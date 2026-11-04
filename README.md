@@ -217,6 +217,31 @@ L9428  Custom msg received [SensorV2], len: 65    ← 流开始
 
 `pods-head-tracker` 的作者只在 **AirPods 4 (ANC)** 上验证过，README 明确写着其他型号未测试。AirPods 3 的固件很可能把该流锁在 macOS 的空间音频激活流程之后。
 
+### 帧长度语义（易错点）
+
+macOS 日志里的 `len` 是 **body 长度**，不是线路上的帧长度：
+
+| 日志 | 含义 | 线路长度 |
+|---|---|---|
+| `Sent custom message type 0x800, len 14` | HID enable body 14B | 12 + 14 = 26B |
+| `Custom msg received [SensorV2], len: 65` | 样本 body 65B | 12 + 65 = 77B |
+| `Received ... type 0x800, len 9` | enable 的 ACK | 12 + 9 = 21B |
+
+而参考实现 `pods-head-tracker` 的判据是 `len >= 70 && p[:10] == 04 00 04 00 17 00 00 00 10 00 && p[10] ∈ {0x44,0x45}`，其中 `p[10..12]` 是 body 长度字段（`0x44`=68 / `0x45`=69），因此**真实样本帧是 80/81 字节**，且内部带标记 `3a 3e 08 10 1a 3a`。这两种格式本项目都已支持解析。
+
+### 最后一轮实测（条件完备，仍失败）
+
+在**双耳在耳**（`left: InEar, right: InEar`）、**音乐正在播放**、设备正常响应（电量 64%/67%）的条件下，使用从本次连接广告中读出的真实 service id，发送与 macOS 录制载荷逐字节一致的 14 字节 enable，并每 4 秒重发，覆盖：
+
+- descriptor `0x800` / `0x100000`
+- interval `20000` / `40000` µs
+- 两种 START 变体
+- 8 字节探测帧（模拟 macOS 首个 `0x800 len 8`）
+- `OwnsConnection=1`、`BT_SECURITY=MEDIUM`
+
+**设备对所有 enable 变体均无任何回应**（连 macOS 会回的 9 字节 ACK 都没有）。会话 id 每连接递增 8（19→27→…→166），确认解析正确。
+
+
 ### 若目标是"Linux 上的空间音频"，可行路线不依赖 AirPods 传感器
 
 经检索，**目前没有任何开源项目实现「AirPods 传感器 → PipeWire 空间音频」**。已实现的 PipeWire 空间音频方案都用其他姿态来源：

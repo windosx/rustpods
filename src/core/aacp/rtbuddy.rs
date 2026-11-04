@@ -20,21 +20,30 @@
 /// Parsed header of a sensor service advertisement (the XML descriptor the
 /// accessory sends on descriptor `0x800` in reply to a service subscription).
 ///
-/// The advertisement is not just XML: the 6 bytes preceding the XML carry the
+/// The advertisement is not just XML: the 8 bytes preceding the plist carry the
 /// identifiers the HID enable needs.
 ///
 /// ```text
-/// offset 0  4  AACP header            04 00 04 00 17 00
-/// offset 6  4  descriptor             00 08 00 00  (0x800)
+/// offset 0  6  AACP header + opcode   04 00 04 00 17 00
+/// offset 6  4  descriptor             00 08 00 00   (0x800)
 /// offset 10 2  body length            e.g. 6D 02
-/// offset 12 4  assigned service id    00 16 00 00  (0x00001600)
-/// offset 16 4  cookie                 83 34 01 00  (0x00013483)
+/// offset 12 1  enable flag            00             (00 = advertised)
+/// offset 13 2  assigned service id    16 00          (22 for neorelay)
+/// offset 15 1  reserved               00
+/// offset 16 4  cookie                 83 34 01 00
 /// offset 20 .. XML plist begins
 /// ```
+///
+/// The service ids read out here match the accessory's own numbering
+/// (`iedrelay` 19, `neorelay` 22, `mando` 23). Reading them as a `u32` from
+/// offset 12 yields `0x1600` instead of `22`, which shifts every later field in
+/// the enable frame — that mistake is what made the accessory ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceAdvertisement {
-    /// Id the accessory assigned to this service, e.g. `0x1600` for `neorelay`.
-    pub service_id: u32,
+    /// Flag byte: `0x00` while advertised, `0x01` when enabled.
+    pub flag: u8,
+    /// Id the accessory assigned to this service, e.g. `22` for `neorelay`.
+    pub service_id: u16,
     /// Per-service cookie to carry in the HID enable.
     pub cookie: u32,
 }
@@ -62,7 +71,8 @@ impl ServiceAdvertisement {
             return None;
         }
         Some(Self {
-            service_id: u32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]),
+            flag: frame[12],
+            service_id: u16::from_le_bytes([frame[13], frame[14]]),
             cookie: u32::from_le_bytes([frame[16], frame[17], frame[18], frame[19]]),
         })
     }
@@ -200,45 +210,32 @@ pub fn make_sensor_v2_trigger() -> Vec<u8> {
 
 /// Builds the 14-byte HID enable that starts the `SensorV2` stream.
 ///
-/// Layout: `[service_id:4][cookie:4][0xD2][0x01][interval_us:4]`.
-pub fn make_sensor_v2_enable(service_id: u32, cookie: u32, interval_us: u32) -> Vec<u8> {
+/// Layout, byte-for-byte the payload recorded from a working macOS session
+/// (`01 16 00 00 83 34 01 00 D2 01 20 4E 00 00`):
+///
+/// ```text
+/// [0]      enable flag         0x01  (0x00 in the advertisement)
+/// [1..3]   service id          u16   (22 = neorelay)
+/// [3]      reserved            0x00
+/// [4..8]   cookie              u32   (copied from the advertisement)
+/// [8]      report id           0xD2
+/// [9]      enabled             0x01
+/// [10..14] interval            u32 microseconds
+/// ```
+///
+/// The service id must come from the advertisement of this connection, because
+/// the accessory reassigns it on every connect.
+pub fn make_sensor_v2_enable(service_id: u16, cookie: u32, interval_us: u32) -> Vec<u8> {
     let mut body = Vec::with_capacity(14);
+    body.push(0x01); // enable flag
     body.extend_from_slice(&service_id.to_le_bytes());
+    body.push(0x00); // reserved
     body.extend_from_slice(&cookie.to_le_bytes());
     body.push(REPORT_ID_SENSOR_V2);
     body.push(0x01);
     body.extend_from_slice(&interval_us.to_le_bytes());
     make_rtbuddy_envelope(DESCRIPTOR_SENSOR, &body)
 }
-
-/// Alternative 14-byte HID enable layout.
-///
-/// The advertisement's id field reads `00 16 00 00` while the activation
-/// payload recorded from a Mac session reads `01 16 00 00` — the same middle
-/// `u16`, differing only in the first byte. That suggests the field is
-/// `[enable:1][service_id:u16][pad:1]` rather than a flat `u32` id, with
-/// `0x00` meaning "advertised" and `0x01` meaning "enabled".
-///
-/// Both readings produce 14 bytes, so which one the accessory accepts can only
-/// be settled by trying them.
-pub fn make_sensor_v2_enable_v2(service_id: u16, cookie: u32, interval_us: u32) -> Vec<u8> {
-    let mut body = Vec::with_capacity(14);
-    body.push(0x01);
-    body.extend_from_slice(&service_id.to_le_bytes());
-    body.push(0x00);
-    body.extend_from_slice(&cookie.to_le_bytes());
-    body.push(REPORT_ID_SENSOR_V2);
-    body.push(0x01);
-    body.extend_from_slice(&interval_us.to_le_bytes());
-    make_rtbuddy_envelope(DESCRIPTOR_SENSOR, &body)
-}
-
-/// Service id the accessory expects in the enable frame for `SensorV2`.
-pub const SENSOR_V2_SERVICE_ID: u32 = 0x0000_1601;
-
-/// Cookie observed in the reference session (`83 34 01 00`). Stable per
-/// accessory; used only when the trigger yields no reply.
-pub const FALLBACK_COOKIE: u32 = 0x0001_3483;
 
 /// Report id carried in the enable frame for the `SensorV2` report.
 pub const REPORT_ID_SENSOR_V2: u8 = 0xD2;
@@ -310,15 +307,38 @@ mod tests {
     ];
 
     #[test]
+    fn enable_frame_matches_recorded_macos_payload() {
+        // `01 16 00 00 83 34 01 00 D2 01 20 4E 00 00` recorded from a working
+        // macOS session: neorelay (service 22) enabled at 20 ms.
+        const RECORDED: [u8; 26] = [
+            0x04, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x08, 0x00, 0x00, 0x0E, 0x00, 0x01, 0x16,
+            0x00, 0x00, 0x83, 0x34, 0x01, 0x00, 0xD2, 0x01, 0x20, 0x4E, 0x00, 0x00,
+        ];
+        assert_eq!(
+            make_sensor_v2_enable(22, 0x0001_3483, INTERVAL_50HZ_US),
+            RECORDED
+        );
+    }
+
+    #[test]
+    fn enable_frame_uses_u16_service_id_not_a_flat_u32() {
+        // Regression guard: reading the advertisement id as a u32 yields 0x1600
+        // and shifts every following field, which the accessory ignores.
+        let frame = make_sensor_v2_enable(22, 0x0001_3483, INTERVAL_50HZ_US);
+        assert_eq!(&frame[12..16], &[0x01, 0x16, 0x00, 0x00]);
+        assert_eq!(&frame[16..20], &[0x83, 0x34, 0x01, 0x00]);
+    }
+
+    #[test]
     fn parses_service_advertisement_identifiers() {
-        // Captured from a real AirPods 3: header of the neorelay advertisement.
-        // The ids are re-assigned on every connection, so they must be read from
-        // the frame rather than hard-coded.
+        // Captured verbatim from a real AirPods 3: header of the neorelay
+        // advertisement. The ids are re-assigned on every connection, so they
+        // must be read from the frame rather than hard-coded.
         let mut frame = vec![
             0x04, 0x00, 0x04, 0x00, 0x17, 0x00, // AACP header
             0x00, 0x08, 0x00, 0x00, // descriptor 0x800
             0x6D, 0x02, // body length 621
-            0x00, 0x1E, 0x00, 0x00, // service id 0x00001E00
+            0x00, 0x16, 0x00, 0x00, // flag 0x00, service id 22, reserved
             0x83, 0x34, 0x01, 0x00, // cookie 0x00013483
         ];
         frame.extend_from_slice(
@@ -326,12 +346,37 @@ mod tests {
         );
 
         let ad = ServiceAdvertisement::parse(&frame).expect("should parse");
-        assert_eq!(ad.service_id, 0x0000_1E00);
+        assert_eq!(ad.flag, 0x00, "advertised, not yet enabled");
+        assert_eq!(ad.service_id, 22, "neorelay is service 22");
         assert_eq!(ad.cookie, 0x0001_3483);
         assert_eq!(
             ServiceAdvertisement::service_name(&frame),
             Some("neorelay")
         );
+    }
+
+    #[test]
+    fn advertisement_service_ids_match_accessory_numbering() {
+        // Captured headers: the u16 at offset 13 must read 19 / 22 / 23, which is
+        // the accessory's own numbering for iedrelay / neorelay / mando.
+        let cases = [
+            ("iedrelay", 19u16, [0x00, 0x13, 0x00, 0x00]),
+            ("neorelay", 22, [0x00, 0x16, 0x00, 0x00]),
+            ("mando", 23, [0x00, 0x17, 0x00, 0x00]),
+        ];
+        for (name, expected, id_field) in cases {
+            let mut frame = vec![
+                0x04, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x08, 0x00, 0x00, 0x6D, 0x02,
+            ];
+            frame.extend_from_slice(&id_field);
+            frame.extend_from_slice(&[0x83, 0x34, 0x01, 0x00]);
+            frame.extend_from_slice(
+                format!("<?xml?><key>AccessoryService</key><string>{}</string>", name).as_bytes(),
+            );
+            let ad = ServiceAdvertisement::parse(&frame).expect("should parse");
+            assert_eq!(ad.service_id, expected, "wrong id for {}", name);
+            assert_eq!(ServiceAdvertisement::service_name(&frame), Some(name));
+        }
     }
 
     #[test]

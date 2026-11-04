@@ -41,7 +41,7 @@ pub struct AacpManager {
     rtb_acp_tx: broadcast::Sender<Vec<u8>>,
     /// Identifiers from the `neorelay` advertisement, which the HID enable
     /// needs. Set by the receive loop as soon as that advertisement arrives.
-    neorelay_ids: Arc<Mutex<Option<(u32, u32)>>>,
+    neorelay_ids: Arc<Mutex<Option<(u16, u32)>>>,
 }
 
 
@@ -530,15 +530,18 @@ impl AacpManager {
 
     /// Starts the head-tracking stream and keeps it alive.
     ///
-    /// The accessory only streams while the buds are in ear, and it ignores a
-    /// START that arrived while they were still in the case. Since the wearer
-    /// can put them in at any time, the starter is re-sent on a timer rather
-    /// than once — this mirrors the watchdog in
-    /// `batubozkan/pods-head-tracker`, which alternates both known START
-    /// variants because some models answer only one of them.
+    /// Three things have to line up, all established from the macOS capture and
+    /// from byte-exact comparison with a working session:
     ///
-    /// Returns immediately; the retry loop runs in the background until the
-    /// stream starts or the connection drops.
+    /// 1. Subscribe to the sensor services, so the accessory advertises
+    ///    `neorelay` and hands out a per-connection service id and cookie.
+    /// 2. Send the 14-byte HID enable carrying those identifiers — this is what
+    ///    actually arms the stream.
+    /// 3. Keep re-sending, because the accessory only streams while both buds
+    ///    are in ear and ignores anything sent while they were in the case.
+    ///
+    /// Returns immediately; the retry loop runs in the background until samples
+    /// arrive or the connection drops.
     pub async fn start_head_tracking(&self) -> Result<(), String> {
         if !self.is_connected().await {
             return Err("AACP socket not connected".to_string());
@@ -552,6 +555,7 @@ impl AacpManager {
             return Err("AACP socket not connected".to_string());
         };
         let tracker = Arc::clone(&self.head_tracker);
+        let ids = Arc::clone(&self.neorelay_ids);
 
         tokio::spawn(async move {
             let mut variant = 0usize;
@@ -560,27 +564,50 @@ impl AacpManager {
             loop {
                 // Stop retrying once samples are arriving or the socket is gone.
                 if tracker.lock().await.samples_seen() > 0 {
-                    debug!("Head-tracking stream is live; stopping the START retries");
+                    debug!("Head-tracking stream is live; stopping the retries");
                     break;
                 }
 
-                let packet = if variant == 0 {
+                // The enable needs the identifiers from *this* connection's
+                // advertisement; without them only the START probe can be sent.
+                let identifiers = *ids.lock().await;
+
+                let mut packets: Vec<Vec<u8>> = Vec::new();
+                if let Some((service_id, cookie)) = identifiers {
+                    packets.push(rtbuddy::make_sensor_v2_enable(
+                        service_id,
+                        cookie,
+                        rtbuddy::INTERVAL_50HZ_US,
+                    ));
+                }
+                packets.push(if variant == 0 {
                     rtbuddy::make_head_tracking_start(rtbuddy::INTERVAL_25HZ_US)
                 } else {
                     rtbuddy::make_alternate_start_head_tracking(rtbuddy::INTERVAL_25HZ_US)
-                };
+                });
                 variant ^= 1;
                 attempts += 1;
 
                 if attempts == 1 {
-                    info!("Starting head tracking, variant {}", variant);
+                    match identifiers {
+                        Some((service_id, cookie)) => info!(
+                            "Starting head tracking: enable(service={}, cookie=0x{:08X}) + START",
+                            service_id, cookie
+                        ),
+                        None => info!(
+                            "Starting head tracking: START only (no advertisement yet)"
+                        ),
+                    }
                 } else {
-                    debug!("Re-sending head-tracking START (attempt {})", attempts);
+                    debug!("Head-tracking retry {}", attempts);
                 }
 
-                if sender.send(packet).await.is_err() {
-                    debug!("AACP send channel closed; stopping START retries");
-                    break;
+                for packet in packets {
+                    if sender.send(packet).await.is_err() {
+                        debug!("AACP send channel closed; stopping retries");
+                        return;
+                    }
+                    sleep(Duration::from_millis(60)).await;
                 }
 
                 // The reference implementation retries every 4 s while the buds
