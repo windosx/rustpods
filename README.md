@@ -241,6 +241,59 @@ macOS 日志里的 `len` 是 **body 长度**，不是线路上的帧长度：
 
 **设备对所有 enable 变体均无任何回应**（连 macOS 会回的 9 字节 ACK 都没有）。会话 id 每连接递增 8（19→27→…→166），确认解析正确。
 
+### macOS 侧 debug 日志揭示的真实性质
+
+用 `log stream --level debug --predicate 'subsystem == "com.apple.bluetooth"'` 在 macOS 27.0.1 上抓到了完整触发时序（这是不用 PacketLogger 能拿到的最详细数据）：
+
+```
+15:23:06.622  A2DP Streaming State: 1                        ← 音频正在串流
+15:23:06.652  Setting Spatial Active: 1  Active IO = 1
+15:23:06.763  Spatial Audio Queue HeadTracked: Enabled
+15:23:06.764  Spatial Status = 4  Mode = 2  Head Tracking = 1
+15:23:06.799  Sent custom message type 0x800, len 14         ← enable
+15:23:06.832  Received type 0x800, len 9                     ← ACK
+15:23:06.991  Received AACP_CUSTOM_MESSAGE_TYPE_SENSOR_V2 len 65   ← 流开始
+```
+
+由此得到两个此前被所有开源实现忽略的事实：
+
+**1. macOS 完全不做 `0x100000` 订阅。** 整段 4 分钟抓包中 `type 0x100000` 出现 **0 次**。macOS 只发 `0x800 len 14`、收 `0x800 len 9`，流就开始了。而 LibrePods、`pods-head-tracker` 与本项目都在发三服务订阅（`SensorDataWX` `ServiceSetting`），这条路径很可能只是恰好在 AirPods 4 / Pro / Max 上碰巧可用。
+
+**2. 传感器数据走 HID Relay 会话，不是普通 AACP 通道。** 每一帧 `SensorV2` 之后都紧跟：
+
+```
+WindowServer  handleMsg ... sessionName:HIDRelay
+WindowServer  accessoryManagerXpcMsgHandler msg:kCBMsgIdAccessoryCustomMessage
+```
+
+即 macOS 把该流当作一个 **HID relay 设备**在消费。这也解释了为什么设备对我们的 `0x800` enable 不作回应——它在等待一个 HID 层的会话注册，而注册过程不通过 AACP 报文。
+
+### 为什么拿不到真实 enable 载荷
+
+14 字节 enable 的确切内容始终无法获得，已排除的手段：
+
+| 手段 | 结果 |
+|---|---|
+| `log stream --level debug` | 只输出 `type 0x800, len 14`，无载荷字节 |
+| `log config --subsystem ... --mode private_data:on` | macOS 26 报 `Invalid Modes`，语法已移除 |
+| `sysdiagnose`（AirPods 串流中采集） | `BluetoothTraceFile.pklg` 恒为 **0 字节** |
+| 搜索日志中的 `04 00 04 00 17` 帧头特征 | 0 命中（载荷从不落盘） |
+| PacketLogger | 需 Apple 开发者账号，普通 Apple ID 被拒（"暂时不符合使用此应用程序的条件"） |
+| 与设备交互探测 | 48 种 `0x800` 载荷组合（flag × report id × mode × interval）全部无 ACK |
+
+补充观察：设备**会解析**我们的 `0x800` 帧——发送 1 字节或 14×`0xFF` 等畸形内容时会返回行为响应（`0x0E` 音频源通知），只是对任何 enable 候选都不回 9 字节 ACK。说明帧结构正确，缺的是语义（某个我们尚未猜到的字段值）。
+
+### 结论
+
+AirPods 3（A2564，固件 `65.1868046005000000.52`）的 head-tracking 流依赖 **macOS 系统级 HID Relay 会话**，在纯 AACP 层面无法触发。这不是实现细节问题，而是协议边界：
+
+- 4 个开源实现全部复现失败（含唯一 Linux 原生实现，字节级完全一致）
+- 条件已完备（双耳在耳、音频串流、空间音频激活）
+- 剩余唯一突破口是拿到那 14 字节真实载荷，而唯一的途径 PacketLogger 不可用
+
+**若要继续，需要换设备（AirPods 4 / Pro / Max，有明确成功案例），或获得可用的 HCI 抓包工具。**
+
+
 
 ### 若目标是"Linux 上的空间音频"，可行路线不依赖 AirPods 传感器
 
