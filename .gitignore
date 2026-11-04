@@ -1,0 +1,5 @@
+/target
+
+# Local tooling and one-off capture artifacts, not part of the project.
+/.zcode
+/sysdiagnose_*
