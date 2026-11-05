@@ -14,7 +14,7 @@ use gtk4::prelude::*;
 use libadwaita::Application;
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 pub enum UiEvent {
@@ -451,7 +451,35 @@ pub async fn start_bluetooth_daemon(
 
                 let mut last_both_in_ear = false;
 
-                while let Ok(event) = event_rx.recv().await {
+                // The AACP socket can also die silently (device out of range,
+                // grabbed by another host) without sending Disconnected. Poll
+                // the manager alongside the event stream so the UI cannot get
+                // stuck on a stale "connected" state.
+                let mut health = tokio::time::interval(tokio::time::Duration::from_secs(3));
+                health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+                loop {
+                    let event = tokio::select! {
+                        event = event_rx.recv() => event,
+                        _ = health.tick() => {
+                            if !aacp.is_connected().await {
+                                warn!("AACP socket is gone; leaving the event loop");
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        // Lagging only means we skipped samples; keep going.
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("AACP event stream lagged, skipped {} events", n);
+                            continue;
+                        }
+                    };
+
                     match event {
                         AacpEvent::Battery(battery_list) => {
                             info!("Received Battery Info over AACP: {:?}", battery_list);
@@ -541,6 +569,14 @@ pub async fn start_bluetooth_daemon(
                             let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
                         }
 
+                        AacpEvent::Disconnected => {
+                            // The broadcast sender lives as long as the manager, so
+                            // recv() never errors on its own. Leaving the loop here
+                            // is what lets the outer loop notice the drop and retry.
+                            warn!("AACP reported disconnect; leaving the event loop");
+                            break;
+                        }
+
                         _ => {}
                     }
                 }
@@ -577,6 +613,9 @@ pub async fn start_bluetooth_daemon(
                         let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state));
                     }
                 }
+                // Also refresh the status pill; without this the hero header keeps
+                // whatever it last showed even though the device is gone.
+                let _ = ui_tx.send(UiEvent::ConnectedChanged(false));
             }
 
             Err(e) => {
