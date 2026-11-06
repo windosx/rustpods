@@ -4,7 +4,7 @@ pub mod ui;
 
 use clap::Parser;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -66,6 +66,55 @@ struct Cli {
                 (what AirPods 3 actually uses) instead of SensorDataWX"
     )]
     remotehid: bool,
+}
+
+/// Exclusive per-session lock, held for the lifetime of the process.
+///
+/// Uses `flock` on a file under `$XDG_RUNTIME_DIR`, which is the conventional
+/// location for per-user runtime state and is cleared on logout. An advisory
+/// lock is chosen over a pidfile because the kernel releases it when the process
+/// dies, so a crash never leaves a stale lock behind - a pidfile would, and
+/// checking whether that pid is still alive races with pid reuse.
+struct InstanceLock {
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    fn acquire(role: &str) -> Result<Self, String> {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+        let path = format!("{}/rustpods-{}.lock", dir, role);
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("Could not open lock file {}: {}", path, e))?;
+
+        // SAFETY: the fd is valid for as long as `file` is alive, and LOCK_EX on
+        // a regular file needs no other setup.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(format!(
+                    "Another RustPods instance is already running ({} is locked); \
+only one can use the AACP session at a time",
+                    path,
+                ));
+            }
+            return Err(format!("Could not lock {}: {}", path, err));
+        }
+
+        // Best effort: record the pid for humans looking at the file. The lock
+        // itself is what enforces exclusivity, not this.
+        let _ = std::fs::write(&path, format!("{}\n", std::process::id()));
+        Ok(Self { _file: file })
+    }
 }
 
 fn main() {
@@ -151,6 +200,19 @@ fn main() {
     }
 
     if cli.no_gui {
+        // The GUI gets single-instance behaviour from GApplication, which owns a
+        // well-known bus name. The daemon has no such name, so it takes an
+        // exclusive lock instead - the usual approach for background services.
+        // Only one process may hold the AACP session anyway: a second one makes
+        // the accessory stop answering for both.
+        let _instance_lock = match InstanceLock::acquire("daemon") {
+            Ok(lock) => lock,
+            Err(reason) => {
+                error!("{}", reason);
+                std::process::exit(1);
+            }
+        };
+
         info!("Running in headless daemon mode");
         rt.block_on(async {
             let config = Arc::new(std::sync::RwLock::new(system::config::load_config()));

@@ -24,15 +24,31 @@ pub enum UiEvent {
     HeadGesture(crate::core::head_tracking::HeadGesture),
 }
 
+/// Starts the GTK application, enforcing one instance per session.
+///
+/// Single-instance behaviour is what a `GApplication` with an application id
+/// gives for free: the first process owns `io.github.rustpods.RustPods` on the
+/// session bus, and a second launch just triggers `activate` on the first one
+/// instead of running its own Bluetooth engine. That matters here because two
+/// instances fight over the one AACP session the accessory allows, and the loser
+/// sees a device that never answers.
+///
+/// `run_with_args` is called with no arguments. Passing anything - even just the
+/// program name - makes `GApplication` treat the invocation as having unknown
+/// arguments, which makes it skip the registration that provides the
+/// single-instance behaviour. Custom flags are already parsed by Clap before we
+/// get here, so there is nothing left to forward.
 pub fn run_app() {
     let app = Application::builder()
         .application_id("io.github.rustpods.RustPods")
         .build();
 
     app.connect_activate(build_ui);
-    // Pass only program name to GTK so it doesn't fail on custom CLI flags parsed by Clap
-    let prog_name = std::env::args().next().unwrap_or_else(|| "rustpods".to_string());
-    app.run_with_args(&[prog_name]);
+    let status = app.run_with_args::<&str>(&[]);
+
+    // A second launch exits through this path once the running instance has been
+    // activated, so it is not an error worth a non-zero code.
+    debug!("GUI exited with status {:?}", status);
 }
 
 fn build_ui(app: &Application) {
