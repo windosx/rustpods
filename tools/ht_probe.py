@@ -230,28 +230,38 @@ def handshake(link):
 
 
 def learn_identifiers(link, service_hint):
-    """Subscribes once to learn this connection's service id and cookie."""
-    for service, seq in ((9, 100), (7, 101), (6, 102)):
-        link.send(subscribe(service, 20000, seq))
-        time.sleep(0.08)
+    """Subscribes once to learn this connection's service id and cookie.
 
+    The accessory reassigns the service id on every connection (observed 19, 22,
+    133, 166, ... - it increments by 8), so sending the enable with a guessed id
+    addresses the wrong service. If no advertisement arrives the caller must know
+    that, because every subsequent enable will be aimed at nothing.
+    """
     service_id, cookie = None, None
-    for frame in link.read(2.5):
-        parsed = parse_advertisement(frame)
-        if not parsed:
-            continue
-        name, sid, ck = parsed
-        print(f"    advert {name or '?':10s} service_id={sid} cookie=0x{ck:08X}")
-        if name == "neorelay":
-            service_id, cookie = sid, ck
+
+    # Try the subscription a few times: the accessory only answers once the AACP
+    # session is fully settled, so a single attempt can be dropped.
+    for attempt in range(3):
+        for service, seq in ((9, 100), (7, 101), (6, 102)):
+            link.send(subscribe(service, 20000, seq))
+            time.sleep(0.08)
+
+        for frame in link.read(1.5):
+            parsed = parse_advertisement(frame)
+            if not parsed:
+                continue
+            name, sid, ck = parsed
+            print(f"    advert {name or '?':10s} service_id={sid} cookie=0x{ck:08X}")
+            if name == "neorelay":
+                service_id, cookie = sid, ck
+        if service_id is not None:
+            break
+        if attempt < 2:
+            print(f"    no advertisement yet (attempt {attempt + 1}/3), retrying")
 
     if service_id is None:
-        print(f"    no neorelay advert; falling back to service={service_hint}")
-        service_id = service_hint
-    if cookie is None:
-        print(f"    no cookie in advert; falling back to 0x{DEFAULT_COOKIE:08X}")
-        cookie = DEFAULT_COOKIE
-    return service_id, cookie
+        return None, cookie
+    return service_id, cookie or DEFAULT_COOKIE
 
 
 def probe_once(link, label, frame, wait):
@@ -301,6 +311,22 @@ def main():
         handshake(link)
         print("handshake sent; learning service ids from advertisements")
         service_id, cookie = learn_identifiers(link, args.service)
+
+        if service_id is None:
+            print()
+            print("No neorelay advertisement arrived, so this connection's service")
+            print("id is unknown. Sending the enable with a guessed id would target")
+            print("a service that does not exist on this connection.")
+            print()
+            print("Likely causes, in order:")
+            print("  1. Another host holds the AACP session. Only one is allowed at a")
+            print("     time - disconnect the AirPods from any Mac/phone first.")
+            print("  2. The buds are not in the case/ears in a state the accessory")
+            print("     answers from.")
+            print()
+            print("Re-run after disconnecting the other host.")
+            return 2
+
         print(f"using service_id={service_id} cookie=0x{cookie:08X}\n")
 
         attempts = []
