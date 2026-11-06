@@ -344,69 +344,112 @@ Linux 上没有对应机制：
 
 ## ✅ 解决方案
 
-按可行性排序，每一条都可以直接执行。
+### 实测结果（本轮全部验证过）
 
-### 方案 A：探测 mode 字节（成本最低，建议先做）
+在 AirPods 连着本机、音乐正在播放、广告帧正常返回的条件下：
 
-macOS 日志显示 `mode: 3 head Tracking 1`，而我们 `enable` 帧里对应位置一直是 `0x01`。**这个字节可能就是我们一直写错的地方，且从未被扫过。**
+| 尝试 | 结果 |
+|---|---|
+| 从本次连接读出真实 service_id（14196 等，每次连递增 8） | ✅ 解析正确 |
+| 8 个 mode 值（0-7）× 2 种 flag 组合 | ❌ 设备零回应 |
+| 3 种 START 变体（service 22/14/16） | ❌ 零回应 |
+| 畸形 `0x800` 帧（1 字节 / 14×0xFF） | ❌ 零回应 |
+| 对照组：不发任何 `0x800` | ✅ **收到 19 帧**（电量、入耳、三份广告、连接列表） |
 
-`tools/ht_probe.py` 已实现这个探测，会依次尝试 `flag × mode` 组合，用设备的 9 字节 ACK 作为判据：
+对照组的 19 帧说明**链路完全正常**，设备只是对 `0x800` 一律不回应。
+
+### 根因：`0x800` 需要 XPC 层预注册
+
+`bluetoothd` 里存在这些符号，但它们全是 **macOS 主机内部的 XPC 机制**，不产生 AACP 报文：
+
+```
+kCBMsgIdAccessoryRegisterCustomMessageClientMsg
+kCBMsgIdAccessoryDeregisterCustomMessageClientMsg
+BTAccessoryMsgHandler::handleBTAccessoryRegisterCustomMessageClientMsg
+SubscribeCustomMessage types: %@
+```
+
+**`0x800` 是「已注册客户端」的下行通道，不是可主动发起的命令。** 主机必须先在同一进程内注册该 type 的回调，bluetoothd 才会把 enable 发下去。Linux 上不存在这个注册层，所以设备看到的是一个没有注册上下文的消息，直接丢弃。
+
+---
+
+### 方案 A：在 Linux 复刻注册层（唯一能真正打通的路）
+
+需要的不是「发对一帧」，而是在 Linux 音频栈里补出 macOS 的这套结构：
+
+```
+┌──────────────────────────────────────────────────┐
+│ 应用 / 播放器                                      │
+│   └─ 声明「本应用进入空间音频，头部追踪 = YES」       │
+├──────────────────────────────────────────────────┤
+│ 新增：spatial-session 层（模拟 BTHAL）              │
+│   · per-app 标识 + mode(3) + headtrack(1) 状态机    │
+│   · 注册 custom message type 0x800 的会话上下文      │
+├──────────────────────────────────────────────────┤
+│ BlueZ audio 插件（需扩展）                          │
+│   └─ 把上述状态转成 AACP 下行                        │
+├──────────────────────────────────────────────────┤
+│ AACP 链路（本项目已实现，可直接复用）                 │
+│   └─ 14 字节 enable + SensorV2 解析（已完成）        │
+└──────────────────────────────────────────────────┘
+```
+
+**落地步骤：**
+
+1. **确认注册机制**：用 `dtruss`/`lldb` 观察 macOS 上 `BTAccessoryRegisterCustomMessageClientMsg` 的调用时机（需 SIP 关闭，或用 `log stream` 观察其日志先后顺序——本轮已经抓到顺序）
+2. **扩展 BlueZ**：在 `profiles/audio/` 里加一个接口，允许上层注册 custom message type 并携带会话上下文
+3. **实现 spatial-session 守护进程**：维护 `(app_id, mode, headtrack)` 三元组，状态变为 `mode:3 + headtrack:1` 时触发 enable
+4. **复用本项目**：`src/core/aacp/` 的协议栈、`rtbuddy.rs` 的帧构造、`head_tracking.rs` 的解析器全部可用
+
+**工作量评估**：BlueZ 扩展 + 守护进程，约 2-3 周。这是唯一能完整复现 macOS 行为的路径。
+
+### 方案 B：换设备验证协议实现（最快见效）
+
+`batubozkan/pods-head-tracker`（70 stars）只在 **AirPods 4 (ANC)** 上验证通过，AirPods 3 未测试。本轮实测证实 AirPods 3 的固件确实有额外门槛。
+
+如果有 AirPods 4 / Pro / Max，本项目的 AACP 实现可直接复用——把 `ht_probe.py` 指向新设备即可：
 
 ```bash
-# 终端 1：确认帧真的到达控制器
-sudo btmon -w /tmp/probe.btsnoop
-
-# 终端 2：扫 mode 字节
-python3 tools/ht_probe.py CC:68:E0:38:9C:E9
-
-# 扫全范围
-python3 tools/ht_probe.py CC:68:E0:38:9C:E9 --modes 0,1,2,3,4,5,6,7
+python3 tools/ht_probe.py <新设备MAC> --modes 0,1,2,3
 ```
 
-成功的标志是输出里出现 `*** ACK`。拿到这个值后写进 `src/core/aacp/rtbuddy.rs` 的 `make_sensor_v2_enable`。
+### 方案 C：不依赖 AirPods 传感器的空间音频（立即可用）
 
-**这一步之前从未做过** —— 之前的 48 种组合扫的是 `report id` 和 `interval`，没有扫 `mode`。
+如果目标是「Linux 上有头追空间音频」，不碰 AACP 也能实现：
 
-### 方案 B：在 PipeWire/BTHAL 层补一个空间音频会话层
+```bash
+# 1. 安装 SOFA + opentrack
+sudo mkdir -p /usr/share/pipewire/sofa
+# 下载 subject_021.sofa 到该目录
 
-如果方案 A 失败，说明确实需要主机侧先声明空间音频会话。落地方式：
-
-1. 新增一个 PipeWire 客户端，在被请求时向 BlueZ 声明「当前应用进入空间音频模式」
-2. 该声明需要落到 BlueZ 的 audio 层（当前 BlueZ 没有此接口，需要扩展或打补丁）
-3. 声明完成后，再发 14 字节 enable
-
-这是**工程量最大但唯一能完整复现 macOS 行为**的路径。可参考 `qeqqe/spatial-track` 的 PipeWire `filter-chain` 结构承载 HRTF 部分。
-
-### 方案 C：绕开 AirPods 传感器，用其他姿态源
-
-如果目标只是「Linux 上的头追空间音频」而不是「用 AirPods 传感器」，则完全不必碰 AACP：
-
-```ini
-# ~/.config/pipewire/pipewire.conf.d/99-spatializer.conf
+# 2. 配置 PipeWire HRTF
+mkdir -p ~/.config/pipewire/pipewire.conf.d/
+cat > ~/.config/pipewire/pipewire.conf.d/99-spatializer.conf <<'CONF'
 context.modules = [
-    {   name = libpipewire-module-filter-chain
-        args = {
-            node.description = "Spatializer"
-            filter.graph = {
-                nodes = [
-                    { type = sofa label = spatializer name = spat_l
-                      config = { filename = "/usr/share/pipewire/sofa/subject_021.sofa" }
-                      control = { "Azimuth" = 30.0 "Elevation" = 0.0 "Radius" = 1.5 } }
-                    { type = sofa label = spatializer name = spat_r
-                      config = { filename = "/usr/share/pipewire/sofa/subject_021.sofa" }
-                      control = { "Azimuth" = -30.0 "Elevation" = 0.0 "Radius" = 1.5 } }
-                ]
-            }
+    { name = libpipewire-module-filter-chain
+      args = {
+        node.description = "Spatializer"
+        media.name = "Spatializer"
+        filter.graph = {
+          nodes = [
+            { type = sofa label = spatializer name = spat_l
+              config = { filename = "/usr/share/pipewire/sofa/subject_021.sofa" }
+              control = { "Azimuth" = 30.0 "Elevation" = 0.0 "Radius" = 1.5 } }
+            { type = sofa label = spatializer name = spat_r
+              config = { filename = "/usr/share/pipewire/sofa/subject_021.sofa" }
+              control = { "Azimuth" = -30.0 "Elevation" = 0.0 "Radius" = 1.5 } }
+          ]
         }
+      }
     }
 ]
+CONF
+
+# 3. 姿态源用 opentrack（UDP 127.0.0.1:4242，神经网络人脸追踪）
+systemctl --user restart pipewire pipewire-pulse
 ```
 
-姿态来源用 `opentrack`（UDP `127.0.0.1:4242`），它支持神经网络人脸追踪，不依赖任何耳机硬件。这条路线已被 [`qeqqe/spatial-track`](https://github.com/qeqqe/spatial-track) 验证可行。
-
-### 方案 D：换设备
-
-`batubozkan/pods-head-tracker`（70 stars）在 **AirPods 4 (ANC)** 上验证通过，并注明 AirPods 3 未测试。若手边有 AirPods 4 / Pro / Max，本项目的 AACP 实现可直接复用验证。
+姿态来源不限于 AirPods：opentrack 支持人脸追踪、手机 IMU、游戏手柄等。这条路线已被 [`qeqqe/spatial-track`](https://github.com/qeqqe/spatial-track) 验证。
 
 ---
 
@@ -414,16 +457,17 @@ context.modules = [
 
 | 工具 | 用途 |
 |---|---|
-| `tools/ht_probe.py` | 扫描 enable 帧的 `mode` 字节，用 9 字节 ACK 判断成败 |
-| `tools/parse_btsnoop.py` | 解析 `btmon -w` 生成的 btsnoop，提取所有 RTBuddy 帧 |
+| `tools/ht_probe.py` | 扫描 enable 的 `mode` 字节；拿不到广告时明确报错而非用猜测的 id |
+| `tools/parse_btsnoop.py` | 解析 `btmon -w` 的 btsnoop，提取所有 RTBuddy 帧 |
 
-**注意**：Linux 上 `btmon` 可以直接抓 HCI（适配器在 USB 总线上时无需任何特权绕过）：
+**Linux 上 `btmon` 直接就能抓 HCI**（适配器在 USB 总线上时无需任何特权绕过）：
 
 ```bash
 sudo btmon -w /tmp/capture.btsnoop
 ```
 
-这是排查 AACP 问题最快的手段，比在 macOS 上折腾 PacketLogger 可靠得多。
+这是排查 AACP 问题最快的手段。**之前认为「Linux 抓不到包」是错误判断**，为此绕道 macOS 完全是浪费。
+
 
 
 
