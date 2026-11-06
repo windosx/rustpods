@@ -3,12 +3,14 @@ pub mod events;
 pub mod packets;
 pub mod remotehid;
 pub mod rtbuddy;
+pub mod session;
 
 use bluer::l2cap::{Socket, SocketAddr};
 use bluer::{Address, AddressType};
 use commands::{ControlCommandId, MicrophoneMode, NoiseControlMode};
 use events::AacpEvent;
 use packets::*;
+use crate::core::aacp::events::EarStatus;
 use crate::core::head_tracking::{HeadGesture, HeadPose, HeadTracker};
 use crate::core::spatial::{SpatialClaim, SpatialMode, SpatialSession};
 use std::sync::Arc;
@@ -44,6 +46,9 @@ pub struct AacpManager {
     /// Identifiers from the `neorelay` advertisement, which the HID enable
     /// needs. Set by the receive loop as soon as that advertisement arrives.
     neorelay_ids: Arc<Mutex<Option<(u16, u32)>>>,
+    /// Latest ear-detection status, cached so callers can tell "buds in case"
+    /// from "buds stuck" without waiting for the next notification.
+    ear_status: Arc<Mutex<Option<(EarStatus, EarStatus)>>>,
     /// Which application currently holds the spatial-audio claim.
     ///
     /// macOS only sends the enable once an app has claimed spatial audio in
@@ -180,6 +185,7 @@ impl AacpManager {
             gesture_tx,
             rtb_acp_tx,
             neorelay_ids: Arc::new(Mutex::new(None)),
+            ear_status: Arc::new(Mutex::new(None)),
             spatial: Arc::new(Mutex::new(SpatialSession::new())),
         }
     }
@@ -203,6 +209,16 @@ impl AacpManager {
     /// How many attitude samples have been parsed since the stream started.
     pub async fn head_samples_seen(&self) -> u64 {
         self.head_tracker.lock().await.samples_seen()
+    }
+
+    /// Last ear status the accessory reported, if any.
+    pub async fn last_ear_status(&self) -> Option<(EarStatus, EarStatus)> {
+        *self.ear_status.lock().await
+    }
+
+    /// Records an ear-detection observation for later queries.
+    pub async fn note_ear_status(&self, left: EarStatus, right: EarStatus) {
+        *self.ear_status.lock().await = Some((left, right));
     }
 
     /// Subscribe to detected nod/shake gestures.
@@ -316,6 +332,7 @@ impl AacpManager {
         let gesture_tx = self.gesture_tx.clone();
         let rtb_acp_tx = self.rtb_acp_tx.clone();
         let neorelay_ids = Arc::clone(&self.neorelay_ids);
+        let ear_cache = Arc::clone(&self.ear_status);
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -371,17 +388,26 @@ impl AacpManager {
                             } else {
                                 0
                             };
-                            // Every RemoteHID frame belongs to the tap: on
-                            // descriptor 0x800 the accessory sends DeviceConnect
-                            // blobs that are hundreds of bytes long, so a size
-                            // test alone would misroute them into the sample
-                            // parser. Only the SensorDataWX descriptor carries
-                            // attitude samples.
-                            if descriptor == rtbuddy::DESCRIPTOR_SENSOR
-                                || (len < crate::core::head_tracking::SENSOR_V2_LEN
-                                    && !packet
-                                        .windows(crate::core::head_tracking::PAYLOAD_MARK.len())
-                                        .any(|w| w == crate::core::head_tracking::PAYLOAD_MARK))
+                            // Short frames on descriptor 0x800 are control traffic
+                            // (DeviceConnect plists, SetReport responses) and go
+                            // to the tap only. Long ones carry a RemoteHID
+                            // InputReport with its 58-byte motion block and must
+                            // also reach the tracker, so they fall through.
+                            let is_remote_hid = descriptor == rtbuddy::DESCRIPTOR_SENSOR;
+                            if is_remote_hid {
+                                rtb_acp_tx.send(packet.to_vec()).ok();
+                                debug!(
+                                    "RemoteHID frame: len={} {:02X?}",
+                                    len,
+                                    &packet[..len.min(24)]
+                                );
+                                if len < crate::core::head_tracking::SENSOR_V2_LEN {
+                                    continue;
+                                }
+                            } else if len < crate::core::head_tracking::SENSOR_V2_LEN
+                                && !packet
+                                    .windows(crate::core::head_tracking::PAYLOAD_MARK.len())
+                                    .any(|w| w == crate::core::head_tracking::PAYLOAD_MARK)
                             {
                                 rtb_acp_tx.send(packet.to_vec()).ok();
                                 debug!(
@@ -426,6 +452,12 @@ impl AacpManager {
                                 if let Err(e) = seq_packet_recv.send(&ack).await {
                                     warn!("Failed to echo version negotiation: {}", e);
                                 }
+                            }
+                            if let AacpEvent::EarDetection(ref ear) = event {
+                                // Cache it: the recovery logic needs to tell a
+                                // unit sitting in its case (sensors off, normal)
+                                // from one that is worn but stuck.
+                                *ear_cache.lock().await = Some((ear.left, ear.right));
                             }
                             let _ = event_tx.send(event);
                         }

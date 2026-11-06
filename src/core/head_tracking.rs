@@ -321,6 +321,15 @@ impl HeadTracker {
     /// form. When the 6-byte AACP header is present it is stripped first, so the
     /// field offsets below are relative to the sensor payload.
     pub fn parse_packet(&mut self, data: &[u8]) -> Option<(HeadPose, Option<HeadGesture>)> {
+        // Descriptor 0x800 belongs to RemoteHID exclusively. Route on the
+        // descriptor before any offset heuristics: frames on that channel that
+        // are not InputReports (DeviceConnect plists, SetReport responses) must
+        // never be read as attitude samples.
+        if let Some(body) = remote_hid_body(data) {
+            return remote_hid_motion_block(body)
+                .and_then(|block| self.parse_remote_hid_block(block));
+        }
+
         // Newer firmware frames carry a marker and are not fixed-length, so they
         // are recognised by the marker before any length checks.
         if let Some(payload) = payload_after_marker(data) {
@@ -510,6 +519,103 @@ fn payload_after_marker(data: &[u8]) -> Option<&[u8]> {
     data.get(payload_start..payload_end)
 }
 
+/// Descriptor for the RemoteHID channel carrying AirPods 3 motion reports.
+const DESCRIPTOR_REMOTE_HID: u32 = 0x0000_0800;
+/// Kind 2 in the RemoteHID sub-header is an InputReport.
+const REMOTE_HID_KIND_INPUT: u32 = 2;
+/// Bytes of motion data in one RemoteHID InputReport, after the report-type byte.
+const REMOTE_HID_MOTION_LEN: usize = 58;
+/// Rotation-rate scale from the protocol document: ~0.122 °/s per count. The
+/// source marks it approximate, so treat derived yaw as indicative only.
+const ROTATION_DEG_PER_SEC: f32 = 0.122;
+
+/// Extracts the 58-byte motion block from a RemoteHID InputReport.
+///
+/// Layout of the frame:
+///
+/// ```text
+/// [04 00 04 00 17 00] [descriptor 0x800: 4] [body_len: 2]
+///   [version][gen][0][side] [sub-header: 4] [report type: 1] [motion: 58]
+///                            ^ bits 17..19 == 2 for InputReport
+/// ```
+fn remote_hid_body(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < 12 || frame[4] != 0x17 {
+        return None;
+    }
+    let descriptor = u32::from_le_bytes([frame[6], frame[7], frame[8], frame[9]]);
+    if descriptor != DESCRIPTOR_REMOTE_HID {
+        return None;
+    }
+    let body_len = u16::from_le_bytes([frame[10], frame[11]]) as usize;
+    frame.get(12..12 + body_len)
+}
+
+/// Extracts the 58-byte motion block from a RemoteHID body.
+///
+/// Returns `None` for any body that is not an InputReport, which keeps plists and
+/// control responses out of the attitude path.
+fn remote_hid_motion_block(body: &[u8]) -> Option<&[u8]> {
+    if body.len() < 9 {
+        return None;
+    }
+    let header = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    if (header >> 17) & 0x7 != REMOTE_HID_KIND_INPUT {
+        return None;
+    }
+    // body[8] is the report type; the motion block follows it.
+    body.get(9..9 + REMOTE_HID_MOTION_LEN)
+}
+
+impl HeadTracker {
+    /// Parses a RemoteHID motion block.
+    ///
+    /// The block carries an absolute gravity vector in 1000-per-g units at
+    /// offset 44, so pitch and roll follow directly with no calibration. Rotation
+    /// rate sits at offset 26 and is scaled by roughly 0.122 °/s per count.
+    fn parse_remote_hid_block(
+        &mut self,
+        block: &[u8],
+    ) -> Option<(HeadPose, Option<HeadGesture>)> {
+        let gx = read_i16(block, 44)? as f32;
+        let gy = read_i16(block, 46)? as f32;
+        let gz = read_i16(block, 48)? as f32;
+
+        // A zero vector means the sensor is still waking up.
+        if gx == 0.0 && gy == 0.0 && gz == 0.0 {
+            return None;
+        }
+
+        let rotation_x = read_i16(block, 26)?;
+        let user_x = read_i16(block, 38)?;
+        let user_y = read_i16(block, 40)?;
+
+        // Forward tilt rotates gravity in the x-y plane; lateral tilt moves z.
+        let pitch = gy.atan2(gx).to_degrees();
+        let magnitude = (gx * gx + gy * gy + gz * gz).sqrt().max(f32::EPSILON);
+        let roll = (gz / magnitude).clamp(-1.0, 1.0).asin().to_degrees();
+
+        self.calibrated = true;
+        self.samples_seen += 1;
+        if self.sample_times.len() >= RATE_WINDOW {
+            self.sample_times.pop_front();
+        }
+        self.sample_times.push_back(Instant::now());
+
+        let pose = HeadPose {
+            pitch: pitch.clamp(-90.0, 90.0),
+            // RemoteHID exposes rotation rate; yaw is the integrated z rate, which
+            // this layer does not accumulate yet.
+            yaw: (rotation_x as f32 * ROTATION_DEG_PER_SEC).clamp(-180.0, 180.0),
+            roll: roll.clamp(-90.0, 90.0),
+            accel_h: user_x,
+            accel_v: user_y,
+        };
+
+        let gesture = self.detect_gesture(user_x as f32, user_y as f32);
+        Some((pose, gesture))
+    }
+}
+
 impl HeadTracker {
     /// Parses a marked payload: raw accelerometer at `[20..26]`, gyro at
     /// `[26..32]`, and an absolute gravity unit vector scaled by 1024 at
@@ -626,6 +732,68 @@ mod tests {
         data[payload + 46..payload + 48].copy_from_slice(&gy.to_le_bytes());
         data[payload + 48..payload + 50].copy_from_slice(&gz.to_le_bytes());
         data
+    }
+
+    /// Builds a RemoteHID InputReport carrying a 58-byte motion block.
+    fn remote_hid_frame(gx: i16, gy: i16, gz: i16, user_x: i16, user_y: i16) -> Vec<u8> {
+        let mut block = vec![0u8; REMOTE_HID_MOTION_LEN];
+        block[44..46].copy_from_slice(&gx.to_le_bytes());
+        block[46..48].copy_from_slice(&gy.to_le_bytes());
+        block[48..50].copy_from_slice(&gz.to_le_bytes());
+        block[38..40].copy_from_slice(&user_x.to_le_bytes());
+        block[40..42].copy_from_slice(&user_y.to_le_bytes());
+
+        // body: version, generation, 0, side, sub-header, report type, block
+        let sub_len = 4 + 1 + block.len();
+        let header = 7u32 | ((sub_len as u32) << 7) | (2u32 << 17);
+        let mut body = vec![0x00, 0x2A, 0x00, 0x00];
+        body.extend_from_slice(&header.to_le_bytes());
+        body.push(0x00); // report type: input
+        body.extend_from_slice(&block);
+
+        let mut frame = vec![0x04, 0x00, 0x04, 0x00, 0x17, 0x00];
+        frame.extend_from_slice(&0x0000_0800u32.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    #[test]
+    fn remote_hid_input_report_is_recognised() {
+        let mut tracker = HeadTracker::new();
+        let (pose, _) = tracker
+            .parse_packet(&remote_hid_frame(1000, 0, 0, 0, 0))
+            .expect("RemoteHID InputReport should parse");
+        // Gravity along +x means level.
+        assert!(pose.pitch.abs() < 0.5, "pitch={}", pose.pitch);
+        assert!(pose.roll.abs() < 0.5, "roll={}", pose.roll);
+        assert!(tracker.is_calibrated());
+    }
+
+    #[test]
+    fn remote_hid_pitch_follows_gravity() {
+        let mut tracker = HeadTracker::new();
+        let (pose, _) = tracker
+            .parse_packet(&remote_hid_frame(0, 1000, 0, 0, 0))
+            .expect("should parse");
+        assert!((pose.pitch - 90.0).abs() < 0.5, "pitch={}", pose.pitch);
+    }
+
+    #[test]
+    fn remote_hid_zero_gravity_is_ignored() {
+        let mut tracker = HeadTracker::new();
+        assert!(tracker.parse_packet(&remote_hid_frame(0, 0, 0, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn remote_hid_ignores_non_input_reports() {
+        let mut frame = remote_hid_frame(1000, 0, 0, 0, 0);
+        // Rewrite the kind bits from 2 (InputReport) to 0 (DeviceConnect).
+        let header = u32::from_le_bytes([frame[16], frame[17], frame[18], frame[19]]);
+        let cleared = header & !(0x7 << 17);
+        frame[16..20].copy_from_slice(&cleared.to_le_bytes());
+        let mut tracker = HeadTracker::new();
+        assert!(tracker.parse_packet(&frame).is_none());
     }
 
     #[test]

@@ -253,79 +253,92 @@ async fn run_spatial_session_test(target: &str) {
 /// AirPods 3 does not implement `SensorDataWX` (`0x100000`) at all; motion data
 /// arrives through this channel instead. See `core::aacp::remotehid` for the
 /// frame layout and for what is and is not verified on this hardware.
+/// Runs the RemoteHID stream, recovering the accessory on its own when needed.
+///
+/// Two hardware quirks make this more than a straight-line sequence:
+///
+/// * AirPods 3 can stop announcing its sensors while both buds are in ear. Only a
+///   full Bluetooth disconnect clears that, and the reconnect has to wait —
+///   reconnecting at once leaves the unit stuck. [`StreamSupervisor`] decides when
+///   to cycle and `RECOVERY_GAP` sets how long to pause.
+/// * The stream is cancelled whenever the accessory re-announces its devices, so
+///   the interval write is repeated on every fresh announcement.
+///
+/// Everything here runs unattended: the earbuds never have to be touched.
 async fn run_remotehid_test(target: &str) {
     use crate::core::aacp::remotehid;
+    use crate::core::aacp::session::{Recovery, StreamState, StreamSupervisor, RECOVERY_GAP};
     use std::time::Duration;
+
+    const MAX_ATTEMPTS: u32 = 4;
 
     let Some(aacp) = prepare_connection(target).await else {
         return;
     };
 
-    // AirPods 3 wedges into a state where it stops announcing its sensors even
-    // while both buds are in ear. A full Bluetooth disconnect is the only thing
-    // that clears it, so start every run from a clean link. Waiting is part of
-    // the fix: reconnecting immediately leaves the accessory in the stuck state.
-    tracing::info!("Cycling the Bluetooth link so the accessory announces its sensors");
-    let _ = tokio::process::Command::new("bluetoothctl")
-        .args(["disconnect", target])
-        .output()
-        .await;
-    tokio::time::sleep(Duration::from_secs(15)).await;
-    let _ = tokio::process::Command::new("bluetoothctl")
-        .args(["connect", target])
-        .output()
-        .await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    tracing::info!("Connecting AACP for RemoteHID...");
-    if let Err(e) = aacp.connect_without_handshake(addr_of(target)).await {
-        tracing::error!("AACP connect failed: {}", e);
-        return;
-    }
-
-    // The reference client sends exactly these three packets and nothing else.
-    // Running the full handshake () adds own-connection claims and subscription
-    // requests that change what the accessory is willing to announce, so the
-    // prelude is written out explicitly here.
-    for (label, packet) in [
-        ("handshake", vec![0x00u8, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]),
-        ("feature flags", vec![0x04, 0x00, 0x04, 0x00, 0x4D, 0x00, 0xD7, 0x00, 0, 0, 0, 0, 0, 0]),
-        ("notifications", vec![0x04, 0x00, 0x04, 0x00, 0x0F, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]),
-    ] {
-        tracing::debug!("Sending {}: {:02X?}", label, packet);
-        let _ = aacp.send_raw(packet).await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-
-    let mut frames = aacp.subscribe_rtbuddy_frames();
-    let mut registry = remotehid::DeviceRegistry::new();
+    let mut supervisor = StreamSupervisor::new();
     let mut generation = remotehid::Generation::default();
-    let mut generation_counter = 0u8;
 
-    // The accessory announces its services on its own once the AACP prelude has
-    // gone out; a HostConnect is not required to make that happen and can race
-    // with the announcement burst. Send it only if nothing arrives first.
-    tracing::info!("Waiting for DeviceConnect announcements");
-    let _ = &mut generation_counter;
+    for attempt in 1..=MAX_ATTEMPTS {
+        if attempt > 1 {
+            tracing::warn!(
+                "Recovering the accessory: dropping the Bluetooth link and waiting {:?}",
+                RECOVERY_GAP
+            );
+            let _ = tokio::process::Command::new("bluetoothctl")
+                .args(["disconnect", target])
+                .output()
+                .await;
+            tokio::time::sleep(RECOVERY_GAP).await;
+            let out = tokio::process::Command::new("bluetoothctl")
+                .args(["connect", target])
+                .output()
+                .await;
+            let ok = out.map(|o| o.status.success()).unwrap_or(false);
+            tracing::info!("Reconnect {}", if ok { "succeeded" } else { "failed" });
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
 
-    // The accessory announces every service it is willing to expose right after
-    // the prelude, but only if the L2CAP receive MTU is 2582 - otherwise the
-    // 833-byte devmotion6 descriptor does not fit and it is silently omitted.
-    // The burst arrives within a couple of seconds.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let Ok(received) = tokio::time::timeout(remaining, frames.recv()).await else {
-            break;
-        };
-        let Ok(frame) = received else { break };
-        let Some((_generation, header, _payload)) = remotehid::parse_frame(&frame) else {
-            continue;
-        };
-        if header.kind() != Some(remotehid::Kind::HostConnect) || header.is_response {
+        supervisor.begin_attempt();
+
+        tracing::info!("Connecting AACP (attempt {}/{})", attempt, MAX_ATTEMPTS);
+        if let Err(e) = aacp.connect_without_handshake(addr_of(target)).await {
+            tracing::error!("AACP connect failed: {}", e);
             continue;
         }
-        if let Some(start) = frame.iter().position(|&b| b == b'<') {
+
+        // The reference client sends exactly these three packets before anything
+        // else; extra handshake steps change what the accessory will announce.
+        for packet in [
+            vec![0x00u8, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![0x04, 0x00, 0x04, 0x00, 0x4D, 0x00, 0xD7, 0x00, 0, 0, 0, 0, 0, 0],
+            vec![0x04, 0x00, 0x04, 0x00, 0x0F, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+        ] {
+            let _ = aacp.send_raw(packet).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        let mut frames = aacp.subscribe_rtbuddy_frames();
+        let mut registry = remotehid::DeviceRegistry::new();
+
+        // Collect the announcement burst. It only contains every service when the
+        // receive MTU is 2582 (handled before connect), so a short list here is
+        // itself a signal that something is off.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(Ok(frame)) = tokio::time::timeout(remaining, frames.recv()).await else {
+                break;
+            };
+            let Some((_g, header, _p)) = remotehid::parse_frame(&frame) else {
+                continue;
+            };
+            if header.kind() != Some(remotehid::Kind::HostConnect) || header.is_response {
+                continue;
+            }
+            let Some(start) = frame.iter().position(|&b| b == b'<') else {
+                continue;
+            };
             let text = String::from_utf8_lossy(&frame[start..]).to_string();
             let descriptor = text
                 .find("<key>ReportDescriptor</key><data>")
@@ -335,71 +348,175 @@ async fn run_remotehid_test(target: &str) {
                 })
                 .unwrap_or_default();
             registry.record(header.device, &text, &descriptor);
-            if let Some(d) = registry.all().find(|d| d.device == header.device) {
+        }
+
+        let announced: Vec<String> = registry.all().map(|d| format!("{}={}", d.service, d.device)).collect();
+        tracing::info!("Announced {} services: {:?}", announced.len(), announced);
+
+        match supervisor.record_announcement(&registry, &mut generation) {
+            Some(packet) if !packet.is_empty() => {
                 tracing::info!(
-                    "DeviceConnect: dev={} service={} max_report={:?} reports={} feature={}",
-                    d.device,
-                    d.service,
-                    d.max_report_size,
-                    d.report_ids.len(),
-                    d.has_feature_report
+                    "Writing the sample interval: {:02X?}",
+                    &packet[..packet.len().min(26)]
                 );
+                if let Err(e) = aacp.send_raw(packet).await {
+                    tracing::error!("SetReport failed: {}", e);
+                    continue;
+                }
+            }
+            Some(_) => tracing::debug!("Interval already written for this device set"),
+            None if !announced.is_empty() => {
+                // Some services but not the motion one: the accessory is still
+                // working through its list. Keep this connection; reconnecting
+                // would restart that progress from zero.
+                match supervisor.after_partial(announced.len()) {
+                    Recovery::KeepWaiting => {
+                        tracing::info!(
+                            "{} services so far, waiting for the motion sensor",
+                            announced.len()
+                        );
+                        // Give it time to finish announcing on this connection.
+                        let extra = tokio::time::Instant::now() + Duration::from_secs(8);
+                        while tokio::time::Instant::now() < extra {
+                            let remaining =
+                                extra.saturating_duration_since(tokio::time::Instant::now());
+                            let Ok(Ok(frame)) = tokio::time::timeout(remaining, frames.recv()).await
+                            else {
+                                continue;
+                            };
+                            let Some((_g, header, _p)) = remotehid::parse_frame(&frame) else {
+                                continue;
+                            };
+                            if header.kind() != Some(remotehid::Kind::HostConnect) {
+                                continue;
+                            }
+                            if let Some(start) = frame.iter().position(|&b| b == b'<') {
+                                let text = String::from_utf8_lossy(&frame[start..]).to_string();
+                                let descriptor = text
+                                    .find("<key>ReportDescriptor</key><data>")
+                                    .and_then(|s| {
+                                        let rest =
+                                            &text[s + "<key>ReportDescriptor</key><data>".len()..];
+                                        rest.find('<').map(|e| decode_base64(&rest[..e]))
+                                    })
+                                    .unwrap_or_default();
+                                registry.record(header.device, &text, &descriptor);
+                            }
+                        }
+                        let now: Vec<String> =
+                            registry.all().map(|d| d.service.clone()).collect();
+                        tracing::info!("After waiting: {} services {:?}", now.len(), now);
+                        if let Some(packet) =
+                            supervisor.record_announcement(&registry, &mut generation)
+                        {
+                            if !packet.is_empty() {
+                                let _ = aacp.send_raw(packet).await;
+                            }
+                        }
+                    }
+                    Recovery::CycleLink | Recovery::WaitForWearer => continue,
+                }
+            }
+            None => {
+                // Nothing announced. A unit in its case powers the sensors down,
+                // so only cycle the link when the buds are actually being worn.
+                // A unit in its case powers the sensors down, so cycling the
+                // link there would be pointless; the ear state comes from the
+                // last ear-detection notification the manager cached.
+                let in_ear = aacp.last_ear_status().await.map(|(l, r)| {
+                    l.is_in_ear() || r.is_in_ear()
+                }).unwrap_or(true);
+                match supervisor.after_silence(in_ear) {
+                    Recovery::CycleLink => continue,
+                    Recovery::KeepWaiting => {
+                        // Announcements can take several seconds on a cold
+                        // accessory. Watch this same connection instead of
+                        // reconnecting, which restarts its init from zero.
+                        tracing::info!("No announcements yet; watching this link for 10 s");
+                        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+                        while tokio::time::Instant::now() < until {
+                            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+                            let Ok(Ok(frame)) = tokio::time::timeout(remaining, frames.recv()).await
+                            else {
+                                continue;
+                            };
+                            let Some((_g, header, _p)) = remotehid::parse_frame(&frame) else {
+                                continue;
+                            };
+                            if header.kind() != Some(remotehid::Kind::HostConnect) {
+                                continue;
+                            }
+                            if let Some(start) = frame.iter().position(|&b| b == b'<') {
+                                let text = String::from_utf8_lossy(&frame[start..]).to_string();
+                                let descriptor = text
+                                    .find("<key>ReportDescriptor</key><data>")
+                                    .and_then(|s| {
+                                        let rest =
+                                            &text[s + "<key>ReportDescriptor</key><data>".len()..];
+                                        rest.find('<').map(|e| decode_base64(&rest[..e]))
+                                    })
+                                    .unwrap_or_default();
+                                registry.record(header.device, &text, &descriptor);
+                            }
+                        }
+                        let names: Vec<String> = registry.all().map(|d| d.service.clone()).collect();
+                        tracing::info!("After waiting on this link: {} services {:?}", names.len(), names);
+                        if let Some(packet) = supervisor.record_announcement(&registry, &mut generation) {
+                            if !packet.is_empty() {
+                                tracing::info!("Writing the sample interval after wait");
+                                let _ = aacp.send_raw(packet).await;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    Recovery::WaitForWearer => {
+                        tracing::info!(
+                            "Buds appear to be out of ear; the sensors stay off until worn"
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
             }
         }
-    }
 
-    let devices: Vec<_> = registry.all().cloned().collect();
-    if devices.is_empty() {
-        tracing::warn!("No DeviceConnect received; the accessory did not announce anything");
-        return;
-    }
+        // Samples should start within a second. Watch for a few seconds so a
+        // silent failure is still caught before declaring success.
+        for second in 1..=10 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let seen = aacp.head_samples_seen().await;
+            if seen > 0 {
+                let rate = aacp.head_tracking_rate_hz().await;
+                tracing::info!(
+                    ">>> Streaming: {} samples, {}",
+                    seen,
+                    rate.map(|r| format!("{:.0} Hz", r))
+                        .unwrap_or_else(|| "rate pending".into())
+                );
+                if second >= 3 {
+                    tracing::info!("Head tracking verified; leaving the stream running");
+                    let _ = aacp.stop_head_tracking().await;
+                    return;
+                }
+            } else if second == 10 {
+                tracing::warn!("Interval written but no samples arrived");
+            }
+        }
 
-    let motion = registry
-        .motion_device()
-        .cloned()
-        .or_else(|| devices.first().cloned());
-    let Some(motion) = motion else {
-        return;
-    };
-    tracing::info!(
-        "Motion service: {} (dev {}), declares Feature report: {}",
-        motion.service,
-        motion.device,
-        motion.has_feature_report
-    );
-    if !motion.has_feature_report {
-        tracing::warn!(
-            "No Feature report declared, so the documented SetReport (Feature \
-             report 1 = interval) has nothing to write to on this firmware."
-        );
-    }
-
-    tracing::info!(
-        "Starting {} Hz on {} (device {})",
-        1_000_000 / 10_000,
-        motion.service,
-        motion.device
-    );
-    let set = remotehid::make_set_interval(generation.next(), motion.device, 10_000);
-    tracing::debug!("SetReport: {:02X?}", set);
-    if let Err(e) = aacp.send_raw(set).await {
-        tracing::error!("SetReport send failed: {}", e);
-        return;
-    }
-
-    for second in 1..=15 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let samples = aacp.head_samples_seen().await;
-        tracing::info!("t={:>2}s  motion samples={}", second, samples);
-        if samples > 0 {
-            tracing::info!(">>> RemoteHID stream is running");
-            break;
+        if matches!(supervisor.state(), StreamState::Streaming { .. }) {
+            tracing::warn!("Stream did not produce samples; retrying with a link reset");
         }
     }
 
-    let _ = aacp.stop_head_tracking().await;
-    tracing::info!("RemoteHID test complete");
+    tracing::error!(
+        "Gave up after {} attempts. If the buds are in the case the sensors are \
+         powered down; otherwise the accessory is stuck and needs a manual reset.",
+        MAX_ATTEMPTS
+    );
 }
+
+
 
 /// Minimal base64 decoder for the descriptor blobs embedded in DeviceConnect.
 fn decode_base64(input: &str) -> Vec<u8> {
