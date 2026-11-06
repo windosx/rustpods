@@ -381,6 +381,86 @@ fn build_ui(app: &Application) {
     });
 }
 
+/// Drives the head-tracked audio stage for as long as poses arrive.
+///
+/// ## Rate
+///
+/// Poses arrive at roughly 100 Hz. The mixer must not be retuned at that rate:
+/// every update costs a full convolution-kernel rebuild inside PipeWire, so the
+/// [`AzimuthSchedule`](crate::system::audio_follow::AzimuthSchedule) quantises to
+/// five degrees with a 50 ms floor, turning a hundred writes a second into a
+/// handful.
+///
+/// ## Why only the HRTF path is driven
+///
+/// An amplitude pan is also available here, and an earlier version updated it
+/// alongside the azimuth. That was wrong: with the filter chain in the audio
+/// path the sound is already spatialised by convolution, and stacking a channel
+/// gain on top would apply the head position twice and exaggerate it. The pan
+/// stays in the code as a fallback for builds without HRTF, not as a second
+/// effect.
+///
+/// ## Failure
+///
+/// Audio is optional. If PipeWire is not running, or the filter chain has not
+/// been configured, the stage reports itself unavailable and this returns
+/// quietly; the compass and battery display are unaffected.
+#[cfg(feature = "audio-follow")]
+async fn run_audio_follow(
+    pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
+) {
+    use crate::system::audio_follow::{AzimuthSchedule, FilterPlan, HrtfClient};
+
+    let plan = FilterPlan::default();
+    let mut client = match HrtfClient::start(&plan) {
+        Ok(client) => client,
+        Err(e) => {
+            warn!("Head-tracked audio unavailable: {}", e);
+            return;
+        }
+    };
+
+    let mut schedule = AzimuthSchedule::new();
+    let mut rx = pose_rx;
+    let started = std::time::Instant::now();
+    let mut announced = false;
+
+    loop {
+        if rx.changed().await.is_err() {
+            break;
+        }
+
+        if !announced && client.is_running() {
+            info!("Head-tracked audio is live on '{}'", plan.node_name);
+            announced = true;
+        }
+
+        let pose = *rx.borrow_and_update();
+        let Some(pose) = pose else {
+            // Tracking stopped: recentre so a stale head angle does not persist.
+            schedule.reset();
+            let now_ms = started.elapsed().as_millis() as u64;
+            client.set_azimuth(schedule.commit(0.0, now_ms));
+            continue;
+        };
+
+        let now_ms = started.elapsed().as_millis() as u64;
+        if schedule.should_update(pose.yaw, now_ms) {
+            let azimuth = schedule.commit(pose.yaw, now_ms);
+            client.set_azimuth(azimuth);
+        }
+    }
+
+    client.shutdown();
+}
+
+/// Stub for builds without the feature, so the call site stays uniform.
+#[cfg(not(feature = "audio-follow"))]
+async fn run_audio_follow(
+    _pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
+) {
+}
+
 pub async fn start_bluetooth_daemon(
     aacp: Arc<AacpManager>,
     dev_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
@@ -520,6 +600,19 @@ pub async fn start_bluetooth_daemon(
                 }
 
                 let mut last_both_in_ear = false;
+
+                // Head-tracked audio, when this build has it. The stage is
+                // started once per session and fed from the same watch channel
+                // the compass reads, so the two can never disagree about where
+                // the head is.
+                //
+                // It is not tied to the AACP event loop: if PipeWire is missing
+                // or the filter chain is not loaded, the task logs once and
+                // exits, and everything else carries on untouched.
+                {
+                    let pose_rx = aacp.head_pose();
+                    tokio::spawn(run_audio_follow(pose_rx));
+                }
 
                 // The AACP socket can also die silently (device out of range,
                 // grabbed by another host) without sending Disconnected. Poll

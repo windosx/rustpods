@@ -1,3 +1,4 @@
+pub mod audio_follow;
 pub mod bluetooth;
 pub mod config;
 pub mod le_monitor;

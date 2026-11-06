@@ -21,8 +21,19 @@ aes = "0.8"
 cipher = "0.4"
 libc = "0.2"
 
+# Head-tracked audio. Optional because linking libpipewire pulls in a build-time
+# dependency on the PipeWire headers and libclang (pipewire-sys runs bindgen).
+pipewire = { version = "0.10", optional = true }
+libspa = { version = "0.10", optional = true }
+
 # GUI dependencies
 gtk4 = { version = "0.9", features = ["v4_12"] }
 libadwaita = { version = "0.7", features = ["v1_5"] }
 glib = "0.20"
 gio = "0.20"
+
+[features]
+default = []
+# Pan the stereo image to follow the wearer's head. Requires libpipewire-0.3
+# headers and libclang at build time.
+audio-follow = ["dep:pipewire", "dep:libspa"]
