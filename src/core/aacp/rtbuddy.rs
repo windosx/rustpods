@@ -208,9 +208,24 @@ pub fn make_sensor_v2_trigger() -> Vec<u8> {
     ]
 }
 
+/// Spatial audio mode the host declares for head tracking.
+///
+/// macOS sets `mode: 3, head Tracking 1` before it sends the enable:
+///
+/// ```text
+/// DeviceManager Set Spatial Mode: bundleID: com.apple.WebKit.GPU, mode: 3 head Tracking 1
+/// AudioLinkManager setSpatialModeWithBundleID: ..., mode:3, headtrack:1
+/// ```
+///
+/// The byte at offset 9 of the enable is the only candidate field that could
+/// carry this value, but every payload captured so far holds `0x01` there, so
+/// whether the accessory reads the mode from this frame at all is unconfirmed.
+/// `tools/ht_probe.py` sweeps it.
+pub const SPATIAL_MODE_HEAD_TRACKED: u8 = 3;
+
 /// Builds the 14-byte HID enable that starts the `SensorV2` stream.
 ///
-/// Layout, byte-for-byte the payload recorded from a working macOS session
+/// Layout, matched against the payload recorded from a macOS session
 /// (`01 16 00 00 83 34 01 00 D2 01 20 4E 00 00`):
 ///
 /// ```text
@@ -219,20 +234,31 @@ pub fn make_sensor_v2_trigger() -> Vec<u8> {
 /// [3]      reserved            0x00
 /// [4..8]   cookie              u32   (copied from the advertisement)
 /// [8]      report id           0xD2
-/// [9]      enabled             0x01
+/// [9]      enabled / mode      0x01 observed; macOS runs in mode 3
 /// [10..14] interval            u32 microseconds
 /// ```
 ///
 /// The service id must come from the advertisement of this connection, because
 /// the accessory reassigns it on every connect.
 pub fn make_sensor_v2_enable(service_id: u16, cookie: u32, interval_us: u32) -> Vec<u8> {
+    make_sensor_v2_enable_with_mode(service_id, cookie, 0x01, interval_us)
+}
+
+/// Same frame with the offset-9 byte set explicitly, so the probe tool and the
+/// runtime can test the spatial-mode hypothesis without duplicating the layout.
+pub fn make_sensor_v2_enable_with_mode(
+    service_id: u16,
+    cookie: u32,
+    mode: u8,
+    interval_us: u32,
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(14);
     body.push(0x01); // enable flag
     body.extend_from_slice(&service_id.to_le_bytes());
     body.push(0x00); // reserved
     body.extend_from_slice(&cookie.to_le_bytes());
     body.push(REPORT_ID_SENSOR_V2);
-    body.push(0x01);
+    body.push(mode);
     body.extend_from_slice(&interval_us.to_le_bytes());
     make_rtbuddy_envelope(DESCRIPTOR_SENSOR, &body)
 }
@@ -305,6 +331,20 @@ mod tests {
         0x04, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00, 0x10, 0x00, 0x11, 0x00, 0x08, 0x7E, 0x10,
         0x02, 0x42, 0x0B, 0x08, 0x4E, 0x10, 0x02, 0x1A, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00,
     ];
+
+    #[test]
+    fn enable_frame_mode_byte_is_overridable() {
+        // The offset-9 byte is the only field that could carry the spatial mode
+        // macOS sets to 3 before enabling head tracking.
+        let frame = make_sensor_v2_enable_with_mode(22, 0x0001_3483, SPATIAL_MODE_HEAD_TRACKED, INTERVAL_50HZ_US);
+        assert_eq!(frame[20], REPORT_ID_SENSOR_V2);
+        assert_eq!(frame[21], 3);
+        // Everything else must be unchanged from the default frame.
+        let default = make_sensor_v2_enable(22, 0x0001_3483, INTERVAL_50HZ_US);
+        assert_eq!(frame.len(), default.len());
+        assert_eq!(&frame[..21], &default[..21]);
+        assert_eq!(&frame[22..], &default[22..]);
+    }
 
     #[test]
     fn enable_frame_matches_recorded_macos_payload() {

@@ -291,7 +291,140 @@ AirPods 3（A2564，固件 `65.1868046005000000.52`）的 head-tracking 流依�
 - 条件已完备（双耳在耳、音频串流、空间音频激活）
 - 剩余唯一突破口是拿到那 14 字节真实载荷，而唯一的途径 PacketLogger 不可用
 
-**若要继续，需要换设备（AirPods 4 / Pro / Max，有明确成功案例），或获得可用的 HCI 抓包工具。**
+---
+
+## 🔍 完整的触发链路（macOS 二进制 + 运行时日志还原）
+
+这一节是本次排查最重要的产出：把「Linux 上为什么做不到」从猜测变成了有证据的结论。
+
+### 前提：macOS 按 Bundle ID 放行空间音频
+
+你观察到「只有 Safari 和 Apple Music 能开空间音频，第三方浏览器和播放器不行」。`/usr/sbin/bluetoothd` 里的符号证实了这一点：
+
+```
+AudioLinkManager setSpatialModeWithBundleID
+%@, mode:%u, headtrack:%u
+Update SpatialAudio App Based to BTHAL %@ Mode %d headTrack %d
+Notify Spatial Audio Mode changed for device ... for App ... Head Tracking YES
+```
+
+### 运行时日志还原的完整链路
+
+用 `log stream --level debug --predicate 'process == "bluetoothd"'` 在 Safari 播放时抓到：
+
+```
+11:01:55.004  RECV type:40000 dataSize:65              ← SensorV2 样本已在流动 (50 Hz)
+11:01:55.013  Spatial Audio mode for App: com.apple.WebKit.GPU From User (via BTHAL) is : 3
+11:01:55.013  StackManager Get Spatial Mode with Bundle ID: com.apple.WebKit.GPU => 2,1
+11:01:55.013  DeviceManager Set Spatial Mode: bundleID: com.apple.WebKit.GPU, mode: 3 head Tracking 1
+11:01:55.013  AudioLinkManager setSpatialModeWithBundleID: com.apple.WebKit.GPU, mode:3, headtrack:1
+11:01:55.016  Notify Spatial Audio Mode changed ... to 3 ... Head Tracking YES
+11:01:55.075  Sent custom message ... type 0x800, len 14   ← enable，59 ms 后
+11:01:55.513  RECV type:800 len 70                     ← [Sensor] 数据
+```
+
+**`com.apple.WebKit.GPU` 就是 Safari** — 这正好解释了你说的「只有 Safari 能开」。
+
+### 为什么纯 AACP 触发不了
+
+enable 的发出**以 `mode:3 + headtrack:1` 状态为前提**，而该状态由主机音频栈（CoreAudio / BTHAL）按应用声明设置，**不通过任何 AACP 控制命令**。AACP 控制命令表到 `0x41` 为止，没有任何空间音频项。
+
+Linux 上没有对应机制：
+
+| macOS 环节 | Linux 等价物 |
+|---|---|
+| BTHAL 空间音频声明 | 无 |
+| per-app Bundle ID 白名单 | 无 |
+| `mode:3` / `headtrack:1` 状态机 | 无 |
+| WindowServer 发 `kCBMsgIdAccessorySendCustomMessageMsg` | 无 |
+
+所以即使 14 字节发得一模一样，设备也缺少「主机已进入头部追踪模式」的前置条件。
+
+---
+
+## ✅ 解决方案
+
+按可行性排序，每一条都可以直接执行。
+
+### 方案 A：探测 mode 字节（成本最低，建议先做）
+
+macOS 日志显示 `mode: 3 head Tracking 1`，而我们 `enable` 帧里对应位置一直是 `0x01`。**这个字节可能就是我们一直写错的地方，且从未被扫过。**
+
+`tools/ht_probe.py` 已实现这个探测，会依次尝试 `flag × mode` 组合，用设备的 9 字节 ACK 作为判据：
+
+```bash
+# 终端 1：确认帧真的到达控制器
+sudo btmon -w /tmp/probe.btsnoop
+
+# 终端 2：扫 mode 字节
+python3 tools/ht_probe.py CC:68:E0:38:9C:E9
+
+# 扫全范围
+python3 tools/ht_probe.py CC:68:E0:38:9C:E9 --modes 0,1,2,3,4,5,6,7
+```
+
+成功的标志是输出里出现 `*** ACK`。拿到这个值后写进 `src/core/aacp/rtbuddy.rs` 的 `make_sensor_v2_enable`。
+
+**这一步之前从未做过** —— 之前的 48 种组合扫的是 `report id` 和 `interval`，没有扫 `mode`。
+
+### 方案 B：在 PipeWire/BTHAL 层补一个空间音频会话层
+
+如果方案 A 失败，说明确实需要主机侧先声明空间音频会话。落地方式：
+
+1. 新增一个 PipeWire 客户端，在被请求时向 BlueZ 声明「当前应用进入空间音频模式」
+2. 该声明需要落到 BlueZ 的 audio 层（当前 BlueZ 没有此接口，需要扩展或打补丁）
+3. 声明完成后，再发 14 字节 enable
+
+这是**工程量最大但唯一能完整复现 macOS 行为**的路径。可参考 `qeqqe/spatial-track` 的 PipeWire `filter-chain` 结构承载 HRTF 部分。
+
+### 方案 C：绕开 AirPods 传感器，用其他姿态源
+
+如果目标只是「Linux 上的头追空间音频」而不是「用 AirPods 传感器」，则完全不必碰 AACP：
+
+```ini
+# ~/.config/pipewire/pipewire.conf.d/99-spatializer.conf
+context.modules = [
+    {   name = libpipewire-module-filter-chain
+        args = {
+            node.description = "Spatializer"
+            filter.graph = {
+                nodes = [
+                    { type = sofa label = spatializer name = spat_l
+                      config = { filename = "/usr/share/pipewire/sofa/subject_021.sofa" }
+                      control = { "Azimuth" = 30.0 "Elevation" = 0.0 "Radius" = 1.5 } }
+                    { type = sofa label = spatializer name = spat_r
+                      config = { filename = "/usr/share/pipewire/sofa/subject_021.sofa" }
+                      control = { "Azimuth" = -30.0 "Elevation" = 0.0 "Radius" = 1.5 } }
+                ]
+            }
+        }
+    }
+]
+```
+
+姿态来源用 `opentrack`（UDP `127.0.0.1:4242`），它支持神经网络人脸追踪，不依赖任何耳机硬件。这条路线已被 [`qeqqe/spatial-track`](https://github.com/qeqqe/spatial-track) 验证可行。
+
+### 方案 D：换设备
+
+`batubozkan/pods-head-tracker`（70 stars）在 **AirPods 4 (ANC)** 上验证通过，并注明 AirPods 3 未测试。若手边有 AirPods 4 / Pro / Max，本项目的 AACP 实现可直接复用验证。
+
+---
+
+## 🧰 附带工具
+
+| 工具 | 用途 |
+|---|---|
+| `tools/ht_probe.py` | 扫描 enable 帧的 `mode` 字节，用 9 字节 ACK 判断成败 |
+| `tools/parse_btsnoop.py` | 解析 `btmon -w` 生成的 btsnoop，提取所有 RTBuddy 帧 |
+
+**注意**：Linux 上 `btmon` 可以直接抓 HCI（适配器在 USB 总线上时无需任何特权绕过）：
+
+```bash
+sudo btmon -w /tmp/capture.btsnoop
+```
+
+这是排查 AACP 问题最快的手段，比在 macOS 上折腾 PacketLogger 可靠得多。
+
 
 
 

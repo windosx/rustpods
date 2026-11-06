@@ -3,3 +3,7 @@
 # Local tooling and one-off capture artifacts, not part of the project.
 /.zcode
 /sysdiagnose_*
+
+# Python bytecode from the helper tools
+__pycache__/
+*.pyc
