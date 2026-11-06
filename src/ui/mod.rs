@@ -459,6 +459,7 @@ pub async fn start_bluetooth_daemon(
                 // will not enable tracking until an application asks for it.
                 {
                     let camera = aacp.clone();
+                    let target = current_state.mac_address.clone();
                     tokio::spawn(async move {
                         camera
                             .claim_spatial_audio(
@@ -467,12 +468,73 @@ pub async fn start_bluetooth_daemon(
                                 true,
                             )
                             .await;
-                        // The supervisor inside start_head_tracking handles the
-                        // announce/wait/retry cycle on its own.
-                        match camera.start_head_tracking().await {
-                            Ok(()) => info!("Head tracking started"),
-                            Err(e) => warn!("Head tracking unavailable: {}", e),
+
+                        // The accessory announces its sensor services
+                        // unreliably: a freshly connected unit often reports
+                        // none, and only a link cycle clears that. Verified on
+                        // hardware - the same unit needed two cycles before it
+                        // listed all eight services. So cycle a few times around
+                        // the in-place retries that start_head_tracking already
+                        // does.
+                        for attempt in 1..=3 {
+                            match camera.start_head_tracking().await {
+                                Ok(()) => {
+                                    info!("Head tracking started (attempt {})", attempt);
+                                    for _ in 0..10 {
+                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                        if camera.head_samples_seen().await > 0 {
+                                            info!("Head tracking is producing samples");
+                                            return;
+                                        }
+                                    }
+                                    warn!("No samples after attempt {}; retrying", attempt);
+                                }
+                                Err(e) => {
+                                    warn!("Attempt {} failed: {}", attempt, e);
+                                    // The driver cycled the Bluetooth link, which
+                                    // kills the socket this manager holds. Rebuild
+                                    // it before trying again, otherwise every
+                                    // later attempt talks to a dead session.
+                                    if e.contains("link recycled") {
+                                        if let Ok(addr) = target.parse() {
+                                            if let Err(e) =
+                                                camera.connect_without_handshake(addr).await
+                                            {
+                                                warn!("Reconnect failed: {}", e);
+                                                return;
+                                            }
+                                            let _ = camera
+                                                .send_raw(vec![
+                                                    0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02,
+                                                    0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                ])
+                                                .await;
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(300),
+                                            )
+                                            .await;
+                                            let _ = camera
+                                                .send_raw(vec![
+                                                    0x04, 0x00, 0x04, 0x00, 0x4D, 0x00, 0xD7,
+                                                    0x00, 0, 0, 0, 0, 0, 0,
+                                                ])
+                                                .await;
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(150),
+                                            )
+                                            .await;
+                                            let _ = camera
+                                                .send_raw(vec![
+                                                    0x04, 0x00, 0x04, 0x00, 0x0F, 0x00, 0xFF,
+                                                    0xFF, 0xFF, 0xFF,
+                                                ])
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
                         }
+                        warn!("Head tracking could not be started automatically");
                     });
                 }
 

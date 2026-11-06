@@ -752,6 +752,7 @@ impl AacpManager {
         let tracker = Arc::clone(&self.head_tracker);
         let spatial = Arc::clone(&self.spatial);
         let frames = self.rtb_acp_tx.subscribe();
+        let address = self.state.read().await.airpods_address;
 
         tokio::spawn(async move {
             if tracker.lock().await.samples_seen() > 0 {
@@ -766,7 +767,7 @@ impl AacpManager {
                 }
             }
 
-            if let Err(e) = drive_remote_hid(sender, frames, tracker).await {
+            if let Err(e) = drive_remote_hid(sender, frames, tracker, address).await {
                 warn!("RemoteHID could not be started: {}", e);
             }
         });
@@ -798,6 +799,7 @@ async fn drive_remote_hid(
     sender: mpsc::Sender<Vec<u8>>,
     mut frames: broadcast::Receiver<Vec<u8>>,
     _tracker: Arc<Mutex<HeadTracker>>,
+    address: Option<Address>,
 ) -> Result<(), String> {
     let mut registry = remotehid::DeviceRegistry::new();
     let mut generation = remotehid::Generation::default();
@@ -805,8 +807,7 @@ async fn drive_remote_hid(
 
     // The announcement burst can lag the AACP session by several seconds on a
     // cold accessory, so this retries in place rather than giving up after one
-    // window. Reconnecting is deliberately not attempted from here: the caller
-    // owns the link, and a reconnect restarts the accessory's own init.
+    // window.
     for round in 1..=4 {
         supervisor.begin_attempt();
         registry.clear();
@@ -850,12 +851,39 @@ async fn drive_remote_hid(
         }
     }
 
+    // The accessory refused to announce anything on this link. Cycling it is the
+    // only software lever left, and the caller has to rebuild the AACP session
+    // afterwards - a bare Bluetooth reconnect leaves this socket dead, which is
+    // why reconnecting here without telling the caller produced no improvement.
+    if let Some(addr) = address {
+        warn!(
+            "No announcements after {} rounds; cycling the Bluetooth link to {}",
+            4, addr
+        );
+        let addr_text = addr.to_string();
+        let _ = tokio::process::Command::new("bluetoothctl")
+            .args(["disconnect", &addr_text])
+            .output()
+            .await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = tokio::process::Command::new("bluetoothctl")
+            .args(["connect", &addr_text])
+            .output()
+            .await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        return Err(RECONNECT_NEEDED.to_string());
+    }
+
     Err(format!(
         "the motion service was never announced. If the buds are in the case the \
          sensors are powered down; otherwise the accessory is stuck and needs a \
          case cycle (the firmware enters a state no software reset clears)."
     ))
 }
+
+/// Marker returned by [`drive_remote_hid`] when it dropped the link and the
+/// caller should rebuild the session and try again.
+const RECONNECT_NEEDED: &str = "link recycled; reconnect the AACP session";
 
 /// Records a DeviceConnect frame in the registry, ignoring anything else.
 fn record_connect(registry: &mut remotehid::DeviceRegistry, frame: &[u8]) {
