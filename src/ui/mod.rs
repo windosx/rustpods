@@ -241,18 +241,22 @@ fn build_ui(app: &Application) {
                 let calibrated = aacp_feed.is_head_tracking_active().await;
                 let rate = aacp_feed.head_tracking_rate_hz().await;
 
+                // Report what the negotiation is actually doing, not a fixed
+                // string. A failure and a still-starting stream used to look
+                // identical here, which made the page useless for diagnosis.
+                let negotiation = aacp_feed.head_tracking_status().await;
                 {
                     let mut state = handles_feed.head_tracking.state.borrow_mut();
                     state.pose = pose;
                     state.calibrated = calibrated;
                     state.rate_hz = rate;
                     state.status = match (pose, calibrated) {
-                        (None, _) => "等待数据流…（请确认 AirPods 已连接）".to_string(),
-                        (Some(_), false) => "正在校准中立姿态…（保持头部静止）".to_string(),
                         (Some(_), true) => match rate {
                             Some(hz) => format!("实时姿态流 · {:.0} Hz", hz),
                             None => "实时姿态流".to_string(),
                         },
+                        (Some(_), false) => "正在校准中立姿态…（保持头部静止）".to_string(),
+                        (None, _) => format!("等待数据流 · {}", negotiation),
                     };
                 }
                 components::headtracking::update_head_tracking_widgets(&handles_feed.head_tracking);

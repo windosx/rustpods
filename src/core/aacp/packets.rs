@@ -3,7 +3,7 @@ use super::events::{
     AacpEvent, BatteryComponent, BatteryStatus, EarDetectionEvent, EarStatus, SingleBatteryInfo,
     StemBud, StemPressType,
 };
-use tracing::debug;
+use tracing::{debug, trace};
 
 pub const PSM_AACP: u16 = 0x1001;
 pub const HEADER: [u8; 4] = [0x04, 0x00, 0x04, 0x00];
@@ -19,6 +19,14 @@ pub mod opcodes {
     pub const CONTROL_COMMAND: u8 = 0x09;
     pub const REQUEST_NOTIFICATIONS: u8 = 0x0F;
     pub const HEAD_TRACKING: u8 = 0x17;
+    /// A connected-device list change (LibrePods calls it "TiPi 1").
+    pub const CONNECTED_DEVICES: u8 = 0x2E;
+    /// Which device currently owns the audio stream ("TiPi 2").
+    pub const AUDIO_SOURCE: u8 = 0x0E;
+    /// Another "TiPi" status frame; the payload is a list of MAC addresses.
+    pub const TIPI_3: u8 = 0x0C;
+    /// Proximity key response.
+    pub const PROXIMITY_KEYS_RSP: u8 = 0x31;
     pub const STEM_PRESS: u8 = 0x19;
     pub const RENAME: u8 = 0x1A;
     pub const INFORMATION: u8 = 0x1D;
@@ -323,7 +331,43 @@ pub fn parse_aacp_packet(packet: &[u8]) -> Option<AacpEvent> {
             }
         }
 
+        // These arrive constantly on a live link. Logging them as "unhandled"
+        // buried the messages that matter, so each one is named and logged at
+        // trace level instead.
+        opcodes::CONNECTED_DEVICES => {
+            trace!(
+                "Connected-devices list changed ({} bytes)",
+                payload.len()
+            );
+            None
+        }
+        opcodes::AUDIO_SOURCE => {
+            trace!("Audio source update ({} bytes)", payload.len());
+            None
+        }
+        opcodes::TIPI_3 => {
+            trace!("TiPi status frame ({} bytes)", payload.len());
+            None
+        }
+        opcodes::PROXIMITY_KEYS_RSP => {
+            trace!("Proximity keys response ({} bytes)", payload.len());
+            None
+        }
+        0x08 => {
+            trace!("Secondary-setting frame ({} bytes)", payload.len());
+            None
+        }
+        0x2B => {
+            trace!("Link statistics frame ({} bytes)", payload.len());
+            None
+        }
+        0x28 => {
+            trace!("Conversation-detect state ({} bytes)", payload.len());
+            None
+        }
+
         _ => {
+            // Genuinely unknown: keep it visible, it may matter.
             debug!("Unhandled opcode 0x{:02X}, len: {}", opcode, packet.len());
             None
         }

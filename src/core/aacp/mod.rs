@@ -49,6 +49,13 @@ pub struct AacpManager {
     /// Latest ear-detection status, cached so callers can tell "buds in case"
     /// from "buds stuck" without waiting for the next notification.
     ear_status: Arc<Mutex<Option<(EarStatus, EarStatus)>>>,
+    /// Human-readable progress of the head-tracking negotiation, for the UI.
+    ///
+    /// The spatial-audio page had a hardcoded "waiting for data" string, so a
+    /// failed negotiation looked identical to one still in progress. This carries
+    /// what actually happened: how many services were announced, whether the
+    /// interval write went out, and how many samples arrived.
+    head_status: Arc<Mutex<String>>,
     /// Which application currently holds the spatial-audio claim.
     ///
     /// macOS only sends the enable once an app has claimed spatial audio in
@@ -186,6 +193,7 @@ impl AacpManager {
             rtb_acp_tx,
             neorelay_ids: Arc::new(Mutex::new(None)),
             ear_status: Arc::new(Mutex::new(None)),
+            head_status: Arc::new(Mutex::new("head tracking not started".to_string())),
             spatial: Arc::new(Mutex::new(SpatialSession::new())),
         }
     }
@@ -209,6 +217,16 @@ impl AacpManager {
     /// How many attitude samples have been parsed since the stream started.
     pub async fn head_samples_seen(&self) -> u64 {
         self.head_tracker.lock().await.samples_seen()
+    }
+
+    /// Current head-tracking progress, for display.
+    pub async fn head_tracking_status(&self) -> String {
+        self.head_status.lock().await.clone()
+    }
+
+    /// Updates the progress string the UI shows.
+    pub async fn set_head_tracking_status(&self, text: impl Into<String>) {
+        *self.head_status.lock().await = text.into();
     }
 
     /// Last ear status the accessory reported, if any.
@@ -752,6 +770,7 @@ impl AacpManager {
         let tracker = Arc::clone(&self.head_tracker);
         let spatial = Arc::clone(&self.spatial);
         let frames = self.rtb_acp_tx.subscribe();
+        let status = Arc::clone(&self.head_status);
         let address = self.state.read().await.airpods_address;
 
         tokio::spawn(async move {
@@ -767,7 +786,7 @@ impl AacpManager {
                 }
             }
 
-            if let Err(e) = drive_remote_hid(sender, frames, tracker, address).await {
+            if let Err(e) = drive_remote_hid(sender, frames, tracker, address, status).await {
                 warn!("RemoteHID could not be started: {}", e);
             }
         });
@@ -800,6 +819,7 @@ async fn drive_remote_hid(
     mut frames: broadcast::Receiver<Vec<u8>>,
     _tracker: Arc<Mutex<HeadTracker>>,
     address: Option<Address>,
+    status: Arc<Mutex<String>>,
 ) -> Result<(), String> {
     let mut registry = remotehid::DeviceRegistry::new();
     let mut generation = remotehid::Generation::default();
@@ -834,10 +854,26 @@ async fn drive_remote_hid(
             announced.len(),
             announced
         );
+        {
+            let mut st = status.lock().await;
+            *st = if announced.is_empty() {
+                format!("round {}/{}: the accessory announced no sensor services", round, ROUNDS)
+            } else {
+                format!(
+                    "round {}/{}: {} services ({})",
+                    round,
+                    ROUNDS,
+                    announced.len(),
+                    announced.join(", ")
+                )
+            };
+        }
 
         if let Some(packet) = supervisor.record_announcement(&registry, &mut generation) {
             if !packet.is_empty() {
                 info!("Writing the sample interval for the motion service");
+                *status.lock().await =
+                    "motion service found; interval written, waiting for samples".to_string();
                 sender
                     .send(packet)
                     .await
@@ -858,12 +894,13 @@ async fn drive_remote_hid(
     // the connection alone lets the next attempt succeed as soon as the wearer
     // puts the buds back in.
     let _ = address;
-    Err(format!(
-        "the motion service was never announced after {} rounds. Put the buds back \
-         in the case and take them out again - that is what re-arms the sensor \
-         announcement on this firmware.",
+    let message = format!(
+        "no motion service after {} rounds. Put the buds in the case and take them \
+         out again to re-arm the sensor announcement",
         ROUNDS
-    ))
+    );
+    *status.lock().await = message.clone();
+    Err(message)
 }
 
 /// How many announcement windows to watch before giving up on this attempt.
