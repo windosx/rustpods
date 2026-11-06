@@ -291,6 +291,28 @@ pub fn make_alternate_start_head_tracking(interval_us: u32) -> Vec<u8> {
     make_rtbuddy_envelope(DESCRIPTOR_SENSOR_DATA_WX, &body)
 }
 
+/// Asks the accessory to send every descriptor it has.
+///
+/// This, not the per-service subscription, is what makes the accessory announce
+/// its sensors. Verified against `starman-tech/mousepods`
+/// (`captures/mtu_test.py`): the reference client sends `22 00` and then
+/// `10 02 22 00` on descriptor `0x100000` and receives the full eight-service
+/// burst, while sending only the per-service frames produces nothing.
+///
+/// The body is `field 4 (0x22)`, with an empty value first and then `field 2 = 2`.
+pub fn make_request_all_descriptors(seq: u64, with_field2: bool) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(0x08); // field 1: seq
+    encode_varint(seq, &mut body);
+    if with_field2 {
+        body.push(0x10); // field 2
+        body.push(0x02);
+    }
+    body.push(0x22); // field 4: request all descriptors
+    body.push(0x00);
+    make_rtbuddy_envelope(DESCRIPTOR_SENSOR_DATA_WX, &body)
+}
+
 /// Builds a `SensorDataWX` subscription for an arbitrary service id.
 ///
 /// This is the original multi-service subscribe frame: the accessory only

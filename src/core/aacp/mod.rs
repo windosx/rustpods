@@ -49,6 +49,15 @@ pub struct AacpManager {
     /// Latest ear-detection status, cached so callers can tell "buds in case"
     /// from "buds stuck" without waiting for the next notification.
     ear_status: Arc<Mutex<Option<(EarStatus, EarStatus)>>>,
+    /// Services the accessory announced on this connection, kept up to date by
+    /// the receive loop.
+    ///
+    /// The announcement burst arrives during the handshake, well before
+    /// `start_head_tracking` is called, and a broadcast channel only delivers
+    /// messages sent after subscribing. Caching here is what makes the burst
+    /// visible to whoever starts tracking later - without it every round reports
+    /// zero services even though eight were announced.
+    remotes: Arc<Mutex<remotehid::DeviceRegistry>>,
     /// Human-readable progress of the head-tracking negotiation, for the UI.
     ///
     /// The spatial-audio page had a hardcoded "waiting for data" string, so a
@@ -194,6 +203,7 @@ impl AacpManager {
             neorelay_ids: Arc::new(Mutex::new(None)),
             ear_status: Arc::new(Mutex::new(None)),
             head_status: Arc::new(Mutex::new("head tracking not started".to_string())),
+            remotes: Arc::new(Mutex::new(remotehid::DeviceRegistry::new())),
             spatial: Arc::new(Mutex::new(SpatialSession::new())),
         }
     }
@@ -351,6 +361,7 @@ impl AacpManager {
         let rtb_acp_tx = self.rtb_acp_tx.clone();
         let neorelay_ids = Arc::clone(&self.neorelay_ids);
         let ear_cache = Arc::clone(&self.ear_status);
+        let remotes = Arc::clone(&self.remotes);
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -397,6 +408,10 @@ impl AacpManager {
                                 // DeviceConnect plists, so they still have to
                                 // reach the tap.
                                 rtb_acp_tx.send(packet.to_vec()).ok();
+                                // Also record it here: the burst lands during
+                                // the handshake, before anything subscribes to
+                                // the tap, so a broadcast alone would lose it.
+                                record_advertisement(&remotes, packet).await;
                                 continue;
                             }
                             // Short frames on this descriptor are descriptor
@@ -650,7 +665,19 @@ impl AacpManager {
     /// This three-service sweep plus ACK is what makes the accessory start
     /// reporting its sensor capabilities at all.
     pub async fn subscribe_rtbuddy_motion(&self) -> Result<(), String> {
-        info!("Subscribing to RTBuddy sensor services...");
+        info!("Requesting all RTBuddy descriptors...");
+
+        // This is the step that actually makes the accessory announce its
+        // sensors. The per-service subscriptions below are kept because they set
+        // the reporting interval, but on their own they produce no announcement
+        // burst at all - confirmed against the reference client and by the
+        // eight-service burst appearing right after these two frames.
+        self.send_raw(rtbuddy::make_request_all_descriptors(0x42, false))
+            .await?;
+        sleep(Duration::from_millis(60)).await;
+        self.send_raw(rtbuddy::make_request_all_descriptors(0x43, true))
+            .await?;
+        sleep(Duration::from_millis(120)).await;
 
         for (service, seq) in [
             (rtbuddy::SERVICE_NEORELAY, 100u64),
@@ -771,6 +798,7 @@ impl AacpManager {
         let spatial = Arc::clone(&self.spatial);
         let frames = self.rtb_acp_tx.subscribe();
         let status = Arc::clone(&self.head_status);
+        let remotes = Arc::clone(&self.remotes);
         let address = self.state.read().await.airpods_address;
 
         tokio::spawn(async move {
@@ -786,7 +814,7 @@ impl AacpManager {
                 }
             }
 
-            if let Err(e) = drive_remote_hid(sender, frames, tracker, address, status).await {
+            if let Err(e) = drive_remote_hid(sender, frames, tracker, address, status, remotes).await {
                 warn!("RemoteHID could not be started: {}", e);
             }
         });
@@ -820,8 +848,8 @@ async fn drive_remote_hid(
     _tracker: Arc<Mutex<HeadTracker>>,
     address: Option<Address>,
     status: Arc<Mutex<String>>,
+    remotes: Arc<Mutex<remotehid::DeviceRegistry>>,
 ) -> Result<(), String> {
-    let mut registry = remotehid::DeviceRegistry::new();
     let mut generation = remotehid::Generation::default();
     let mut supervisor = session::StreamSupervisor::new();
 
@@ -830,19 +858,22 @@ async fn drive_remote_hid(
     // window.
     for round in 1..=ROUNDS {
         supervisor.begin_attempt();
-        registry.clear();
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // The announcement burst arrives during the handshake, so the cached
+        // registry is already populated. Drain the live channel first to pick up
+        // anything sent since, then read the cache.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
         while tokio::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let Ok(received) = tokio::time::timeout(remaining, frames.recv()).await else {
                 break;
             };
-            let Ok(frame) = received else {
+            let Ok(_frame) = received else {
                 return Err("AACP receive channel closed".to_string());
             };
-            record_connect(&mut registry, &frame);
+            // The receive loop records these already; nothing to do per frame.
         }
+        let registry = { remotes.lock().await.clone() };
 
         let announced: Vec<String> = registry
             .all()
@@ -905,6 +936,15 @@ async fn drive_remote_hid(
 
 /// How many announcement windows to watch before giving up on this attempt.
 const ROUNDS: u32 = 4;
+
+/// Records a DeviceConnect advertisement in the shared registry.
+///
+/// Called from the receive loop, which sees the burst during the handshake - well
+/// before anything asks for the stream.
+async fn record_advertisement(registry: &Mutex<remotehid::DeviceRegistry>, frame: &[u8]) {
+    let mut guard = registry.lock().await;
+    record_connect(&mut guard, frame);
+}
 
 /// Records a DeviceConnect frame in the registry, ignoring anything else.
 fn record_connect(registry: &mut remotehid::DeviceRegistry, frame: &[u8]) {

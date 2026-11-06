@@ -18,6 +18,14 @@ struct Cli {
 
     #[arg(
         long,
+        value_name = "PATH",
+        help = "Also write logs to this file (useful when started from the desktop \
+                entry, where stdout goes nowhere)"
+    )]
+    log_file: Option<String>,
+
+    #[arg(
+        long,
         value_name = "MAC",
         help = "Connect to the given AirPods and print the head-tracking stream"
     )]
@@ -69,14 +77,43 @@ fn main() {
         tracing::Level::INFO
     };
 
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(log_level.into())
-                .from_env_lossy(),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(log_level.into())
+        .from_env_lossy();
+
+    // A file layer matters because the GUI is normally launched from the desktop
+    // entry: stdout goes nowhere there, and `journalctl` sees nothing because the
+    // process does not log through syslog.
+    let log_file = cli.log_file.clone().map(|path| {
+        use std::fs::OpenOptions;
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                eprintln!("could not open log file {}: {}", path, e);
+                None
+            }
+        }
+    });
+
+    match log_file.flatten() {
+        Some(file) => {
+            let writer = std::sync::Mutex::new(file);
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(writer),
+                )
+                .with(filter)
+                .init();
+        }
+        None => {
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer())
+                .with(filter)
+                .init();
+        }
+    }
 
     info!("Starting RustPods v{}...", env!("CARGO_PKG_VERSION"));
 

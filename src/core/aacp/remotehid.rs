@@ -301,7 +301,7 @@ pub fn scan_report_ids(descriptor: &[u8]) -> (Vec<u8>, bool) {
 }
 
 /// Collects the services announced in DeviceConnect frames.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DeviceRegistry {
     devices: HashMap<u8, RemoteDevice>,
 }
