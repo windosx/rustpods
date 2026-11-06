@@ -267,7 +267,7 @@ async fn run_spatial_session_test(target: &str) {
 /// Everything here runs unattended: the earbuds never have to be touched.
 async fn run_remotehid_test(target: &str) {
     use crate::core::aacp::remotehid;
-    use crate::core::aacp::session::{Recovery, StreamState, StreamSupervisor, RECOVERY_GAP};
+    use crate::core::aacp::session::{Recovery, StreamState, StreamSupervisor};
     use std::time::Duration;
 
     const MAX_ATTEMPTS: u32 = 4;
@@ -279,26 +279,10 @@ async fn run_remotehid_test(target: &str) {
     let mut supervisor = StreamSupervisor::new();
     let mut generation = remotehid::Generation::default();
 
+    // One connection, watched patiently. Do not disconnect: cycling the link was
+    // tried and it is destructive, pushing the accessory into a state where it
+    // refuses paging and only a physical case cycle brings it back.
     for attempt in 1..=MAX_ATTEMPTS {
-        if attempt > 1 {
-            tracing::warn!(
-                "Recovering the accessory: dropping the Bluetooth link and waiting {:?}",
-                RECOVERY_GAP
-            );
-            let _ = tokio::process::Command::new("bluetoothctl")
-                .args(["disconnect", target])
-                .output()
-                .await;
-            tokio::time::sleep(RECOVERY_GAP).await;
-            let out = tokio::process::Command::new("bluetoothctl")
-                .args(["connect", target])
-                .output()
-                .await;
-            let ok = out.map(|o| o.status.success()).unwrap_or(false);
-            tracing::info!("Reconnect {}", if ok { "succeeded" } else { "failed" });
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-
         supervisor.begin_attempt();
 
         tracing::info!("Connecting AACP (attempt {}/{})", attempt, MAX_ATTEMPTS);

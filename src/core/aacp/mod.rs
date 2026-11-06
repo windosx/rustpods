@@ -808,7 +808,7 @@ async fn drive_remote_hid(
     // The announcement burst can lag the AACP session by several seconds on a
     // cold accessory, so this retries in place rather than giving up after one
     // window.
-    for round in 1..=4 {
+    for round in 1..=ROUNDS {
         supervisor.begin_attempt();
         registry.clear();
 
@@ -851,39 +851,23 @@ async fn drive_remote_hid(
         }
     }
 
-    // The accessory refused to announce anything on this link. Cycling it is the
-    // only software lever left, and the caller has to rebuild the AACP session
-    // afterwards - a bare Bluetooth reconnect leaves this socket dead, which is
-    // why reconnecting here without telling the caller produced no improvement.
-    if let Some(addr) = address {
-        warn!(
-            "No announcements after {} rounds; cycling the Bluetooth link to {}",
-            4, addr
-        );
-        let addr_text = addr.to_string();
-        let _ = tokio::process::Command::new("bluetoothctl")
-            .args(["disconnect", &addr_text])
-            .output()
-            .await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let _ = tokio::process::Command::new("bluetoothctl")
-            .args(["connect", &addr_text])
-            .output()
-            .await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        return Err(RECONNECT_NEEDED.to_string());
-    }
-
+    // Deliberately no disconnect here. Cycling the Bluetooth link was tried and
+    // it is destructive: the accessory ends up refusing paging outright
+    // (`br-connection-page-timeout`) and only a physical case cycle brings it
+    // back, while macOS never does this - it keeps one link and waits. Leaving
+    // the connection alone lets the next attempt succeed as soon as the wearer
+    // puts the buds back in.
+    let _ = address;
     Err(format!(
-        "the motion service was never announced. If the buds are in the case the \
-         sensors are powered down; otherwise the accessory is stuck and needs a \
-         case cycle (the firmware enters a state no software reset clears)."
+        "the motion service was never announced after {} rounds. Put the buds back \
+         in the case and take them out again - that is what re-arms the sensor \
+         announcement on this firmware.",
+        ROUNDS
     ))
 }
 
-/// Marker returned by [`drive_remote_hid`] when it dropped the link and the
-/// caller should rebuild the session and try again.
-const RECONNECT_NEEDED: &str = "link recycled; reconnect the AACP session";
+/// How many announcement windows to watch before giving up on this attempt.
+const ROUNDS: u32 = 4;
 
 /// Records a DeviceConnect frame in the registry, ignoring anything else.
 fn record_connect(registry: &mut remotehid::DeviceRegistry, frame: &[u8]) {
