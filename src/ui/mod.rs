@@ -376,9 +376,30 @@ fn build_ui(app: &Application) {
     let ui_tx_bg = ui_event_tx.clone();
     let cfg_bg = config.clone();
 
+    // Serve ZCode question hooks. If the --no-gui daemon already owns the
+    // socket, this quietly does nothing; either way the hook finds a server.
+    tokio::spawn(crate::system::zcode_ask::run_socket_server());
+
     tokio::spawn(async move {
         start_bluetooth_daemon(aacp_bg, dev_state_bg, mpris_bg, ui_tx_bg, cfg_bg).await;
     });
+
+    // Poll the ZCode question state for the card. The hub is plain shared
+    // state, and the card is a status surface, so a 5 Hz poll is simpler than
+    // bridging another async channel into the GTK loop.
+    {
+        let handles_ask = handles.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            let progress = crate::system::zcode_ask::ASK_HUB.progress_snapshot();
+            let resolved = crate::system::zcode_ask::ASK_HUB.resolved_note();
+            components::zcode_ask::update_zcode_ask_widgets(
+                &handles_ask.zcode_ask,
+                progress,
+                resolved,
+            );
+            glib::ControlFlow::Continue
+        });
+    }
 }
 
 /// Drives the head-tracked audio stage for as long as poses arrive.
@@ -612,6 +633,14 @@ pub async fn start_bluetooth_daemon(
                 {
                     let pose_rx = aacp.head_pose();
                     tokio::spawn(run_audio_follow(pose_rx));
+                }
+
+                // Head-gesture answering of ZCode questions, fed from the same
+                // watch channel as the compass. Retires any task from a
+                // previous connection itself.
+                {
+                    let pose_rx = aacp.head_pose();
+                    tokio::spawn(crate::system::zcode_ask::run_question_answers(pose_rx));
                 }
 
                 // The AACP socket can also die silently (device out of range,

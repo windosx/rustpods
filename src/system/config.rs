@@ -31,6 +31,20 @@ pub struct AppConfig {
     pub stem_long_press: StemAction,
     pub start_minimized: bool,
     pub close_to_tray: bool,
+    /// Answers ZCode `AskUserQuestion` prompts by counting head nods while a
+    /// question is pending. The ZCode hook always falls back to the normal
+    /// question UI when this is off, so the toggle only silences the feature.
+    ///
+    /// `serde(default)` keeps config files written before this field existed
+    /// parseable - a missing field must fall back to the feature default, not
+    /// invalidate the whole file (a parse failure here discards every saved
+    /// preference and rewrites the file from scratch).
+    #[serde(default = "default_true")]
+    pub head_gesture_answers_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -45,6 +59,7 @@ impl Default for AppConfig {
             stem_long_press: StemAction::ToggleNoiseMode,
             start_minimized: false,
             close_to_tray: true,
+            head_gesture_answers_enabled: true,
         }
     }
 }

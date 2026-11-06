@@ -4,6 +4,7 @@ use super::components::hero::build_hero_card;
 use super::components::noise::build_noise_control_card;
 use super::components::preferences::build_preferences_page;
 use super::components::settings::build_smart_settings_group;
+use super::components::zcode_ask::{build_zcode_ask_card, ZcodeAskWidgets};
 use crate::core::aacp::commands::{MicrophoneMode, NoiseControlMode};
 use crate::core::device::AirPodsDeviceState;
 use crate::system::config::{AppConfig, PauseBehavior};
@@ -21,6 +22,7 @@ pub struct MainWindowHandles {
     pub connect_btn: Button,
     pub battery_widgets: BatteryViewWidgets,
     pub head_tracking: HeadTrackingWidgets,
+    pub zcode_ask: ZcodeAskWidgets,
 }
 
 pub fn create_main_window<R, W, N, A, E, P, C, M, K, Y>(
@@ -112,6 +114,12 @@ where
     // Page 2: 空间音频与头部追踪 (Spatial Audio & Head Tracking)
     // -------------------------------------------------------------
     let head_tracking = build_head_tracking_page();
+
+    // The ZCode question card lives on this page too: answering by nodding is
+    // a head-tracking activity, and the compass beside it doubles as live
+    // feedback for the gesture.
+    let zcode_ask = build_zcode_ask_card();
+    head_tracking.container.append(&zcode_ask.container);
 
     let tracking_scrolled = ScrolledWindow::new();
     tracking_scrolled.set_vexpand(true);
@@ -302,6 +310,7 @@ where
         connect_btn,
         battery_widgets,
         head_tracking,
+        zcode_ask,
     }
 }
 

@@ -66,6 +66,29 @@ struct Cli {
                 (what AirPods 3 actually uses) instead of SensorDataWX"
     )]
     remotehid: bool,
+
+    // ZCode head-gesture answering. These are plumbing commands rather than
+    // user-facing modes, so they stay out of --help: the hook entry is
+    // installed by --zcode-hook-install and invokes --zcode-ask-hook itself.
+    #[arg(long, hide = true, help = "ZCode PreToolUse hook: answer AskUserQuestion with head nods")]
+    zcode_ask_hook: bool,
+
+    #[arg(
+        long,
+        hide = true,
+        help = "Install the ZCode AskUserQuestion hook into ~/.zcode/cli/config.json"
+    )]
+    zcode_hook_install: bool,
+
+    #[arg(long, hide = true, help = "Remove the installed ZCode AskUserQuestion hook")]
+    zcode_hook_uninstall: bool,
+
+    #[arg(
+        long,
+        hide = true,
+        help = "Send a sample question to the running RustPods to exercise the nod-answer path"
+    )]
+    zcode_ask_simulate: bool,
 }
 
 /// Exclusive per-session lock, held for the lifetime of the process.
@@ -144,6 +167,8 @@ fn main() {
         }
     });
 
+    // Console logs go to stderr: `--zcode-ask-hook` prints its answer as JSON
+    // on stdout, and a stray log line there could break the hook's parsing.
     match log_file.flatten() {
         Some(file) => {
             let writer = std::sync::Mutex::new(file);
@@ -153,12 +178,21 @@ fn main() {
                         .with_ansi(false)
                         .with_writer(writer),
                 )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::io::stderr),
+                )
                 .with(filter)
                 .init();
         }
         None => {
             tracing_subscriber::registry()
-                .with(tracing_subscriber::fmt::layer())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::io::stderr),
+                )
                 .with(filter)
                 .init();
         }
@@ -197,6 +231,38 @@ fn main() {
             }
         });
         return;
+    }
+
+    // ZCode plumbing. These run standalone (no GTK, no Bluetooth, no instance
+    // lock) because the hook fires while ZCode is already talking to the real
+    // daemon over the socket.
+    if cli.zcode_ask_hook {
+        let code = rt.block_on(system::zcode_ask::run_hook_mode());
+        std::process::exit(code);
+    }
+    if cli.zcode_hook_install {
+        match system::zcode_ask::install_hook() {
+            Ok(()) => info!("ZCode hook installed"),
+            Err(e) => {
+                error!("Installing the ZCode hook failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if cli.zcode_hook_uninstall {
+        match system::zcode_ask::uninstall_hook() {
+            Ok(()) => info!("ZCode hook removed"),
+            Err(e) => {
+                error!("Removing the ZCode hook failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if cli.zcode_ask_simulate {
+        let code = rt.block_on(system::zcode_ask::run_simulate());
+        std::process::exit(code);
     }
 
     if cli.no_gui {
@@ -250,6 +316,10 @@ fn main() {
             tokio::spawn(async move {
                 while let Some(_) = ui_rx.recv().await {}
             });
+
+            // Serve ZCode question hooks in the daemon too: whichever process
+            // wins the socket answers the hook, and both run the same engine.
+            tokio::spawn(system::zcode_ask::run_socket_server());
 
             tokio::spawn(async move {
                 ui::start_bluetooth_daemon(

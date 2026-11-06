@@ -4,3 +4,4 @@ pub mod hero;
 pub mod noise;
 pub mod preferences;
 pub mod settings;
+pub mod zcode_ask;
