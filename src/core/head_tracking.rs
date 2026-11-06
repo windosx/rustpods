@@ -83,6 +83,154 @@ const ISOLATION_MARGIN: f32 = 1.2;
 /// Samples kept for the rolling rate estimate (~2 s at 50 Hz).
 const RATE_WINDOW: usize = 100;
 
+/// Fuses gyroscope angular rate with the gravity vector into yaw/pitch/roll.
+///
+/// The math follows `starman-tech/mousepods` `MotionEngine.step`, which is the
+/// implementation verified against this hardware:
+///
+/// * gravity gives the vertical axis, low-pass filtered so noise does not steer
+///   the frame;
+/// * the gyro rate is projected onto that vertical for yaw, and onto the
+///   horizontal residual for pitch and roll;
+/// * each component is integrated over time to produce degrees.
+///
+/// A head resting against a shoulder is a *rotation*, so it shows up as a large
+/// integral here even though the raw gravity vector barely changes.
+#[derive(Debug, Clone, Copy, Default)]
+struct AttitudeIntegrator {
+    /// Low-pass filtered gravity unit vector; `None` until the first sample.
+    up: Option<[f32; 3]>,
+    yaw_deg: f32,
+    pitch_deg: f32,
+    roll_deg: f32,
+    /// Learned lateral axis, so pitch keeps a stable reference when the head is
+    /// tilted far enough that the default axis is nearly vertical.
+    lateral: Option<[f32; 3]>,
+    last_sample: Option<Instant>,
+}
+
+impl AttitudeIntegrator {
+    const UP_SMOOTHING: f32 = 0.15;
+
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Feeds one sample. `gyro` is the rotation rate at offsets 26..32 and
+    /// `gravity` the vector at 44..50, both in device counts.
+    fn update(&mut self, gyro: [f32; 3], gravity: [f32; 3]) -> Option<[f32; 3]> {
+        let g_len = len3(gravity);
+        if g_len <= 1e-3 {
+            return None;
+        }
+        let unit = scale3(gravity, 1.0 / g_len);
+        self.up = Some(match self.up {
+            None => unit,
+            Some(prev) => normalize3(add3(
+                prev,
+                scale3(sub3(unit, prev), Self::UP_SMOOTHING),
+            )),
+        });
+        let up = self.up?;
+
+        // Time since the previous sample, capped so a stalled stream does not
+        // produce one huge jump when it resumes.
+        let now = Instant::now();
+        let dt = self
+            .last_sample
+            .map(|t| now.duration_since(t).as_secs_f32().min(0.25))
+            .unwrap_or(0.0);
+        self.last_sample = Some(now);
+        if dt <= 0.0 {
+            return Some([self.yaw_deg, self.pitch_deg, self.roll_deg]);
+        }
+
+        // Yaw: rotation about the vertical.
+        let yaw_rate = dot3(gyro, up);
+
+        // Pitch and roll live in the plane perpendicular to gravity. The lateral
+        // axis is the device's own x axis projected down, kept from the previous
+        // sample when the projection degenerates.
+        let horizontal = sub3(gyro, scale3(up, yaw_rate));
+        let lateral = match self.lateral {
+            Some(prev) if len3(reject3([1.0, 0.0, 0.0], up)) < 0.25 => prev,
+            _ => normalize3(reject3([1.0, 0.0, 0.0], up)),
+        };
+        self.lateral = Some(lateral);
+        let forward = cross3(up, lateral);
+
+        let pitch_rate = dot3(horizontal, lateral);
+        let roll_rate = dot3(horizontal, forward);
+
+        self.yaw_deg += yaw_rate * ROTATION_DEG_PER_SEC * dt;
+        self.pitch_deg += pitch_rate * ROTATION_DEG_PER_SEC * dt;
+        self.roll_deg += roll_rate * ROTATION_DEG_PER_SEC * dt;
+
+        // Keep the display bounded; the head cannot turn further than this.
+        self.yaw_deg = wrap_deg(self.yaw_deg);
+        self.pitch_deg = self.pitch_deg.clamp(-90.0, 90.0);
+        self.roll_deg = self.roll_deg.clamp(-90.0, 90.0);
+
+        Some([self.yaw_deg, self.pitch_deg, self.roll_deg])
+    }
+}
+
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn scale3(a: [f32; 3], k: f32) -> [f32; 3] {
+    [a[0] * k, a[1] * k, a[2] * k]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn len3(a: [f32; 3]) -> f32 {
+    dot3(a, a).sqrt()
+}
+
+fn normalize3(a: [f32; 3]) -> [f32; 3] {
+    let l = len3(a);
+    if l > 1e-6 {
+        scale3(a, 1.0 / l)
+    } else {
+        [0.0, 0.0, 1.0]
+    }
+}
+
+/// Removes the component of `v` parallel to `axis`.
+fn reject3(v: [f32; 3], axis: [f32; 3]) -> [f32; 3] {
+    sub3(v, scale3(axis, dot3(v, axis)))
+}
+
+fn wrap_deg(deg: f32) -> f32 {
+    let mut d = deg % 360.0;
+    if d > 180.0 {
+        d -= 360.0;
+    } else if d < -180.0 {
+        d += 360.0;
+    }
+    d
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeadPose {
     /// Nodding: negative looks down, positive looks up. Degrees.
@@ -237,6 +385,15 @@ pub struct HeadTracker {
     smooth_yaw: VecDeque<f32>,
     smooth_roll: VecDeque<f32>,
 
+    /// Integrated attitude, in degrees.
+    ///
+    /// The gyroscope reports angular rate, not angle, so orientation is the
+    /// integral of the rate projected onto gravity-derived axes. Reading the
+    /// gravity vector as an angle (atan2 of two components) only gives the
+    /// static tilt of one plane and barely moves when the head turns - which is
+    /// exactly what a head resting on a shoulder looked like.
+    attitude: AttitudeIntegrator,
+
     calibrated: bool,
     calib_samples: Vec<RawSample>,
     o1_neutral: f32,
@@ -260,6 +417,7 @@ impl HeadTracker {
             smooth_pitch: VecDeque::with_capacity(SMOOTHING_WINDOW),
             smooth_yaw: VecDeque::with_capacity(SMOOTHING_WINDOW),
             smooth_roll: VecDeque::with_capacity(SMOOTHING_WINDOW),
+            attitude: AttitudeIntegrator::new(),
 
             calibrated: false,
             calib_samples: Vec::with_capacity(CALIBRATION_SAMPLES),
@@ -287,6 +445,7 @@ impl HeadTracker {
         self.smooth_roll.clear();
         self.horizon.reset();
         self.vertical.reset();
+        self.attitude.reset();
         self.sample_times.clear();
         self.samples_seen = 0;
         self.last_gesture = None;
@@ -585,14 +744,19 @@ impl HeadTracker {
             return None;
         }
 
-        let rotation_x = read_i16(block, 26)?;
+        let gyro = [
+            read_i16(block, 26)? as f32,
+            read_i16(block, 28)? as f32,
+            read_i16(block, 30)? as f32,
+        ];
+        let gravity = [gx, gy, gz];
         let user_x = read_i16(block, 38)?;
         let user_y = read_i16(block, 40)?;
 
-        // Forward tilt rotates gravity in the x-y plane; lateral tilt moves z.
-        let pitch = gy.atan2(gx).to_degrees();
-        let magnitude = (gx * gx + gy * gy + gz * gz).sqrt().max(f32::EPSILON);
-        let roll = (gz / magnitude).clamp(-1.0, 1.0).asin().to_degrees();
+        // Orientation is the integral of the gyroscope rate, not the gravity
+        // vector itself. Reading gravity as an angle only tracks the static tilt
+        // of one plane and barely reacts to a head turn.
+        let attitude = self.attitude.update(gyro, gravity);
 
         self.calibrated = true;
         self.samples_seen += 1;
@@ -601,12 +765,11 @@ impl HeadTracker {
         }
         self.sample_times.push_back(Instant::now());
 
+        let [yaw, pitch, roll] = attitude.unwrap_or([0.0, 0.0, 0.0]);
         let pose = HeadPose {
-            pitch: pitch.clamp(-90.0, 90.0),
-            // RemoteHID exposes rotation rate; yaw is the integrated z rate, which
-            // this layer does not accumulate yet.
-            yaw: (rotation_x as f32 * ROTATION_DEG_PER_SEC).clamp(-180.0, 180.0),
-            roll: roll.clamp(-90.0, 90.0),
+            pitch,
+            yaw,
+            roll,
             accel_h: user_x,
             accel_v: user_y,
         };
@@ -759,6 +922,69 @@ mod tests {
     }
 
     #[test]
+    fn integrator_turns_rotation_rate_into_angle() {
+        // A steady yaw rate about the vertical must accumulate into an angle.
+        // This is the behaviour the old atan2(gravity) code could not produce:
+        // it reported the static tilt only, so a head turn barely moved.
+        let mut integ = AttitudeIntegrator::new();
+        // Gravity along +z means the head is upright.
+        let gravity = [0.0, 0.0, 1000.0];
+        // Rotation of 5000 counts/s about z, held for ~0.1 s per sample.
+        let gyro = [0.0, 0.0, 5000.0];
+        integ.update(gyro, gravity);
+        // Feed repeatedly; each call advances by the real elapsed time, so assert
+        // on the direction rather than an exact value.
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            integ.update(gyro, gravity);
+        }
+        let [yaw, _, _] = integ.update(gyro, gravity).unwrap();
+        assert!(yaw > 0.0, "yaw should integrate upward, got {}", yaw);
+    }
+
+    #[test]
+    fn integrator_ignores_a_zero_gravity_vector() {
+        let mut integ = AttitudeIntegrator::new();
+        assert!(integ.update([100.0, 0.0, 0.0], [0.0, 0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn integrator_does_not_move_without_rotation() {
+        let mut integ = AttitudeIntegrator::new();
+        let gravity = [0.0, 0.0, 1000.0];
+        integ.update([0.0, 0.0, 0.0], gravity);
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            integ.update([0.0, 0.0, 0.0], gravity);
+        }
+        let [yaw, pitch, roll] = integ.update([0.0, 0.0, 0.0], gravity).unwrap();
+        assert!(yaw.abs() < 0.01, "yaw drifted to {}", yaw);
+        assert!(pitch.abs() < 0.01, "pitch drifted to {}", pitch);
+        assert!(roll.abs() < 0.01, "roll drifted to {}", roll);
+    }
+
+    #[test]
+    fn tilt_about_the_lateral_axis_moves_pitch_not_roll() {
+        let mut integ = AttitudeIntegrator::new();
+        let gravity = [0.0, 0.0, 1000.0];
+        // Rotating about x (the lateral axis) is a nod when upright.
+        let gyro = [4000.0, 0.0, 0.0];
+        integ.update(gyro, gravity);
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            integ.update(gyro, gravity);
+        }
+        let [_yaw, pitch, roll] = integ.update(gyro, gravity).unwrap();
+        assert!(pitch.abs() > 0.0, "pitch should move, got {}", pitch);
+        assert!(
+            roll.abs() < pitch.abs().max(0.5),
+            "roll ({}) should stay smaller than pitch ({})",
+            roll,
+            pitch
+        );
+    }
+
+    #[test]
     fn remote_hid_input_report_is_recognised() {
         let mut tracker = HeadTracker::new();
         let (pose, _) = tracker
@@ -771,12 +997,19 @@ mod tests {
     }
 
     #[test]
-    fn remote_hid_pitch_follows_gravity() {
+    fn remote_hid_pose_starts_level_and_stays_there_without_rotation() {
+        // Orientation now comes from integrating the gyroscope, so a single
+        // static frame - regardless of which way gravity points - reports the
+        // integrated attitude, which starts at zero. The old parser read the
+        // gravity vector as an angle, and that is what made a head turn look like
+        // it did almost nothing.
         let mut tracker = HeadTracker::new();
         let (pose, _) = tracker
             .parse_packet(&remote_hid_frame(0, 1000, 0, 0, 0))
             .expect("should parse");
-        assert!((pose.pitch - 90.0).abs() < 0.5, "pitch={}", pose.pitch);
+        assert!(pose.pitch.abs() < 0.5, "pitch={}", pose.pitch);
+        assert!(pose.roll.abs() < 0.5, "roll={}", pose.roll);
+        assert!(pose.yaw.abs() < 0.5, "yaw={}", pose.yaw);
     }
 
     #[test]
