@@ -63,6 +63,81 @@ const BT_SECURITY_MEDIUM: libc::c_int = 2;
 /// The kernel applies this as a requirement when the ACL link comes up, so it
 /// must be set before `connect`. Failure is non-fatal: some BlueZ/controller
 /// combinations already have the link encrypted, and the socket still works.
+/// `SOL_L2CAP` / `L2CAP_OPTIONS`, from the kernel's `bluetooth/l2cap.h`.
+///
+/// These are **not** `SOL_BLUETOOTH`: the MTU lives in the L2CAP-level option
+/// block, and setting it through the wrong level silently fails with
+/// `ENOPROTOOPT`, which is why an earlier attempt at this appeared not to work.
+const SOL_L2CAP: libc::c_int = 6;
+const L2CAP_OPTIONS: libc::c_int = 1;
+
+/// Receive MTU the accessory needs before it will announce the motion sensor.
+///
+/// With the kernel default (672) the `devmotion6` descriptor is too large to fit
+/// and the accessory simply omits it from the DeviceConnect burst — it announces
+/// three services instead of eight. At 2582 all eight appear. Established by
+/// `starman-tech/mousepods` (`captures/airpods3_announces_mtu*.hex`) and
+/// reproduced here.
+const AACP_RECEIVE_MTU: u16 = 2582;
+
+/// `struct l2cap_options` as the kernel lays it out: omtu, imtu, flush_to, mode,
+/// then a few single-byte fields. Only omtu/imtu are read here.
+const L2CAP_OPTIONS_LEN: usize = 12;
+
+/// Raises the L2CAP receive MTU so the accessory will announce every sensor.
+///
+/// Must run **before** `connect()`: the MTU is advertised during L2CAP
+/// configuration, so setting it afterwards has no effect on the negotiation.
+/// The existing option block is read first and only the imtu field rewritten,
+/// because the other fields carry the kernel's current settings.
+fn raise_receive_mtu<Type>(socket: &Socket<Type>) {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = socket.as_raw_fd();
+    let mut opts = [0u8; L2CAP_OPTIONS_LEN];
+
+    // SAFETY: `opts` is exactly the 12-byte l2cap_options block the kernel
+    // expects for L2CAP_OPTIONS, and the fd outlives this call.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_L2CAP,
+            L2CAP_OPTIONS,
+            opts.as_mut_ptr().cast(),
+            &mut (L2CAP_OPTIONS_LEN as libc::socklen_t),
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!("Could not read L2CAP options; receive MTU left at default: {}", err);
+        return;
+    }
+
+    // imtu is at byte offset 2 (omtu occupies 0..2), little-endian.
+    opts[2..4].copy_from_slice(&AACP_RECEIVE_MTU.to_le_bytes());
+
+    // SAFETY: same buffer and length as above.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            SOL_L2CAP,
+            L2CAP_OPTIONS,
+            opts.as_ptr().cast(),
+            L2CAP_OPTIONS_LEN as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        debug!("Set AACP receive MTU to {}", AACP_RECEIVE_MTU);
+    } else {
+        let err = std::io::Error::last_os_error();
+        warn!(
+            "Could not raise the receive MTU ({}); the accessory will not announce \
+             its motion sensor and head tracking cannot start",
+            err
+        );
+    }
+}
+
 fn raise_link_security<Type>(socket: &Socket<Type>) {
     use std::os::unix::io::AsRawFd;
 
@@ -179,6 +254,9 @@ impl AacpManager {
         // with EACCES, or the accessory silently ignores sensor commands on the
         // resulting link.
         raise_link_security(&socket);
+        // The MTU has to be in place before the L2CAP configuration exchange:
+        // with the default 672 the accessory omits devmotion6 entirely.
+        raise_receive_mtu(&socket);
 
         let seq_packet = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(target_sa))
             .await

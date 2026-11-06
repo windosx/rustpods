@@ -261,12 +261,32 @@ async fn run_remotehid_test(target: &str) {
         return;
     };
 
+    // AirPods 3 wedges into a state where it stops announcing its sensors even
+    // while both buds are in ear. A full Bluetooth disconnect is the only thing
+    // that clears it, so start every run from a clean link. Waiting is part of
+    // the fix: reconnecting immediately leaves the accessory in the stuck state.
+    tracing::info!("Cycling the Bluetooth link so the accessory announces its sensors");
+    let _ = tokio::process::Command::new("bluetoothctl")
+        .args(["disconnect", target])
+        .output()
+        .await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let _ = tokio::process::Command::new("bluetoothctl")
+        .args(["connect", target])
+        .output()
+        .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     tracing::info!("Connecting AACP for RemoteHID...");
-    if let Err(e) = aacp.connect(addr_of(target)).await {
+    if let Err(e) = aacp.connect_without_handshake(addr_of(target)).await {
         tracing::error!("AACP connect failed: {}", e);
         return;
     }
 
+    // The reference client sends exactly these three packets and nothing else.
+    // Running the full handshake () adds own-connection claims and subscription
+    // requests that change what the accessory is willing to announce, so the
+    // prelude is written out explicitly here.
     for (label, packet) in [
         ("handshake", vec![0x00u8, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]),
         ("feature flags", vec![0x04, 0x00, 0x04, 0x00, 0x4D, 0x00, 0xD7, 0x00, 0, 0, 0, 0, 0, 0]),
@@ -274,7 +294,7 @@ async fn run_remotehid_test(target: &str) {
     ] {
         tracing::debug!("Sending {}: {:02X?}", label, packet);
         let _ = aacp.send_raw(packet).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     let mut frames = aacp.subscribe_rtbuddy_frames();
@@ -282,14 +302,17 @@ async fn run_remotehid_test(target: &str) {
     let mut generation = remotehid::Generation::default();
     let mut generation_counter = 0u8;
 
-    tracing::info!("Sending HostConnect");
-    if let Err(e) = aacp.send_raw(remotehid::make_host_connect(generation.next())).await {
-        tracing::error!("send failed: {}", e);
-        return;
-    }
+    // The accessory announces its services on its own once the AACP prelude has
+    // gone out; a HostConnect is not required to make that happen and can race
+    // with the announcement burst. Send it only if nothing arrives first.
+    tracing::info!("Waiting for DeviceConnect announcements");
     let _ = &mut generation_counter;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    // The accessory announces every service it is willing to expose right after
+    // the prelude, but only if the L2CAP receive MTU is 2582 - otherwise the
+    // 833-byte devmotion6 descriptor does not fit and it is silently omitted.
+    // The burst arrives within a couple of seconds.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let Ok(received) = tokio::time::timeout(remaining, frames.recv()).await else {
@@ -351,10 +374,18 @@ async fn run_remotehid_test(target: &str) {
         );
     }
 
-    tracing::info!("Sending SetReport: Feature report 1 = 10000us (100 Hz)");
+    tracing::info!(
+        "Starting {} Hz on {} (device {})",
+        1_000_000 / 10_000,
+        motion.service,
+        motion.device
+    );
     let set = remotehid::make_set_interval(generation.next(), motion.device, 10_000);
     tracing::debug!("SetReport: {:02X?}", set);
-    let _ = aacp.send_raw(set).await;
+    if let Err(e) = aacp.send_raw(set).await {
+        tracing::error!("SetReport send failed: {}", e);
+        return;
+    }
 
     for second in 1..=15 {
         tokio::time::sleep(Duration::from_secs(1)).await;
