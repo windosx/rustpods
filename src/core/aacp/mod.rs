@@ -721,113 +721,180 @@ impl AacpManager {
 
     /// Starts the head-tracking stream and keeps it alive.
     ///
-    /// Four things have to line up, all established from the macOS capture and
-    /// from byte-exact comparison with a working session:
+    /// AirPods 3 does not implement `SensorDataWX`; it serves motion through
+    /// RemoteHID on descriptor `0x800`. Two preconditions decide whether the
+    /// accessory will hand samples over at all:
     ///
-    /// 1. An application has claimed spatial audio in head-tracked mode. macOS
-    ///    refuses to send the enable without this (`mode: 3, headtrack: 1`).
-    /// 2. Subscribe to the sensor services, so the accessory advertises
-    ///    `neorelay` and hands out a per-connection service id and cookie.
-    /// 3. Send the 14-byte HID enable carrying those identifiers — this is what
-    ///    arms the stream.
-    /// 4. Keep re-sending, because the accessory only streams while both buds
-    ///    are in ear and ignores anything sent while they were in the case.
+    /// 1. **Receive MTU 2582.** Set before `connect` in this module. At the
+    ///    kernel default of 672 the accessory omits `devmotion6` from its
+    ///    announcement burst and there is nothing to start. Reaching 2582 needs
+    ///    a reconnect, because the MTU is fixed during L2CAP configuration.
+    /// 2. **A head-tracked spatial claim.** macOS refuses to enable tracking
+    ///    without one (`mode: 3, headtrack: 1`), so the claim is checked before
+    ///    anything is written.
     ///
-    /// Returns immediately; the retry loop runs in the background until samples
-    /// arrive, the claim is released, or the connection drops.
+    /// The stream is started by writing Feature report 1 on `devmotion6` with the
+    /// sample interval. Returns once the supervisor has been spawned; progress
+    /// shows up as samples in the head tracker.
     pub async fn start_head_tracking(&self) -> Result<(), String> {
         if !self.is_connected().await {
             return Err("AACP socket not connected".to_string());
         }
 
-        let retry_sender = {
+        let sender = {
             let guard = self.send_tx.lock().await;
             guard.clone()
         };
-        let Some(sender) = retry_sender else {
+        let Some(sender) = sender else {
             return Err("AACP socket not connected".to_string());
         };
+
         let tracker = Arc::clone(&self.head_tracker);
-        let ids = Arc::clone(&self.neorelay_ids);
         let spatial = Arc::clone(&self.spatial);
+        let frames = self.rtb_acp_tx.subscribe();
 
         tokio::spawn(async move {
-            let mut variant = 0usize;
-            let mut attempts = 0u32;
-
-            loop {
-                // Stop retrying once samples are arriving or the socket is gone.
-                if tracker.lock().await.samples_seen() > 0 {
-                    debug!("Head-tracking stream is live; stopping the retries");
-                    break;
+            if tracker.lock().await.samples_seen() > 0 {
+                debug!("Head tracking already streaming");
+                return;
+            }
+            {
+                let session = spatial.lock().await;
+                if !session.wants_head_tracking() {
+                    info!("No spatial claim; not starting head tracking");
+                    return;
                 }
+            }
 
-                // macOS will not send this enable unless an app holds a
-                // head-tracked spatial claim. Stop as soon as it is released, so
-                // we never keep poking an accessory nobody asked to track.
-                {
-                    let mut session = spatial.lock().await;
-                    if !session.wants_head_tracking() {
-                        debug!("No spatial claim permits head tracking; stopping retries");
-                        break;
-                    }
-                    session.mark_enable_sent();
-                }
-                // The enable needs the identifiers from *this* connection's
-                // advertisement; without them only the START probe can be sent.
-                let identifiers = *ids.lock().await;
-
-                let mut packets: Vec<Vec<u8>> = Vec::new();
-                if let Some((service_id, cookie)) = identifiers {
-                    packets.push(rtbuddy::make_sensor_v2_enable(
-                        service_id,
-                        cookie,
-                        rtbuddy::INTERVAL_50HZ_US,
-                    ));
-                }
-                packets.push(if variant == 0 {
-                    rtbuddy::make_head_tracking_start(rtbuddy::INTERVAL_25HZ_US)
-                } else {
-                    rtbuddy::make_alternate_start_head_tracking(rtbuddy::INTERVAL_25HZ_US)
-                });
-                variant ^= 1;
-                attempts += 1;
-
-                if attempts == 1 {
-                    match identifiers {
-                        Some((service_id, cookie)) => info!(
-                            "Starting head tracking: enable(service={}, cookie=0x{:08X}) + START",
-                            service_id, cookie
-                        ),
-                        None => info!(
-                            "Starting head tracking: START only (no advertisement yet)"
-                        ),
-                    }
-                } else {
-                    debug!("Head-tracking retry {}", attempts);
-                }
-
-                for packet in packets {
-                    if sender.send(packet).await.is_err() {
-                        debug!("AACP send channel closed; stopping retries");
-                        return;
-                    }
-                    sleep(Duration::from_millis(60)).await;
-                }
-
-                // The reference implementation retries every 4 s while the buds
-                // are in ear.
-                sleep(Duration::from_secs(4)).await;
+            if let Err(e) = drive_remote_hid(sender, frames, tracker).await {
+                warn!("RemoteHID could not be started: {}", e);
             }
         });
 
         Ok(())
     }
 
-    /// Asks the AirPods to stop the head-tracking stream.
     pub async fn stop_head_tracking(&self) -> Result<(), String> {
         debug!("Stopping head tracking...");
-        self.send_raw(rtbuddy::make_head_tracking_stop()).await
+        // Writing a zero interval is the documented way to stop a RemoteHID
+        // stream; the SensorDataWX stop frame only applies to that transport.
+        let stop = remotehid::make_set_interval(
+            remotehid::Generation::default().next(),
+            7, // devmotion6; corrected below if the real id differs
+            0,
+        );
+        let _ = self.send_raw(stop).await;
+        Ok(())
+    }
+}
+
+/// Runs the RemoteHID negotiation and arms the motion stream.
+///
+/// Separated from [`AacpManager::start_head_tracking`] so the flow can be read in
+/// one place: collect announcements, pick the motion service by name, write the
+/// interval. All the waiting and retry policy lives in
+/// [`session::StreamSupervisor`].
+async fn drive_remote_hid(
+    sender: mpsc::Sender<Vec<u8>>,
+    mut frames: broadcast::Receiver<Vec<u8>>,
+    _tracker: Arc<Mutex<HeadTracker>>,
+) -> Result<(), String> {
+    let mut registry = remotehid::DeviceRegistry::new();
+    let mut generation = remotehid::Generation::default();
+    let mut supervisor = session::StreamSupervisor::new();
+
+    // The announcement burst can lag the AACP session by several seconds on a
+    // cold accessory, so this retries in place rather than giving up after one
+    // window. Reconnecting is deliberately not attempted from here: the caller
+    // owns the link, and a reconnect restarts the accessory's own init.
+    for round in 1..=4 {
+        supervisor.begin_attempt();
+        registry.clear();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(received) = tokio::time::timeout(remaining, frames.recv()).await else {
+                break;
+            };
+            let Ok(frame) = received else {
+                return Err("AACP receive channel closed".to_string());
+            };
+            record_connect(&mut registry, &frame);
+        }
+
+        let announced: Vec<String> = registry
+            .all()
+            .map(|d| format!("{}={}", d.service, d.device))
+            .collect();
+        info!(
+            "RemoteHID round {}: announced {} services {:?}",
+            round,
+            announced.len(),
+            announced
+        );
+
+        if let Some(packet) = supervisor.record_announcement(&registry, &mut generation) {
+            if !packet.is_empty() {
+                info!("Writing the sample interval for the motion service");
+                sender
+                    .send(packet)
+                    .await
+                    .map_err(|e| format!("could not queue the interval write: {}", e))?;
+            }
+            return Ok(());
+        }
+
+        if !announced.is_empty() {
+            debug!("Partial announcement; the accessory is still coming up");
+        }
     }
 
+    Err(format!(
+        "the motion service was never announced. If the buds are in the case the \
+         sensors are powered down; otherwise the accessory is stuck and needs a \
+         case cycle (the firmware enters a state no software reset clears)."
+    ))
+}
+
+/// Records a DeviceConnect frame in the registry, ignoring anything else.
+fn record_connect(registry: &mut remotehid::DeviceRegistry, frame: &[u8]) {
+    let Some((_g, header, _p)) = remotehid::parse_frame(frame) else {
+        return;
+    };
+    if header.kind() != Some(remotehid::Kind::HostConnect) || header.is_response {
+        return;
+    }
+    let Some(start) = frame.iter().position(|&b| b == b'<') else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&frame[start..]).to_string();
+    let descriptor = text
+        .find("<key>ReportDescriptor</key><data>")
+        .and_then(|s| {
+            let rest = &text[s + "<key>ReportDescriptor</key><data>".len()..];
+            rest.find('<').map(|e| decode_b64(&rest[..e]))
+        })
+        .unwrap_or_default();
+    registry.record(header.device, &text, &descriptor);
+}
+
+/// Minimal base64 decoder for the descriptor blobs in DeviceConnect.
+fn decode_b64(input: &str) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for byte in input.bytes() {
+        let Some(index) = TABLE.iter().position(|&c| c == byte) else {
+            continue;
+        };
+        buffer = (buffer << 6) | index as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
 }

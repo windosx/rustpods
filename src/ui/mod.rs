@@ -449,6 +449,33 @@ pub async fn start_bluetooth_daemon(
                 info!("Requesting initial battery and status...");
                 let _ = aacp.request_battery_and_status().await;
 
+                // Head tracking needs its own negotiation: the accessory only
+                // announces its sensor services after the RemoteHID prelude, and
+                // the stream stays off until Feature report 1 is written on
+                // devmotion6. Without this the spatial-audio page has nothing to
+                // draw even though battery and ear detection work fine.
+                //
+                // A spatial-audio claim is required first, matching macOS, which
+                // will not enable tracking until an application asks for it.
+                {
+                    let camera = aacp.clone();
+                    tokio::spawn(async move {
+                        camera
+                            .claim_spatial_audio(
+                                "io.github.rustpods.RustPods",
+                                crate::core::spatial::SpatialMode::HeadTracked,
+                                true,
+                            )
+                            .await;
+                        // The supervisor inside start_head_tracking handles the
+                        // announce/wait/retry cycle on its own.
+                        match camera.start_head_tracking().await {
+                            Ok(()) => info!("Head tracking started"),
+                            Err(e) => warn!("Head tracking unavailable: {}", e),
+                        }
+                    });
+                }
+
                 let mut last_both_in_ear = false;
 
                 // The AACP socket can also die silently (device out of range,
