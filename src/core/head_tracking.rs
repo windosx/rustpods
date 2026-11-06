@@ -766,6 +766,16 @@ impl HeadTracker {
         self.sample_times.push_back(Instant::now());
 
         let [yaw, pitch, roll] = attitude.unwrap_or([0.0, 0.0, 0.0]);
+
+        // Dump raw and integrated values occasionally so the gyro scale can be
+        // calibrated against real movement. `0.122 deg/s per count` comes from
+        // the protocol document, which marks it approximate.
+        if self.samples_seen % 100 == 0 {
+            debug!(
+                "attitude raw gyro=[{:.0},{:.0},{:.0}] grav=[{:.0},{:.0},{:.0}] -> yaw={:.1} pitch={:.1} roll={:.1}",
+                gyro[0], gyro[1], gyro[2], gx, gy, gz, yaw, pitch, roll
+            );
+        }
         let pose = HeadPose {
             pitch,
             yaw,

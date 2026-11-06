@@ -206,10 +206,30 @@ fn draw_compass(cr: &gtk4::cairo::Context, width: i32, height: i32, state: &Head
         return;
     };
 
+    // The gyro scale in the protocol document is marked approximate ("~0.122
+    // deg/s per LSB"), and the integrated angles come out on the small side, so
+    // the dial is drawn with a visible gain. Motion amplification is a rendering
+    // choice; it does not change what the sensor reported.
+    const DISPLAY_GAIN: f64 = 2.2;
+
     // Yaw: clockwise from "front", matching how a wearer turns their head.
-    let yaw_rad = (pose.yaw as f64).to_radians();
-    // Pitch tilts the arrow radius: looking up pulls the tip toward the centre.
-    let pitch_factor = 1.0 - (pose.pitch as f64 / 90.0).abs() * 0.35;
+    let yaw_rad = (pose.yaw as f64 * DISPLAY_GAIN).to_radians().clamp(-3.0, 3.0);
+    // Pitch shortens the arrow: looking up pulls the tip toward the centre.
+    // The cube-root-ish easing keeps small movements visible instead of
+    // flattening everything below 30 degrees.
+    let pitch_norm = (pose.pitch as f64 * DISPLAY_GAIN / 90.0).clamp(-1.0, 1.0);
+    let pitch_factor = 1.0 - pitch_norm.abs().powf(0.6) * 0.45;
+    // Roll tips the whole dial, which is what leaning toward a shoulder does.
+    // Without this the compass ignored roll entirely, so that motion looked like
+    // nothing was happening.
+    let roll_rad = (pose.roll as f64 * DISPLAY_GAIN)
+        .to_radians()
+        .clamp(-1.4, 1.4);
+
+    cr.save().ok();
+    cr.translate(cx, cy);
+    cr.rotate(roll_rad * 0.5);
+    cr.translate(-cx, -cy);
 
     cr.set_source_rgba(0.36, 0.66, 1.0, 0.95);
     cr.set_line_width(3.0);
@@ -234,6 +254,8 @@ fn draw_compass(cr: &gtk4::cairo::Context, width: i32, height: i32, state: &Head
     cr.line_to(tip_x + head * right.sin(), tip_y - head * right.cos());
     cr.close_path();
     cr.fill().ok();
+
+    cr.restore().ok();
 
     // Centre dot
     cr.set_source_rgba(0.36, 0.66, 1.0, 0.9);
