@@ -9,6 +9,7 @@ use commands::{ControlCommandId, MicrophoneMode, NoiseControlMode};
 use events::AacpEvent;
 use packets::*;
 use crate::core::head_tracking::{HeadGesture, HeadPose, HeadTracker};
+use crate::core::spatial::{SpatialClaim, SpatialMode, SpatialSession};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
@@ -42,6 +43,11 @@ pub struct AacpManager {
     /// Identifiers from the `neorelay` advertisement, which the HID enable
     /// needs. Set by the receive loop as soon as that advertisement arrives.
     neorelay_ids: Arc<Mutex<Option<(u16, u32)>>>,
+    /// Which application currently holds the spatial-audio claim.
+    ///
+    /// macOS only sends the enable once an app has claimed spatial audio in
+    /// head-tracked mode, so the enable path is gated on this the same way.
+    spatial: Arc<Mutex<SpatialSession>>,
 }
 
 
@@ -98,6 +104,7 @@ impl AacpManager {
             gesture_tx,
             rtb_acp_tx,
             neorelay_ids: Arc::new(Mutex::new(None)),
+            spatial: Arc::new(Mutex::new(SpatialSession::new())),
         }
     }
 
@@ -528,20 +535,85 @@ impl AacpManager {
         Ok(())
     }
 
+    /// Declares that an application wants spatial audio.
+    ///
+    /// This is the Linux equivalent of the macOS step that always precedes the
+    /// enable:
+    ///
+    /// ```text
+    /// AudioLinkManager setSpatialModeWithBundleID: ..., mode:3, headtrack:1
+    /// ```
+    ///
+    /// The claim is recorded even when it does not request head tracking, so
+    /// `spatial_snapshot` can report why streaming is idle. Returns whether the
+    /// accessory should now be streaming.
+    pub async fn claim_spatial_audio(
+        &self,
+        app_id: &str,
+        mode: SpatialMode,
+        head_tracking: bool,
+    ) -> bool {
+        let claim = SpatialClaim::new(app_id, mode, head_tracking);
+        let wants = {
+            let mut session = self.spatial.lock().await;
+            session.claim(claim);
+            session.wants_head_tracking()
+        };
+        info!(
+            "Spatial audio claimed by '{}' (mode={:?}, head tracking={}) -> streaming {}",
+            app_id,
+            mode,
+            head_tracking,
+            if wants { "requested" } else { "not requested" }
+        );
+        wants
+    }
+
+    /// Releases an application's spatial-audio claim.
+    ///
+    /// Returns `true` when the release should stop the stream.
+    pub async fn release_spatial_audio(&self, app_id: &str) -> bool {
+        let was = {
+            let mut session = self.spatial.lock().await;
+            session.release(app_id)
+        };
+        if was {
+            info!("Spatial claim released by '{}'; stopping tracking", app_id);
+            let _ = self.stop_head_tracking().await;
+        }
+        was
+    }
+
+    /// Whether a spatial-audio claim currently permits head tracking.
+    pub async fn wants_head_tracking(&self) -> bool {
+        self.spatial.lock().await.wants_head_tracking()
+    }
+
+    /// Free-text description of the current claim, for the UI and logs.
+    pub async fn spatial_snapshot(&self) -> Option<(String, SpatialMode, bool)> {
+        self.spatial
+            .lock()
+            .await
+            .current()
+            .map(|c| (c.app_id.clone(), c.mode, c.head_tracking))
+    }
+
     /// Starts the head-tracking stream and keeps it alive.
     ///
-    /// Three things have to line up, all established from the macOS capture and
+    /// Four things have to line up, all established from the macOS capture and
     /// from byte-exact comparison with a working session:
     ///
-    /// 1. Subscribe to the sensor services, so the accessory advertises
+    /// 1. An application has claimed spatial audio in head-tracked mode. macOS
+    ///    refuses to send the enable without this (`mode: 3, headtrack: 1`).
+    /// 2. Subscribe to the sensor services, so the accessory advertises
     ///    `neorelay` and hands out a per-connection service id and cookie.
-    /// 2. Send the 14-byte HID enable carrying those identifiers — this is what
-    ///    actually arms the stream.
-    /// 3. Keep re-sending, because the accessory only streams while both buds
+    /// 3. Send the 14-byte HID enable carrying those identifiers — this is what
+    ///    arms the stream.
+    /// 4. Keep re-sending, because the accessory only streams while both buds
     ///    are in ear and ignores anything sent while they were in the case.
     ///
     /// Returns immediately; the retry loop runs in the background until samples
-    /// arrive or the connection drops.
+    /// arrive, the claim is released, or the connection drops.
     pub async fn start_head_tracking(&self) -> Result<(), String> {
         if !self.is_connected().await {
             return Err("AACP socket not connected".to_string());
@@ -556,6 +628,7 @@ impl AacpManager {
         };
         let tracker = Arc::clone(&self.head_tracker);
         let ids = Arc::clone(&self.neorelay_ids);
+        let spatial = Arc::clone(&self.spatial);
 
         tokio::spawn(async move {
             let mut variant = 0usize;
@@ -568,6 +641,17 @@ impl AacpManager {
                     break;
                 }
 
+                // macOS will not send this enable unless an app holds a
+                // head-tracked spatial claim. Stop as soon as it is released, so
+                // we never keep poking an accessory nobody asked to track.
+                {
+                    let mut session = spatial.lock().await;
+                    if !session.wants_head_tracking() {
+                        debug!("No spatial claim permits head tracking; stopping retries");
+                        break;
+                    }
+                    session.mark_enable_sent();
+                }
                 // The enable needs the identifiers from *this* connection's
                 // advertisement; without them only the START probe can be sent.
                 let identifiers = *ids.lock().await;

@@ -486,3 +486,73 @@ sudo btmon -w /tmp/capture.btsnoop
 
 
 
+
+---
+
+## 🚧 方案 A 的实施记录（第一版已完成）
+
+已经实现了 macOS 那套前置状态机，代码在 `src/core/spatial.rs`，接入 `AacpManager`。
+
+### 已实现
+
+```rust
+pub enum SpatialMode { Off, Fixed, HeadAnchored, HeadTracked }  // HeadTracked = 3，与 macOS 日志一致
+pub struct SpatialClaim { app_id, mode, head_tracking, claimed_at }
+pub struct SpatialSession { /* 单 claim、可过期、可替换 */ }
+```
+
+三个行为与 macOS 对齐：
+
+| macOS 行为 | 本实现 |
+|---|---|
+| `setSpatialModeWithBundleID: mode:3, headtrack:1` | `claim_spatial_audio(app, HeadTracked, true)` |
+| 按 app 放行（Bundle ID 白名单） | `SpatialClaim.app_id` |
+| 应用退出即释放 | `release_spatial_audio()` / `expire_stale()` |
+
+enable 路径现在被 gating：没有满足条件的 claim 就不发，有 claim 才发，claim 释放后立即停止重试。
+
+### 实测结果
+
+```bash
+./target/release/rustpods --debug --spatial --head-tracking-test CC:68:E0:38:9C:E9
+```
+
+```
+Claiming spatial audio in head-tracked mode (the macOS precondition)
+Session permits head tracking: true
+Current claim: io.github.rustpods.RustPods mode=HeadTracked head_tracking=true
+Sensor service 'neorelay': id=0x00003794 cookie=0x00013483
+Starting head tracking: enable(service=14228, cookie=0x00013483) + START
+t= 1s  samples=0  rate=—
+...
+```
+
+**enable 带着本次连接的真实 service id 发出了，设备仍然零回应。**
+
+### 这说明什么
+
+会话层解决的是**主机侧**的前置条件，但设备端的 `0x800` 是一个**已注册客户端的下行通道**。要让设备接受，还需要主机进程内存在注册上下文：
+
+```
+bluetoothd 中的符号：
+  kCBMsgIdAccessoryRegisterCustomMessageClientMsg
+  BTAccessoryMsgHandler::handleBTAccessoryRegisterCustomMessageClientMsg
+  SubscribeCustomMessage types: %@
+```
+
+这些全是 macOS 的 XPC 内部机制，不对应任何 AACP 报文。**在 Linux 上复刻它们，需要扩展 BlueZ 的 audio 插件**，让上层能注册 custom message type 并携带会话上下文。
+
+### 方案 A 的剩余工作
+
+| 步骤 | 状态 |
+|---|---|
+| 1. 空间音频会话状态机（claim / mode / headtrack / 过期） | ✅ 已完成 |
+| 2. enable 路径按会话 gating | ✅ 已完成 |
+| 3. BlueZ audio 插件扩展：注册 custom message type + 会话上下文 | ❌ 未开始 |
+| 4. 在注册上下文中发送 enable 并验证设备是否 ACK | ❌ 未开始 |
+
+第 3 步是真正的硬骨头，需要改 BlueZ 源码（C）。做完第 3、4 步才能回答「设备到底认不认」这个根本问题。
+
+### 如果第 3、4 步也失败
+
+那说明 `0x800` 依赖的能力**只有 Apple 的蓝牙协议栈能提供**（例如固件层的 HID relay 会话，前面在 macOS 日志里见过 `sessionName:HIDRelay`）。那种情况下方案 A 无法在开源栈上完成，应转向方案 B（换设备验证）或方案 C（PipeWire HRTF + 外部姿态源）。

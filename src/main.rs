@@ -44,6 +44,13 @@ struct Cli {
                 START frame) with no sensor subscriptions"
     )]
     reference: bool,
+
+    #[arg(
+        long,
+        help = "With --head-tracking-test: run the spatial-session test - claim spatial \
+                audio in head-tracked mode (the macOS precondition) before enabling"
+    )]
+    spatial: bool,
 }
 
 fn main() {
@@ -79,8 +86,11 @@ fn main() {
         let sweep = cli.sweep;
         let reference = cli.reference;
         let linux_reference = cli.linux_reference;
+        let spatial = cli.spatial;
         rt.block_on(async move {
-            if linux_reference {
+            if spatial {
+                run_spatial_session_test(&target).await;
+            } else if linux_reference {
                 run_linux_reference_sequence(&target).await;
             } else if reference {
                 run_reference_sequence(&target).await;
@@ -157,6 +167,77 @@ fn main() {
 /// Connects to the given AirPods and reports what the head-tracking stream
 /// actually delivers, so the protocol can be validated against a real device
 /// without the GUI.
+/// Exercises the spatial-session layer end to end.
+///
+/// macOS will not send the enable until an application claims spatial audio in
+/// head-tracked mode, so this runs the same order: claim first, then let the
+/// enable path decide whether it is allowed to fire.
+///
+/// What this proves and what it does not: it shows the host-side precondition is
+/// modelled and enforced. Whether the accessory starts streaming in response is
+/// the open question the previous sweep could not settle either, so the test
+/// reports sample counts rather than asserting success.
+async fn run_spatial_session_test(target: &str) {
+    use crate::core::spatial::SpatialMode;
+    use std::time::Duration;
+
+    let Some(aacp) = prepare_connection(target).await else {
+        return;
+    };
+
+    tracing::info!("Connecting AACP...");
+    if let Err(e) = aacp.connect(addr_of(target)).await {
+        tracing::error!("AACP connect failed: {}", e);
+        return;
+    }
+
+    // Step 1: the claim macOS makes before it will send anything.
+    tracing::info!("Claiming spatial audio in head-tracked mode (the macOS precondition)");
+    let permitted = aacp
+        .claim_spatial_audio("io.github.rustpods.RustPods", SpatialMode::HeadTracked, true)
+        .await;
+    tracing::info!("Session permits head tracking: {}", permitted);
+
+    if let Some((app, mode, tracking)) = aacp.spatial_snapshot().await {
+        tracing::info!("Current claim: {} mode={:?} head_tracking={}", app, mode, tracking);
+    }
+
+    // Step 2: let the gated enable path run.
+    match aacp.start_head_tracking().await {
+        Ok(()) => tracing::info!("start_head_tracking accepted the claim"),
+        Err(e) => tracing::warn!("start_head_tracking refused: {}", e),
+    }
+
+    for second in 1..=20 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let samples = aacp.head_samples_seen().await;
+        let rate = aacp.head_tracking_rate_hz().await;
+        tracing::info!(
+            "t={:>2}s  samples={:<5} rate={}",
+            second,
+            samples,
+            rate.map(|r| format!("{:.1} Hz", r))
+                .unwrap_or_else(|| "—".to_string())
+        );
+        if samples > 0 {
+            tracing::info!(">>> Stream started with a spatial claim in place");
+            break;
+        }
+    }
+
+    let samples = aacp.head_samples_seen().await;
+    if samples == 0 {
+        tracing::warn!("No samples arrived despite the claim.");
+        tracing::warn!("The host side of the chain is in place; the accessory still");
+        tracing::warn!("does not answer 0x800, which means the missing piece is not");
+        tracing::warn!("only this state machine - see README 方案 A step 1.");
+    }
+
+    // Step 3: releasing must stop the retries.
+    aacp.release_spatial_audio("io.github.rustpods.RustPods").await;
+    tracing::info!("Spatial claim released; retries should have stopped");
+}
+
 async fn run_head_tracking_test(target: &str) {
     use std::time::Duration;
 
