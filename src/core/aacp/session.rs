@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn unWorn_accessory_just_waits() {
+    fn unworn_accessory_just_waits() {
         let mut sup = StreamSupervisor::new();
         sup.begin_attempt();
         assert_eq!(sup.after_silence(false), Recovery::WaitForWearer);

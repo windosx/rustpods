@@ -22,12 +22,15 @@ RustPods 是使用 Rust 语言重构并全面升级的 Linux 端 AirPods 高级�
 - 🎵 **智能媒体联动 (MPRIS & PipeWire)**：
   - **自动入耳检测 (In-Ear Detection)**：摘下一只耳塞或双耳时自动暂停本地播放器（如 YesPlayMusic、Spotify、VLC 或浏览器媒体），重新戴回时平滑恢复播放；
   - **对话感知 (Conversational Awareness)**：检测到用户开口说话时自动压低媒体音量，结束说话后平滑恢复原音量。
-- 🧭 **头部追踪与点头/摇头手势（实验性）**：
-  - 解析 RTBuddy `SensorV2` 传感器帧（固定 65 字节，字段偏移为帧内绝对值：orientation1 @43、orientation2 @45、orientation3 @47、水平加速度 @51、垂直加速度 @53）；
-  - 前 10 个样本自动校准中立姿态，输出 pitch / yaw / roll 三轴角度并做 5 点滑动平均；
-  - 移植 LibrePods 的置信度模型识别点头（是）与摇头（否），要求 3 个交替极值且加权置信度 ≥ 0.7；
-  - 「空间音频」页以 Cairo 绘制实时罗盘并显示采样率与手势提示。
-  - **状态：协议前半段已验证，数据流尚未拉通**，详见下方「已知限制」。
+- 🧭 **头部追踪与点头/摇头手势**：
+  - 走 **RemoteHID（descriptor `0x800`）**，约 100 Hz 收到 79 字节 InputReport；
+  - 用**陀螺仪积分**得到姿态（`gravity` 只作参考系，不直接当角度读），并做静止检测估计零偏，长时间不漂；
+  - 输出 pitch / yaw / roll，「空间音频」页以 Cairo 绘制实时罗盘；
+  - 识别点头（是）与摇头（否）手势。
+- 🎧 **头部追踪空间音频**：
+  - PipeWire `filter-chain` + `sofa` spatializer 做 HRTF 卷积，方位角由头姿实时驱动；
+  - 5° 量化 + 50 ms 下限节流，避免 100 Hz 重建卷积器；
+  - 需要 `--features audio-follow` 编译，详见下方专节。
 - 🔔 **系统托盘驻留 (`ksni`)**：
   - 符合 Freedesktop StatusNotifierItem 标准，无缝嵌入 Wayland（如 `niri`、`Waybar`）及 GNOME/KDE 状态栏；
   - 托盘右键菜单实时显示左右耳及充电盒电量，并提供快速降噪模式切换与主界面呼出入口。
@@ -127,62 +130,44 @@ cargo test
 
 ---
 
-## ⚠️ 已知限制：头部追踪数据流尚未拉通
+## ✅ 头部追踪：已打通（AirPods 3 实测）
 
-以下结论均来自真机实测（AirPods 3 / A2564 / 固件 `65.1868046005000000.52`）。与网络上流传的部分说法不一致，记录在此以免重复踩坑。
+数据流能跑起来了。真正起作用的只有一个条件，是它让整个传感器体系开始工作：
 
-### 已验证的事实
+**必须在 `0x100000` 上发送 `request_all_descriptors`（`22 00`）**，并且把接收 MTU 提到 2582。
 
-**1. `SensorV2` 样本格式**：固定 65 字节，字段偏移为帧内绝对值（`orientation1` @43、`orientation2` @45、`orientation3` @47、水平加速度 @51、垂直加速度 @53）。macOS 抓包中去除多线程重复记录后实测 **42–50 Hz，中位间隔 20.1 ms**。
-
-**2. service_id 与 cookie 来自设备的 XML 广告帧头，且每次连接都会重新分配。** 这是本项目最关键的发现：
-
-```
-04 00 04 00 17 00 | 00 08 00 00 | 6D 02 | 00 1E 00 00 | 83 34 01 00 | <?xml ...
- AACP header        descriptor    len     service_id    cookie        plist
-                    0x800
+```rust
+// rtbuddy.rs — 这一帧是触发器。逐服务订阅永远等不到传感器。
+body.push(0x22); // field 4: request all descriptors
+body.push(0x00);
 ```
 
-实测三次连接的结果（id 递增，证明不可硬编码）：
+发出的两条探测序列：
 
-| 服务 | 连接的 service_id | cookie | MaxReportSize |
-|------|------------------|--------|---------------|
-| `iedrelay` | `0x1300` → `0x1B00` | `0x00013C88` | 40 |
-| `neorelay`（6-DoF 头部姿态） | `0x1600` → `0x1E00` → `0x2600` | `0x00013483` | 28 |
-| `mando` | `0x1700` → `0x1F00` | `0x00011F02` | 27 |
+```
+devmotion6 上的 Feature report 1  ← 写采样间隔（10 ms，约 100 Hz）
+0x100000 上的 22 00 → 10 02 22 00 ← 让配件宣告全部传感器
+```
 
-**3. AACP `0x02` 版本协商**：设备在握手后立即发送此帧，此前被当作未知 opcode 丢弃。设备端能力列表完整内容为 45 字节。现已解析并原样回显。
+### 三个必须同时满足的条件
 
-### 尚未解决的关键缺口
-
-设备对 **14 字节 HID enable 完全无响应**（既无 9 字节 ACK，也无数据流）。已尝试两种候选布局，均失败：
-
-- `[service_id:4][cookie:4][0xD2][0x01][interval_us:4]`
-- `[0x01][service_id:u16][0x00][cookie:4][0xD2][0x01][interval_us:4]`
-
-已排除的假设：
-
-- ❌ service 编号问题：`6/7/8/9/14/16` × `10/20/40 ms` 共 18 种组合全部无响应
-- ❌ 握手顺序问题：不跑 AACP 1.3、直接复现 LibrePods `INIT`+`START`，同样无效
-- ❌ 被其他设备占用：`0x2E` 连接设备列表只含本机
-- ❌ 音频未播放：抓包窗口内 A2DP 在 Idle/A2DP 间反复切换，SensorV2 始终流动
-- ❌ 字节级抓包：`~/Downloads/bluetooth.log` 中 AACP 相关行原始字节数为 **0**，3158 处字段被 `<private>` 脱敏；此路不通
-
-### macOS 还做了、我们尚未实现的步骤
-
-对照抓包，macOS 在 enable 前还有这些动作，均未实现：
-
-| macOS 动作 | 状态 |
+| 条件 | 不满足时 |
 |---|---|
-| `feature capabilities mask 0x2f2ff` | 我们发 `0xD7`，不同 |
-| 逐服务连接确认 `0x10→0x80000→0x1→0x8→0x100000` | 不等确认 |
-| `sendTimestamp`（UNIX Epoch 秒+微秒） | 未实现 |
-| `TimeSyncEnable` + Remote Timesync 注册 | 未实现 |
-| Jitter Buffer（控制命令 `0x0B`） | 枚举中缺失 |
+| 接收 MTU = **2582**（`SOL_L2CAP=6` / `L2CAP_OPTIONS=1`，必须在 `connect()` **之前**设置） | 配件静默丢弃装不下的服务，其中包括 833 字节的 `devmotion6`，只宣告 3/8 个服务 |
+| `request_all_descriptors`（`22 00`，随后 `10 02 22 00`） | 无论订阅多少次、重连多少次，都收不到任何姿态数据 |
+| 走 **RemoteHID（descriptor `0x800`）**，而不是 `SensorDataWX` | 帧格式对不上，解析全错 |
 
-其中 `Audio Timesync: Sensor data support: Yes` 明确把时间同步与传感器数据绑定，是最可疑的缺口。
+### 实测结果
 
-**结论：在补齐时间同步之前，「空间音频」页会一直显示「等待数据流」。** 其余功能（电量、入耳检测、降噪、按柄、对话感知）均已在真机验证正常。
+- 8 个服务全部宣告：`cma`、`devmotion6`、`iedrelay`、`gyro`、`accel`、`neorelay`、`mando`、`kadabra`
+- 每帧 79 字节，子头 `87 1f 04 00`（设备 7，长度 63，kind 2 = InputReport）
+- 稳定 200–306 帧，约 **100 Hz**
+- 姿态来自陀螺仪积分（`gravity` 只作参考系），并做静止检测估计零偏，长时间不漂
+
+### 关键教训
+
+- **千万不要断开链路。** 之前为了"唤醒"配件反复断连重连，反而把它推进 `br-connection-page-timeout`，只能开盒恢复。`grep -rn '"disconnect"' src/` 现在是 0 结果。
+- 不要在蓝牙配置里改 `ReconnectAttempts` 之类的参数来绕过——那是把程序的问题推给用户的系统。
 
 ---
 
@@ -342,114 +327,88 @@ Linux 上没有对应机制：
 
 ---
 
-## ✅ 解决方案
+## 🎧 头部追踪空间音频：端到端已跑通
 
-### 实测结果（本轮全部验证过）
+头追数据到手之后，下面这一步是让声音跟着头动。
 
-在 AirPods 连着本机、音乐正在播放、广告帧正常返回的条件下：
-
-| 尝试 | 结果 |
-|---|---|
-| 从本次连接读出真实 service_id（14196 等，每次连递增 8） | ✅ 解析正确 |
-| 8 个 mode 值（0-7）× 2 种 flag 组合 | ❌ 设备零回应 |
-| 3 种 START 变体（service 22/14/16） | ❌ 零回应 |
-| 畸形 `0x800` 帧（1 字节 / 14×0xFF） | ❌ 零回应 |
-| 对照组：不发任何 `0x800` | ✅ **收到 19 帧**（电量、入耳、三份广告、连接列表） |
-
-对照组的 19 帧说明**链路完全正常**，设备只是对 `0x800` 一律不回应。
-
-### 根因：`0x800` 需要 XPC 层预注册
-
-`bluetoothd` 里存在这些符号，但它们全是 **macOS 主机内部的 XPC 机制**，不产生 AACP 报文：
+### 数据流
 
 ```
-kCBMsgIdAccessoryRegisterCustomMessageClientMsg
-kCBMsgIdAccessoryDeregisterCustomMessageClientMsg
-BTAccessoryMsgHandler::handleBTAccessoryRegisterCustomMessageClientMsg
-SubscribeCustomMessage types: %@
+应用 ──播放──> rustpods_hrtf_in (Audio/Sink)
+                      │
+                      ├─ sofa spatializer（HRTF 卷积，Azimuth 由头姿驱动）
+                      │
+                      ▼
+               rustpods_hrtf_out (passive)
+                      │
+                      ▼
+               真实声卡 / 蓝牙耳机
 ```
 
-**`0x800` 是「已注册客户端」的下行通道，不是可主动发起的命令。** 主机必须先在同一进程内注册该 type 的回调，bluetoothd 才会把 enable 发下去。Linux 上不存在这个注册层，所以设备看到的是一个没有注册上下文的消息，直接丢弃。
+RustPods 以 100 Hz 读头姿，经节流后把方位角写入 filter-chain 节点的 Props。
+不需要改 PipeWire 配置来"订阅"：写入 `spat:Azimuth` 就会触发 `spatializer_reload()`，
+它在数据线程上用双缓冲换卷积器，播放不会中断。
 
----
-
-### 方案 A：在 Linux 复刻注册层（唯一能真正打通的路）
-
-需要的不是「发对一帧」，而是在 Linux 音频栈里补出 macOS 的这套结构：
-
-```
-┌──────────────────────────────────────────────────┐
-│ 应用 / 播放器                                      │
-│   └─ 声明「本应用进入空间音频，头部追踪 = YES」       │
-├──────────────────────────────────────────────────┤
-│ 新增：spatial-session 层（模拟 BTHAL）              │
-│   · per-app 标识 + mode(3) + headtrack(1) 状态机    │
-│   · 注册 custom message type 0x800 的会话上下文      │
-├──────────────────────────────────────────────────┤
-│ BlueZ audio 插件（需扩展）                          │
-│   └─ 把上述状态转成 AACP 下行                        │
-├──────────────────────────────────────────────────┤
-│ AACP 链路（本项目已实现，可直接复用）                 │
-│   └─ 14 字节 enable + SensorV2 解析（已完成）        │
-└──────────────────────────────────────────────────┘
-```
-
-**落地步骤：**
-
-1. **确认注册机制**：用 `dtruss`/`lldb` 观察 macOS 上 `BTAccessoryRegisterCustomMessageClientMsg` 的调用时机（需 SIP 关闭，或用 `log stream` 观察其日志先后顺序——本轮已经抓到顺序）
-2. **扩展 BlueZ**：在 `profiles/audio/` 里加一个接口，允许上层注册 custom message type 并携带会话上下文
-3. **实现 spatial-session 守护进程**：维护 `(app_id, mode, headtrack)` 三元组，状态变为 `mode:3 + headtrack:1` 时触发 enable
-4. **复用本项目**：`src/core/aacp/` 的协议栈、`rtbuddy.rs` 的帧构造、`head_tracking.rs` 的解析器全部可用
-
-**工作量评估**：BlueZ 扩展 + 守护进程，约 2-3 周。这是唯一能完整复现 macOS 行为的路径。
-
-### 方案 B：换设备验证协议实现（最快见效）
-
-`batubozkan/pods-head-tracker`（70 stars）只在 **AirPods 4 (ANC)** 上验证通过，AirPods 3 未测试。本轮实测证实 AirPods 3 的固件确实有额外门槛。
-
-如果有 AirPods 4 / Pro / Max，本项目的 AACP 实现可直接复用——把 `ht_probe.py` 指向新设备即可：
+### 依赖
 
 ```bash
-python3 tools/ht_probe.py <新设备MAC> --modes 0,1,2,3
+sudo dnf install pipewire-module-filter-chain-sofa
+mkdir -p ~/.local/share/rustpods/sofa
+# 放入一个 SOFA 数据集，例如 MIT KEMAR（mit_kemar_normal_pinna.sofa）
 ```
 
-### 方案 C：不依赖 AirPods 传感器的空间音频（立即可用）
+把 [`contrib/pipewire/99-rustpods-hrtf.conf`](contrib/pipewire/99-rustpods-hrtf.conf)
+复制到 `~/.config/pipewire/pipewire.conf.d/`，用 `systemctl --user restart pipewire` 生效。
 
-如果目标是「Linux 上有头追空间音频」，不碰 AACP 也能实现：
+配置文件里的 SOFA 路径**必须是绝对路径**：它被原样交给 `mysofa`，开头的 `~` 不会展开，
+加载失败时节点依然出现在混音器里，只是静音——这种失败方式没有任何报错。
+
+### 编译
+
+音频跟随是可选特性，因为它会引入 `libpipewire` 头文件和 bindgen（需要 libclang）：
 
 ```bash
-# 1. 安装 SOFA + opentrack
-sudo mkdir -p /usr/share/pipewire/sofa
-# 下载 subject_021.sofa 到该目录
-
-# 2. 配置 PipeWire HRTF
-mkdir -p ~/.config/pipewire/pipewire.conf.d/
-cat > ~/.config/pipewire/pipewire.conf.d/99-spatializer.conf <<'CONF'
-context.modules = [
-    { name = libpipewire-module-filter-chain
-      args = {
-        node.description = "Spatializer"
-        media.name = "Spatializer"
-        filter.graph = {
-          nodes = [
-            { type = sofa label = spatializer name = spat_l
-              config = { filename = "/usr/share/pipewire/sofa/subject_021.sofa" }
-              control = { "Azimuth" = 30.0 "Elevation" = 0.0 "Radius" = 1.5 } }
-            { type = sofa label = spatializer name = spat_r
-              config = { filename = "/usr/share/pipewire/sofa/subject_021.sofa" }
-              control = { "Azimuth" = -30.0 "Elevation" = 0.0 "Radius" = 1.5 } }
-          ]
-        }
-      }
-    }
-]
-CONF
-
-# 3. 姿态源用 opentrack（UDP 127.0.0.1:4242，神经网络人脸追踪）
-systemctl --user restart pipewire pipewire-pulse
+BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/clang/22/include" \
+  cargo build --release --features audio-follow
 ```
 
-姿态来源不限于 AirPods：opentrack 支持人脸追踪、手机 IMU、游戏手柄等。这条路线已被 [`qeqqe/spatial-track`](https://github.com/qeqqe/spatial-track) 验证。
+不加 `--features audio-follow` 时完全不链接 PipeWire，其余功能不受影响。
+
+### 方位角的符号约定（实测，不是猜的）
+
+`plugin_sofa.c` 先对 `[Azimuth, Elevation, Radius]` 调 `mysofa_s2c()` 转笛卡尔，
+再交 `mysofa_getfilter_float()`。按这个顺序调用 `libmysofa`，用 MIT KEMAR 数据集测出：
+
+| Azimuth | 笛卡尔 (x, y, z) | 更响的耳 |
+|---:|---|---|
+| 90 | (0.0, +1.5, 0.0) | 左 |
+| 270 | (0.0, −1.5, 0.0) | 右 |
+| 30 | (+1.3, +0.75, 0.0) | 左 |
+| 330 | (+1.3, −0.75, 0.0) | 右 |
+
+所以 **Azimuth 逆时针递增：0 在正前，90 在左**。
+0° 和 180° 两耳能量相等（都在中轴线上），这对对称性本身也反证了测量没出错。
+
+RustPods 的 `yaw` 是"向右为正"，因此写入前要取反：转头时声源留在原地，这才是空间音频该有的行为。
+
+### 为什么要节流
+
+`spatializer_reload()` 每次都要重新解析两个 HRIR 并新建两个卷积器，是毫秒级的工作。
+100 Hz 直接写会打满一个核，而且双缓冲换不到位。所以按 **5° 量化 + 50 ms 下限**下发：
+
+```
+200 个头部样本（2 秒）→ 21 次写入（约 10 Hz）
+```
+
+5° 小于正前方约 3.6° 的最小可辨角，步进听不出来。
+
+### 一个必须说清楚的取舍
+
+虚拟 sink 是**独立设备**，应用不会自动播放到它。需要在系统音量设置里把输出切到
+"RustPods Head-Tracked Stereo"。这跟 macOS 不同——macOS 是在系统层直接接管输出。
+
+要让所有应用自动走 HRTF，需要在 WirePlumber 里写默认路由规则，那是另一件事，
+目前没做。
 
 ---
 
@@ -457,43 +416,23 @@ systemctl --user restart pipewire pipewire-pulse
 
 | 工具 | 用途 |
 |---|---|
-| `tools/ht_probe.py` | 扫描 enable 的 `mode` 字节；拿不到广告时明确报错而非用猜测的 id |
-| `tools/parse_btsnoop.py` | 解析 `btmon -w` 的 btsnoop，提取所有 RTBuddy 帧 |
+| `tools/ht_probe.py` | 扫描 enable 的 `mode` 字节；拿不到广告时明确报错，而不是用猜测的 id 去碰运气 |
+| `tools/parse_btsnoop.py` | 解析 `btmon -w` 抓到的 btsnoop，提取其中所有 RTBuddy 帧 |
 
-**Linux 上 `btmon` 直接就能抓 HCI**（适配器在 USB 总线上时无需任何特权绕过）：
+**Linux 上 `btmon` 直接就能抓 HCI**（适配器挂在 USB 总线上时不需要任何特权绕过）：
 
 ```bash
 sudo btmon -w /tmp/capture.btsnoop
 ```
 
-这是排查 AACP 问题最快的手段。**之前认为「Linux 抓不到包」是错误判断**，为此绕道 macOS 完全是浪费。
-
-
-
-
-
-### 若目标是"Linux 上的空间音频"，可行路线不依赖 AirPods 传感器
-
-经检索，**目前没有任何开源项目实现「AirPods 传感器 → PipeWire 空间音频」**。已实现的 PipeWire 空间音频方案都用其他姿态来源：
-
-| 项目 | 做法 |
-|---|---|
-| [qeqqe/spatial-track](https://github.com/qeqqe/spatial-track) | PipeWire `filter-chain` + SOFA HRTF，姿态来自 **opentrack 神经网络人脸追踪** |
-| Collaplex-Spatial-Audio / kz-dsp / timbre | 纯 PipeWire DSP（HRTF/EQ/混响），无头部追踪 |
-| HanreichC/MyPods 的 "spatial audio" | 实为 AACP 音效（EQ），非头部追踪 |
-
-因此若要在 Linux 上获得头追空间音频，推荐路线是 **PipeWire HRTF + opentrack（人脸追踪）**，而非等待 AirPods 传感器可用。
-
-
-
+这是排查 AACP 问题最快的手段。**早期认为「Linux 抓不到包」是错误判断**，
+为此绕道 macOS 抓包完全是浪费——记在这里，避免再犯。
 
 ---
 
-## 🚧 方案 A 的实施记录（第一版已完成）
+## 🗂️ 空间音频会话层
 
-已经实现了 macOS 那套前置状态机，代码在 `src/core/spatial.rs`，接入 `AacpManager`。
-
-### 已实现
+`src/core/spatial.rs` 复刻了 macOS 的前置状态机：
 
 ```rust
 pub enum SpatialMode { Off, Fixed, HeadAnchored, HeadTracked }  // HeadTracked = 3，与 macOS 日志一致
@@ -501,58 +440,17 @@ pub struct SpatialClaim { app_id, mode, head_tracking, claimed_at }
 pub struct SpatialSession { /* 单 claim、可过期、可替换 */ }
 ```
 
-三个行为与 macOS 对齐：
-
 | macOS 行为 | 本实现 |
 |---|---|
 | `setSpatialModeWithBundleID: mode:3, headtrack:1` | `claim_spatial_audio(app, HeadTracked, true)` |
 | 按 app 放行（Bundle ID 白名单） | `SpatialClaim.app_id` |
 | 应用退出即释放 | `release_spatial_audio()` / `expire_stale()` |
 
-enable 路径现在被 gating：没有满足条件的 claim 就不发，有 claim 才发，claim 释放后立即停止重试。
+这一层是**主机侧**的前置条件，和真正拉起数据流是两件事。
 
-### 实测结果
+> **修正一处旧结论。** 本文档早先版本写过「`0x800` 是已注册客户端的下行通道，
+> Linux 上必须扩展 BlueZ 才能用」。那是错的。设备对 `0x800` 没有反应，
+> 真正的原因是我方没有在 `0x100000` 上发 `request_all_descriptors`。
+> 补上这一帧之后，`0x800` 上的 InputReport 以约 100 Hz 正常到达，
+> 不需要任何 BlueZ 改动。
 
-```bash
-./target/release/rustpods --debug --spatial --head-tracking-test CC:68:E0:38:9C:E9
-```
-
-```
-Claiming spatial audio in head-tracked mode (the macOS precondition)
-Session permits head tracking: true
-Current claim: io.github.rustpods.RustPods mode=HeadTracked head_tracking=true
-Sensor service 'neorelay': id=0x00003794 cookie=0x00013483
-Starting head tracking: enable(service=14228, cookie=0x00013483) + START
-t= 1s  samples=0  rate=—
-...
-```
-
-**enable 带着本次连接的真实 service id 发出了，设备仍然零回应。**
-
-### 这说明什么
-
-会话层解决的是**主机侧**的前置条件，但设备端的 `0x800` 是一个**已注册客户端的下行通道**。要让设备接受，还需要主机进程内存在注册上下文：
-
-```
-bluetoothd 中的符号：
-  kCBMsgIdAccessoryRegisterCustomMessageClientMsg
-  BTAccessoryMsgHandler::handleBTAccessoryRegisterCustomMessageClientMsg
-  SubscribeCustomMessage types: %@
-```
-
-这些全是 macOS 的 XPC 内部机制，不对应任何 AACP 报文。**在 Linux 上复刻它们，需要扩展 BlueZ 的 audio 插件**，让上层能注册 custom message type 并携带会话上下文。
-
-### 方案 A 的剩余工作
-
-| 步骤 | 状态 |
-|---|---|
-| 1. 空间音频会话状态机（claim / mode / headtrack / 过期） | ✅ 已完成 |
-| 2. enable 路径按会话 gating | ✅ 已完成 |
-| 3. BlueZ audio 插件扩展：注册 custom message type + 会话上下文 | ❌ 未开始 |
-| 4. 在注册上下文中发送 enable 并验证设备是否 ACK | ❌ 未开始 |
-
-第 3 步是真正的硬骨头，需要改 BlueZ 源码（C）。做完第 3、4 步才能回答「设备到底认不认」这个根本问题。
-
-### 如果第 3、4 步也失败
-
-那说明 `0x800` 依赖的能力**只有 Apple 的蓝牙协议栈能提供**（例如固件层的 HID relay 会话，前面在 macOS 日志里见过 `sessionName:HIDRelay`）。那种情况下方案 A 无法在开源栈上完成，应转向方案 B（换设备验证）或方案 C（PipeWire HRTF + 外部姿态源）。
