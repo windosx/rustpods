@@ -26,7 +26,8 @@ RustPods 是使用 Rust 语言重构并全面升级的 Linux 端 AirPods 高级�
   - 走 **RemoteHID（descriptor `0x800`）**，约 100 Hz 收到 79 字节 InputReport；
   - 用**陀螺仪积分**得到姿态（`gravity` 只作参考系，不直接当角度读），并做静止检测估计零偏，长时间不漂；
   - 输出 pitch / yaw / roll，「空间音频」页以 Cairo 绘制实时罗盘；
-  - 识别点头（是）与摇头（否）手势。
+  - 识别点头（是）与摇头（否）手势；
+  - **点头代答智能体选择题**：ZCode 弹出 AskUserQuestion 时经 PreToolUse hook 把问题推送到 RustPods，点头 N 次即选择第 N 项，摇头/超时/未佩戴自动回退到 ZCode 原生界面；在「偏好设置 → 智能体接入」中一键安装/卸载/测试（Codex 等其他智能体已预留接入位）。
 - 🎧 **头部追踪空间音频**：
   - PipeWire `filter-chain` + `sofa` spatializer 做 HRTF 卷积，方位角由头姿实时驱动；
   - 5° 量化 + 50 ms 下限节流，避免 100 Hz 重建卷积器；
@@ -43,32 +44,41 @@ RustPods 是使用 Rust 语言重构并全面升级的 Linux 端 AirPods 高级�
 rustpods/
 ├── Cargo.toml
 ├── src/
-│   ├── main.rs                    # 命令行入口、多线程 Tokio 异步运行时与应用生命周期
+│   ├── main.rs                    # 命令行入口、多线程 Tokio 异步运行时、单实例锁与应用生命周期
 │   ├── core/                      # 核心协议与状态层
 │   │   ├── aacp/                  # Apple Accessory Communication Protocol (L2CAP PSM 0x1001)
 │   │   │   ├── commands.rs        # 控制命令编码（降噪模式、麦克风、按柄、自适应强度等）
 │   │   │   ├── events.rs          # 状态通知解码（电量、入耳状态、按柄事件）
 │   │   │   ├── packets.rs         # 握手包编解码、Opcode 路由分发
-│   │   │   └── mod.rs             # AacpManager 连接、数据收发线程与事件广播
+│   │   │   ├── remotehid.rs       # RemoteHID 描述符 0x800 帧编解码与服务注册表
+│   │   │   ├── rtbuddy.rs         # RTBuddy 传感器子协议（服务公告与采样间隔）
+│   │   │   ├── session.rs         # 连接重试状态机（诊断用）
+│   │   │   └── mod.rs             # AacpManager 连接、数据收发与事件广播
+│   │   ├── head_tracking.rs       # 姿态解算（陀螺仪积分 + 零偏估计）与点头/摇头手势检测
+│   │   ├── nod_counter.rs         # 点头计数状态机（智能体选择题代答的核心）
+│   │   ├── spatial.rs             # 空间音频会话声明 (SpatialClaim / SpatialSession)
 │   │   ├── models.rs              # AirPods 各代硬件型号库与能力矩阵映射
 │   │   ├── device.rs              # AirPodsDeviceState 统一响应式数据模型
 │   │   └── crypto.rs              # AES-128 与蓝牙 RPA 哈希验证 (ah)
 │   ├── system/                    # 桌面生态与系统服务集成
 │   │   ├── bluetooth.rs           # BlueZ 适配器管理、设备扫描与连接监听
 │   │   ├── le_monitor.rs          # BLE Proximity 充电盒广播监听
+│   │   ├── audio_follow.rs        # PipeWire HRTF 方位角实时驱动（--features audio-follow）
+│   │   ├── agent_hooks.rs         # 智能体接入注册表（ZCode 已实现，Codex 预留）
+│   │   ├── zcode_ask.rs           # 选择题代答：socket 服务、hook 子命令与安装器
 │   │   ├── mpris.rs               # D-Bus MPRIS 播放器智能播放/暂停联动
 │   │   ├── tray.rs                # StatusNotifierItem 动态圆形电量系统托盘
-│   │   └── config.rs              # 用户偏好设置持久化 (~/.config/rustpods/config.json)
+│   │   └── config.rs              # 用户偏好持久化（解析失败备份不覆盖，临时文件原子写）
 │   └── ui/                        # Libadwaita / GTK4 用户友好图形界面
 │       ├── components/
 │       │   ├── hero.rs            # 耳机形象展示、重命名弹窗、连接指示
 │       │   ├── battery.rs         # 苹果圆形环状独立电量与充电动画仪表
 │       │   ├── noise.rs           # 降噪/通透/自适应分段控制器与能力标签卡片
-│       │   ├── preferences.rs     # 偏好设置与硬件信息面板
+│       │   ├── headtracking.rs    # 空间音频页：Cairo 实时罗盘与手势徽标
+│       │   ├── zcode_ask.rs       # 「ZCode 提问」实时卡片（问题、选项、点头计数）
+│       │   ├── preferences.rs     # 偏好设置（含「智能体接入」管理组）与硬件信息面板
 │       │   └── settings.rs        # 入耳检测、麦克风偏好、提示音设置组
-│       ├── window.rs              # 主窗口 macOS 侧边栏布局与刷新逻辑
-│       └── mod.rs                 # AdwApplication 与后台线程安全通信总线
-│       ├── window.rs              # 主窗口 (AdwPreferencesWindow) 布局与刷新逻辑
+│       ├── window.rs              # 主窗口侧边栏布局、页面装配与刷新逻辑
 │       └── mod.rs                 # AdwApplication 与后台线程安全通信总线
 ```
 
@@ -77,13 +87,13 @@ rustpods/
 ## 🚀 编译与运行
 
 ### 依赖项
-- Rust 1.80+ (推荐最新稳定版)
+- Rust 1.85+（本项目使用 edition 2024，推荐最新稳定版）
 - `gtk4` 和 `libadwaita` 开发库（Fedora 上运行 `sudo dnf install gtk4-devel libadwaita-devel`）
 - `bluez` (>= 5.60) 与 `pipewire`
 
 ### 编译
 ```bash
-cd /home/windosx/Dev/rustpods
+cd rustpods   # 仓库根目录
 cargo build --release
 ```
 
@@ -121,8 +131,8 @@ cargo test
 # 完整握手后启动头部追踪，逐秒打印是否在流、实测采样率
 ./target/debug/rustpods --debug --head-tracking-test CC:68:E0:38:9C:E9
 
-# 复现 LibrePods 的最小序列（不跑 AACP 1.3 握手）
-./target/debug/rustpods --no-handshake --head-tracking-test CC:68:E0:38:9C:E9
+# 复现 Linux 原生实现 airpods-posture 的序列（连接不跑完整 AACP 握手）
+./target/debug/rustpods --linux-reference --head-tracking-test CC:68:E0:38:9C:E9
 
 # 扫描候选 (service, interval) 组合，找出真正能拉起数据流的一组
 ./target/debug/rustpods --sweep --head-tracking-test CC:68:E0:38:9C:E9

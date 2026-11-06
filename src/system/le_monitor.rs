@@ -26,29 +26,54 @@ pub async fn start_le_monitor(
 
     info!("BLE Proximity Monitor (discovery mode) started and active");
 
+    // Devices already given an event task, so a device that disappears and
+    // reappears does not pile up a second task for the same address.
+    let mut spawned: std::collections::HashSet<_> = std::collections::HashSet::new();
+
     while let Some(evt) = stream.next().await {
         if let bluer::AdapterEvent::DeviceAdded(addr) = evt {
-            if let Ok(dev) = adapter.device(addr) {
-                if let Ok(Some(mfg)) = dev.manufacturer_data().await {
-                    if let Some(apple_data) = mfg.get(&76) {
-                        parse_proximity_message(apple_data, &dev_state, &ui_tx).await;
-                    }
-                }
+            let Ok(dev) = adapter.device(addr) else {
+                continue;
+            };
+            let mfg = dev
+                .manufacturer_data()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if let Some(apple_data) = mfg.get(&76) {
+                parse_proximity_message(apple_data, &dev_state, &ui_tx).await;
+            }
 
-                let dev_state_clone = dev_state.clone();
-                let ui_tx_clone = ui_tx.clone();
-                tokio::spawn(async move {
-                    if let Ok(mut events) = dev.events().await {
-                        while let Some(ev) = events.next().await {
-                            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ManufacturerData(mfg)) = ev {
-                                if let Some(apple_data) = mfg.get(&76) {
-                                    parse_proximity_message(apple_data, &dev_state_clone, &ui_tx_clone).await;
-                                }
+            // Every device in range would otherwise park one event task for
+            // the lifetime of the process - unbounded growth in a busy RF
+            // environment. Only Apple devices are interesting here, judged by
+            // the current advertisement or the advertised alias; properties
+            // that show up later arrive through the initial parse above on a
+            // fresh DeviceAdded.
+            let looks_like_airpods = mfg.contains_key(&76)
+                || dev
+                    .alias()
+                    .await
+                    .map(|a| a.to_lowercase().contains("airpods"))
+                    .unwrap_or(false);
+            if !looks_like_airpods || !spawned.insert(addr) {
+                continue;
+            }
+
+            let dev_state_clone = dev_state.clone();
+            let ui_tx_clone = ui_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(mut events) = dev.events().await {
+                    while let Some(ev) = events.next().await {
+                        if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ManufacturerData(mfg)) = ev {
+                            if let Some(apple_data) = mfg.get(&76) {
+                                parse_proximity_message(apple_data, &dev_state_clone, &ui_tx_clone).await;
                             }
                         }
                     }
-                });
-            }
+                }
+            });
         }
     }
 

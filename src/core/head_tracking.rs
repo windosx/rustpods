@@ -587,9 +587,14 @@ impl HeadTracker {
 
     /// Parses one received frame and updates orientation/gesture state.
     ///
-    /// Accepts both the bare 65-byte `SensorV2` payload and the AACP-wrapped
-    /// form. When the 6-byte AACP header is present it is stripped first, so the
-    /// field offsets below are relative to the sensor payload.
+    /// Frame shapes are told apart before any offsets are read:
+    /// RemoteHID (descriptor `0x800`) and the marker-prefixed payloads are
+    /// recognised first, then the `SensorV2` fallback, which comes in two
+    /// variants - the bare payload (fields at absolute offsets 43..55) and
+    /// the AACP-wrapped form (`04 00 04 00 17` prefix, fields at the same
+    /// offsets *after* the 6-byte header is stripped). The length classes
+    /// decide which one applies; the header of a wrapped frame is never
+    /// counted as part of the payload.
     pub fn parse_packet(&mut self, data: &[u8]) -> Option<(HeadPose, Option<HeadGesture>)> {
         // Descriptor 0x800 belongs to RemoteHID exclusively. Route on the
         // descriptor before any offset heuristics: frames on that channel that

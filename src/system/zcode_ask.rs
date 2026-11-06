@@ -39,6 +39,9 @@ use tracing::{debug, error, info, warn};
 /// gives up and passes through. The hook waits slightly longer, and its own
 /// hook `timeoutMs` longer still, so RustPods always decides first.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(172);
+/// A hook connection must deliver its payload within this window; longer is
+/// indistinguishable from a wedged client.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the hook process waits for a reply from RustPods.
 const HOOK_REPLY_TIMEOUT: Duration = Duration::from_secs(175);
 /// Connect timeout for the hook process reaching the RustPods socket. If the
@@ -85,7 +88,9 @@ pub enum AskReply {
 
 /// Extracts the question list from a hook payload. Accepts both the full
 /// `PreToolUse` envelope (`tool_input.questions`) and a bare question list,
-/// and tolerates option objects or plain strings.
+/// and tolerates option objects or plain strings. An option object without a
+/// `label` makes the whole payload unusable: silently dropping it would
+/// shift every later nod index onto the wrong answer.
 pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
     let questions = value
         .get("tool_input")
@@ -96,16 +101,19 @@ pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
     let mut out = Vec::new();
     for q in questions {
         let options = match q.get("options") {
-            Some(serde_json::Value::Array(opts)) => opts
-                .iter()
-                .filter_map(|o| match o {
-                    serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Object(_) => {
-                        o.get("label").and_then(|l| l.as_str()).map(String::from)
+            Some(serde_json::Value::Array(opts)) => {
+                let mut labels = Vec::new();
+                for o in opts {
+                    match o {
+                        serde_json::Value::String(s) => labels.push(s.clone()),
+                        serde_json::Value::Object(_) => {
+                            labels.push(o.get("label")?.as_str()?.to_string());
+                        }
+                        _ => return None,
                     }
-                    _ => None,
-                })
-                .collect(),
+                }
+                labels
+            }
             _ => Vec::new(),
         };
         out.push(HookQuestion {
@@ -290,6 +298,12 @@ impl AskHub {
         *self.last_pose.lock().unwrap() = Some(Instant::now());
     }
 
+    /// Marks the pose stream as gone (disconnect sentinel), so freshness
+    /// checks fail immediately instead of up to one window later.
+    pub fn retire_pose(&self) {
+        *self.last_pose.lock().unwrap() = None;
+    }
+
     /// Whether the pose stream is alive right now.
     pub fn tracking_fresh(&self) -> bool {
         self.last_pose
@@ -304,11 +318,26 @@ impl AskHub {
 // ---------------------------------------------------------------------------
 
 /// Where the hook process finds the running RustPods instance.
+///
+/// Falls back to the temp directory when `XDG_RUNTIME_DIR` is unset or
+/// empty; the server side refuses to serve there (see `run_socket_server`),
+/// so the fallback only ever produces a connect-fail on the client, which
+/// fails open.
 pub fn socket_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
     dir.join("rustpods").join("zcode-ask.sock")
+}
+
+/// The per-user runtime directory, if this session has a proper one.
+fn runtime_dir() -> Option<PathBuf> {
+    std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Serves hook connections until the process exits.
@@ -317,7 +346,18 @@ pub fn socket_path() -> PathBuf {
 /// and will answer instead. A stale socket left behind by a crash is removed
 /// and rebound once.
 pub async fn run_socket_server() {
-    let path = socket_path();
+    // A predictable world-readable path under /tmp would let any local user
+    // pre-bind it (this instance would then silently never serve) or post
+    // questions into it. Without a per-user runtime dir, fail open: hooks
+    // pass through and the question UI stays as it was.
+    let Some(base) = runtime_dir() else {
+        warn!(
+            "XDG_RUNTIME_DIR is not set; not serving the zcode-ask socket, \
+             agent questions will pass through"
+        );
+        return;
+    };
+    let path = base.join("rustpods").join("zcode-ask.sock");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -380,11 +420,15 @@ async fn handle_hook_connection(mut stream: tokio::net::UnixStream) {
 /// Reads a question from the hook, shepherds it through the hub, and returns
 /// the decision. `None` means the payload was unusable.
 async fn ask_from_stream(stream: &mut tokio::net::UnixStream) -> Option<AskReply> {
-    // One line, capped. `take` guarantees a hostile writer cannot balloon
-    // memory; anything past the cap means the payload is garbage anyway.
+    // One line, capped and time-bounded. `take` guarantees a hostile writer
+    // cannot balloon memory; a client that connects and never speaks cannot
+    // park this task forever.
     let mut buf = Vec::new();
     let mut reader = BufReader::new(stream.take(MAX_PAYLOAD_BYTES));
-    reader.read_until(b'\n', &mut buf).await.ok()?;
+    tokio::time::timeout(REQUEST_READ_TIMEOUT, reader.read_until(b'\n', &mut buf))
+        .await
+        .ok()?
+        .ok()?;
     if buf.is_empty() {
         return None;
     }
@@ -536,14 +580,17 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
             debug!("A newer head-gesture task took over; retiring this one");
             return;
         }
-        ASK_HUB.note_pose();
-
         let now = Instant::now();
         let dt = last_sample.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32());
         let Some(pose) = *pose_rx.borrow_and_update() else {
+            // Disconnect sentinel: expire the freshness stamp, so a question
+            // arriving right after a drop passes through instead of
+            // registering for gestures nothing can answer.
+            ASK_HUB.retire_pose();
             counter.reset();
             continue;
         };
+        ASK_HUB.note_pose();
 
         let Some(progress) = ASK_HUB.progress_snapshot() else {
             counter.reset();
@@ -572,15 +619,18 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
 /// Delivers a decision for the pending question, if it is still ours to
 /// answer, and tidies the shared state.
 fn resolve_question(id: u64, reply: AskReply) {
+    let note = match &reply {
+        AskReply::Select { index, label } => format!("✓ 已选择第 {} 项「{}」", index + 1, label),
+        AskReply::Pass => "已取消,请在 ZCode 中手动作答".to_string(),
+    };
     if let Some(pending) = ASK_HUB.take_pending(id) {
-        let note = match &reply {
-            AskReply::Select { index, label } => {
-                format!("✓ 已选择第 {} 项「{}」", index + 1, label)
-            }
-            AskReply::Pass => "已取消,请在 ZCode 中手动作答".to_string(),
-        };
-        ASK_HUB.mark_resolved(note);
-        let _ = pending.reply.send(reply);
+        if pending.reply.send(reply).is_ok() {
+            ASK_HUB.mark_resolved(note);
+        } else {
+            // The server timed out first and already answered pass-through:
+            // the choice is moot, so the card must not claim it was applied.
+            ASK_HUB.clear_progress(id);
+        }
     } else {
         // The server timed out first; drop the card so it does not linger.
         ASK_HUB.clear_progress(id);
@@ -690,65 +740,82 @@ fn zcode_cli_config_path() -> PathBuf {
     PathBuf::from(home).join(".zcode").join("cli").join("config.json")
 }
 
+/// The hook entry RustPods installs, as a reusable value: a `process` hook
+/// (argv vector, no shell). ZCode **drops** a hook outright when `args` is
+/// mixed into a `type: "command"` entry - the first shipped version did
+/// exactly that and the feature silently never engaged - so the entry is
+/// always written back in this canonical shape on reinstall.
+fn canonical_hook_entry(command: &str) -> serde_json::Value {
+    json!([{
+        "type": "process",
+        "command": command,
+        "args": [HOOK_ARG_MARKER],
+        "timeoutMs": 180000,
+        "onError": "allow",
+    }])
+}
+
 /// Merges our PreToolUse hook entry into a ZCode config document.
 ///
-/// Returns whether anything changed, so repeated installs are no-ops. An
-/// entry installed by an older binary path is repointed to `command` rather
-/// than duplicated - the marker in `args`, not the command path, is the
-/// identity of our hook.
-pub fn install_hook_into(config: &mut serde_json::Value, command: &str) -> bool {
+/// Returns whether anything changed, so repeated installs are no-ops, and an
+/// entry installed by an older binary path is repointed rather than
+/// duplicated. Errors out instead of improvising when the document has an
+/// unexpected shape: an install must never mangle a config another tool
+/// wrote.
+pub fn install_hook_into(config: &mut serde_json::Value, command: &str) -> Result<bool, String> {
     let Some(root) = config.as_object_mut() else {
-        return false;
+        return Err("config 根节点不是 JSON 对象".to_string());
     };
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .expect("hooks must be an object");
-    hooks.insert("enabled".into(), json!(true));
+        .ok_or_else(|| "`hooks` 已存在且不是对象;请先手工修正 ~/.zcode/cli/config.json".to_string())?;
+
+    // Config-file hooks are inert unless enabled. Re-enabling is required for
+    // the feature to run at all, but a deliberate `false` is the user's
+    // global kill switch for every hook - refuse rather than flip it back on
+    // behind their back.
+    let mut changed = false;
+    match hooks.get("enabled") {
+        Some(serde_json::Value::Bool(false)) => {
+            return Err(
+                "hooks.enabled 为 false:配置文件 hooks 已被整体停用,请先在 ZCode 侧启用再安装"
+                    .to_string(),
+            );
+        }
+        Some(serde_json::Value::Bool(true)) => {}
+        _ => {
+            hooks.insert("enabled".into(), json!(true));
+            changed = true;
+        }
+    }
 
     let events = hooks
         .entry("events")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .expect("events must be an object");
+        .ok_or_else(|| "`hooks.events` 不是对象".to_string())?;
     let pre = events
         .entry("PreToolUse")
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .expect("PreToolUse must be an array");
+        .ok_or_else(|| "`hooks.events.PreToolUse` 不是数组".to_string())?;
 
+    let canonical = canonical_hook_entry(command);
     if let Some(existing) = pre.iter_mut().find(|e| entry_is_ours(e)) {
-        let mut changed = false;
-        if let Some(hooks) = existing.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-            for h in hooks.iter_mut() {
-                let ours = h
-                    .get("args")
-                    .and_then(|a| a.as_array())
-                    .is_some_and(|args| args.iter().any(|a| a.as_str() == Some(HOOK_ARG_MARKER)));
-                if ours {
-                    if h.get("command").and_then(|c| c.as_str()) != Some(command) {
-                        h["command"] = json!(command);
-                        changed = true;
-                    }
-                    break;
-                }
-            }
+        if existing.get("hooks") == Some(&canonical) {
+            return Ok(changed);
         }
-        return changed;
+        existing["hooks"] = canonical;
+        return Ok(true);
     }
 
     pre.push(json!({
         "matcher": "AskUserQuestion",
-        "hooks": [{
-            "type": "command",
-            "command": command,
-            "args": ["--zcode-ask-hook"],
-            "timeoutMs": 180000,
-            "onError": "allow",
-        }],
+        "hooks": canonical,
     }));
-    true
+    Ok(true)
 }
 
 /// Removes our hook entry; returns whether anything changed.
@@ -860,6 +927,21 @@ pub fn hook_status() -> HookInstallStatus {
     }
 }
 
+/// Writes ZCode's config through a temp file + rename, so a crash mid-write
+/// cannot leave the agent's own config half-written.
+fn write_zcode_config(path: &std::path::Path, pretty: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.rustpods-tmp");
+    std::fs::write(&tmp, pretty).map_err(|e| format!("could not write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not move {} into place: {}", tmp.display(), e)
+    })?;
+    Ok(())
+}
+
 /// Writes `~/.zcode/cli/config.json` with our hook merged in, backing the
 /// previous file up first.
 pub fn install_hook() -> Result<(), String> {
@@ -869,7 +951,8 @@ pub fn install_hook() -> Result<(), String> {
         .map_err(|e| format!("{} is not valid JSON ({}); fix it by hand first", path.display(), e))?;
 
     let command = hook_command_path()?;
-    if !install_hook_into(&mut root, &command) {
+    let changed = install_hook_into(&mut root, &command)?;
+    if !changed {
         info!("ZCode hook already installed");
         return Ok(());
     }
@@ -880,11 +963,8 @@ pub fn install_hook() -> Result<(), String> {
             .map_err(|e| format!("could not back up {} : {}", path.display(), e))?;
         info!("Backed up previous config to {}", backup.display());
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    std::fs::write(&path, pretty).map_err(|e| format!("could not write {}: {}", path.display(), e))?;
+    write_zcode_config(&path, &pretty)?;
     info!("Installed ZCode hook (command: {})", command);
     Ok(())
 }
@@ -896,8 +976,7 @@ pub fn uninstall_hook() -> Result<(), String> {
         .map_err(|e| format!("{} is not valid JSON ({}); fix it by hand first", path.display(), e))?;
     if uninstall_hook_from(&mut root) {
         let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-        std::fs::write(&path, pretty)
-            .map_err(|e| format!("could not write {}: {}", path.display(), e))?;
+        write_zcode_config(&path, &pretty)?;
         info!("Removed ZCode hook");
     } else {
         info!("No ZCode hook to remove");
@@ -1047,16 +1126,20 @@ mod tests {
         )
         .unwrap();
 
-        assert!(install_hook_into(&mut config, "/opt/rustpods"));
+        assert!(install_hook_into(&mut config, "/opt/rustpods").unwrap());
         let pre = config["hooks"]["events"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 1);
         assert_eq!(pre[0]["matcher"], "AskUserQuestion");
+        // A `command` hook carrying `args` is dropped outright by ZCode, so
+        // the installed shape must be a `process` hook.
+        assert_eq!(pre[0]["hooks"][0]["type"], "process");
+        assert_eq!(pre[0]["hooks"][0]["args"][0], "--zcode-ask-hook");
         assert_eq!(pre[0]["hooks"][0]["timeoutMs"], 180000);
         assert_eq!(config["mcp"]["servers"]["gitlab"]["url"], "http://x");
         assert_eq!(config["hooks"]["enabled"], true);
 
         // A second run changes nothing.
-        assert!(!install_hook_into(&mut config, "/opt/rustpods"));
+        assert!(!install_hook_into(&mut config, "/opt/rustpods").unwrap());
         assert_eq!(
             config["hooks"]["events"]["PreToolUse"]
                 .as_array()
@@ -1067,7 +1150,10 @@ mod tests {
     }
 
     #[test]
-    fn reinstall_from_a_moved_binary_repoints_the_command() {
+    fn install_migrates_the_dropped_command_shape() {
+        // The shape the first version installed: `args` on a `command` hook,
+        // which ZCode discards wholesale. Reinstalling must replace it with
+        // the canonical process entry rather than only repointing command.
         let mut config: Value = serde_json::from_str(
             r#"{
                 "hooks": {
@@ -1084,11 +1170,47 @@ mod tests {
         )
         .unwrap();
 
-        // The marker in `args`, not the old command path, is the identity.
-        assert!(install_hook_into(&mut config, "/new/path/rustpods"));
+        assert!(install_hook_into(&mut config, "/new/path/rustpods").unwrap());
         let pre = config["hooks"]["events"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre.len(), 1, "moving the binary must not duplicate the hook");
+        assert_eq!(pre.len(), 1, "migration must not duplicate the hook");
+        assert_eq!(pre[0]["hooks"][0]["type"], "process");
         assert_eq!(pre[0]["hooks"][0]["command"], "/new/path/rustpods");
+    }
+
+    #[test]
+    fn install_refuses_wrong_shaped_blocks() {
+        // `hooks` present but not an object: refuse instead of clobbering.
+        let mut config: Value = serde_json::json!({"hooks": []});
+        assert!(install_hook_into(&mut config, "/x").is_err());
+        assert_eq!(config["hooks"], serde_json::json!([]), "must not rewrite");
+
+        let mut config: Value = serde_json::json!({"hooks": {"events": {"PreToolUse": {}}}});
+        assert!(install_hook_into(&mut config, "/x").is_err());
+    }
+
+    #[test]
+    fn install_respects_a_deliberate_hooks_kill_switch() {
+        let mut config: Value = serde_json::json!({
+            "hooks": {"enabled": false, "events": {"PostToolUse": []}}
+        });
+        let err = install_hook_into(&mut config, "/x").unwrap_err();
+        assert!(err.contains("false"), "{err}");
+        // The user's kill switch and their other hooks survive untouched.
+        assert_eq!(config["hooks"]["enabled"], false);
+        assert!(config["hooks"]["events"].get("PostToolUse").is_some());
+    }
+
+    #[test]
+    fn parse_questions_rejects_option_objects_without_labels() {
+        // Dropping a label-less option would shift every later nod index
+        // onto the wrong answer; the payload must be unusable instead.
+        let payload: Value = serde_json::json!({
+            "tool_input": {"questions": [{
+                "question": "q",
+                "options": [{"label": "A"}, {"description": "no label"}]
+            }]}
+        });
+        assert!(parse_questions(&payload).is_none());
     }
 
     #[test]

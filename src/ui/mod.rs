@@ -380,6 +380,12 @@ fn build_ui(app: &Application) {
     // socket, this quietly does nothing; either way the hook finds a server.
     tokio::spawn(crate::system::zcode_ask::run_socket_server());
 
+    // Head-tracked audio, once per process. The watch channel and the
+    // PipeWire filter-chain node both outlive any single AACP connection, so
+    // re-spawning per reconnect would pile up one PipeWire thread and one
+    // HRTF client per flapping link.
+    tokio::spawn(run_audio_follow(aacp_manager.head_pose()));
+
     tokio::spawn(async move {
         start_bluetooth_daemon(aacp_bg, dev_state_bg, mpris_bg, ui_tx_bg, cfg_bg).await;
     });
@@ -404,6 +410,10 @@ fn build_ui(app: &Application) {
 
 /// Drives the head-tracked audio stage for as long as poses arrive.
 ///
+/// Spawned once per process: the watch channel and the PipeWire node both
+/// outlive any single AACP connection, and a fresh instance per reconnect
+/// would leak a PipeWire thread and an HRTF client per flapping link.
+///
 /// ## Rate
 ///
 /// Poses arrive at roughly 100 Hz. The mixer must not be retuned at that rate:
@@ -427,7 +437,7 @@ fn build_ui(app: &Application) {
 /// been configured, the stage reports itself unavailable and this returns
 /// quietly; the compass and battery display are unaffected.
 #[cfg(feature = "audio-follow")]
-async fn run_audio_follow(
+pub async fn run_audio_follow(
     pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
 ) {
     use crate::system::audio_follow::{AzimuthSchedule, FilterPlan, HrtfClient};
@@ -477,7 +487,7 @@ async fn run_audio_follow(
 
 /// Stub for builds without the feature, so the call site stays uniform.
 #[cfg(not(feature = "audio-follow"))]
-async fn run_audio_follow(
+pub async fn run_audio_follow(
     _pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
 ) {
 }
@@ -621,19 +631,6 @@ pub async fn start_bluetooth_daemon(
                 }
 
                 let mut last_both_in_ear = false;
-
-                // Head-tracked audio, when this build has it. The stage is
-                // started once per session and fed from the same watch channel
-                // the compass reads, so the two can never disagree about where
-                // the head is.
-                //
-                // It is not tied to the AACP event loop: if PipeWire is missing
-                // or the filter chain is not loaded, the task logs once and
-                // exits, and everything else carries on untouched.
-                {
-                    let pose_rx = aacp.head_pose();
-                    tokio::spawn(run_audio_follow(pose_rx));
-                }
 
                 // Head-gesture answering of ZCode questions, fed from the same
                 // watch channel as the compass. Retires any task from a

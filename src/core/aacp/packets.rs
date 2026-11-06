@@ -108,10 +108,15 @@ pub fn make_control_command_packet(cmd: ControlCommandId, data: &[u8]) -> Vec<u8
 }
 
 pub fn make_rename_packet(name: &str) -> Vec<u8> {
+    // The length field is a single byte; a longer name would wrap it and
+    // emit a malformed frame. Clamp on a UTF-8 boundary instead.
     let bytes = name.as_bytes();
-    let size = bytes.len() as u8;
-    let mut packet = vec![0x04, 0x00, 0x04, 0x00, 0x1A, 0x00, 0x01, size, 0x00];
-    packet.extend_from_slice(bytes);
+    let mut end = bytes.len().min(255);
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut packet = vec![0x04, 0x00, 0x04, 0x00, 0x1A, 0x00, 0x01, end as u8, 0x00];
+    packet.extend_from_slice(&bytes[..end]);
     packet
 }
 

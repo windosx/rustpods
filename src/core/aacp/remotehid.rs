@@ -235,7 +235,12 @@ pub struct RemoteDevice {
 
 /// Splits a received frame into (generation, sub-header, payload).
 pub fn parse_frame(frame: &[u8]) -> Option<(u8, SubHeader, &[u8])> {
-    if frame.len() < 8 || frame[4] != 0x17 {
+    // The descriptor id and body length need bytes 6..12, so anything shorter
+    // than that is noise, not a malformed-but-real frame. A shorter guard
+    // here used to panic the receive task on an 8-11 byte 0x17 frame - and
+    // the task panics before its cleanup, wedging the whole AACP session in
+    // a "connected" state no event ever clears.
+    if frame.len() < 12 || frame[4] != 0x17 {
         return None;
     }
     let descriptor = u32::from_le_bytes([frame[6], frame[7], frame[8], frame[9]]);
@@ -394,6 +399,19 @@ impl MotionSample {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_0x17_frames_are_rejected_not_panic() {
+        // The receive loop routes any 0x17 frame containing '<' here; an
+        // 8-11 byte one must be dropped. The old <8 guard panicked at
+        // frame[8]/frame[10], killing the receive task before its cleanup
+        // and wedging the session as permanently "connected".
+        let short = [0x04, 0x00, 0x04, 0x00, 0x17, 0x00, b'<', 0x08, 0x00, 0x00, 0x00];
+        assert_eq!(short.len(), 11);
+        assert!(parse_frame(&short).is_none());
+        assert!(parse_frame(&short[..8]).is_none());
+        assert!(parse_frame(&short[..10]).is_none());
+    }
 
     #[test]
     fn sub_header_matches_documented_examples() {

@@ -362,6 +362,7 @@ impl AacpManager {
         let neorelay_ids = Arc::clone(&self.neorelay_ids);
         let ear_cache = Arc::clone(&self.ear_status);
         let remotes = Arc::clone(&self.remotes);
+        let self_head_status = Arc::clone(&self.head_status);
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -520,6 +521,15 @@ impl AacpManager {
                 tracker.active = false;
                 tracker.reset();
             }
+            // Per-connection caches go with the connection. The accessory
+            // reassigns its service ids on every connect (rtbuddy's own docs),
+            // so a registry carried across would aim the next session's
+            // interval/feature reports at ids that no longer exist - and a
+            // stale entry for a *named* service would mask the fresh one.
+            *remotes.lock().await = remotehid::DeviceRegistry::new();
+            *neorelay_ids.lock().await = None;
+            *ear_cache.lock().await = None;
+            *self_head_status.lock().await = "head tracking not started".to_string();
             let _ = head_feed.send(None);
             let _ = event_tx.send(AacpEvent::Disconnected);
             warn!("AACP receive loop exited, sent Disconnected event");

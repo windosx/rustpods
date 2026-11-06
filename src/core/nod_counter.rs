@@ -28,8 +28,15 @@ const NOD_RETURN: f32 = 2.0;
 const MIN_NOD_INTERVAL: f32 = 0.15;
 /// Silence after the last nod that commits the count, in seconds.
 const QUIET_COMMIT_SECS: f32 = 1.4;
-/// Resting pitch is tracked with an EMA; this is its convergence rate in 1/s.
+/// Resting pitch is tracked with an EMA; this is its convergence rate in 1/s
+/// while the head is near the baseline.
 const BASELINE_RATE: f32 = 1.5;
+/// Outside this deadband (degrees) the baseline adapts at the slow drift
+/// rate instead: a deliberate slow nod must not drag its own reference down
+/// with it, or the dip never crosses the threshold at all.
+const BASELINE_DEADBAND: f32 = 3.0;
+/// Baseline convergence rate while the head is away from the baseline.
+const BASELINE_DRIFT_RATE: f32 = 0.1;
 /// Yaw swing, in degrees, above which a pending count is read as a head shake.
 const YAW_CANCEL_SWING: f32 = 10.0;
 /// The shake must dominate the nod motion by this ratio to cancel it.
@@ -142,7 +149,13 @@ impl NodCounter {
         // has been counted, freezing the baseline keeps the next nod equally
         // easy to reach even if the wearer rests slightly dipped.
         if self.count == 0 {
-            self.baseline = Some(baseline + (pitch_deg - baseline) * (BASELINE_RATE * dt).min(1.0));
+            let deviation = pitch_deg - baseline;
+            let rate = if deviation.abs() < BASELINE_DEADBAND {
+                BASELINE_RATE
+            } else {
+                BASELINE_DRIFT_RATE
+            };
+            self.baseline = Some(baseline + deviation * (rate * dt).min(1.0));
         }
 
         // Hysteresis: arm on the way down, count on the way back up.
@@ -160,8 +173,11 @@ impl NodCounter {
             return Some(NodEvent::Counted(self.count));
         }
 
-        // The wearer has stopped nodding: commit whatever was counted.
-        if self.count > 0 && self.since_count > QUIET_COMMIT_SECS {
+        // The wearer has stopped nodding: commit whatever was counted. The
+        // head must be back near the baseline first - a slow, deliberate nod
+        // can spend longer than the quiet window on the way down, and
+        // committing mid-dip would truncate the count.
+        if self.count > 0 && !self.down && self.since_count > QUIET_COMMIT_SECS {
             let total = self.count;
             self.reset();
             return Some(NodEvent::Commit(total));
@@ -314,6 +330,35 @@ mod tests {
         // And the cancelled state must not produce a commit later.
         let tail = hold(&mut counter, 0.0, 2.0, 0.0);
         assert!(tail.is_empty(), "cancelled count must not commit: {tail:?}");
+    }
+
+    #[test]
+    fn slow_nods_are_not_committed_mid_dip() {
+        let mut counter = NodCounter::new();
+        // First slow nod (0.9 s down, 0.2 s up), then start a second one.
+        let mut events = ramp(&mut counter, 0.0, -10.0, 0.9, 0.0);
+        events.extend(ramp(&mut counter, -10.0, 0.0, 0.2, 0.0));
+        events.extend(hold(&mut counter, 0.0, 0.35, 0.0));
+        assert!(events.contains(&NodEvent::Counted(1)));
+        events.extend(ramp(&mut counter, 0.0, -10.0, 0.9, 0.0));
+        assert_eq!(counter.count(), 1, "second dip still in progress");
+
+        // Hold the head down: more than QUIET_COMMIT_SECS now elapsed since
+        // the first count. The old rule committed right here, truncating the
+        // wearer's intent to option 1 while their head was still nodding.
+        events.extend(hold(&mut counter, -10.0, 0.4, 0.0));
+        assert!(
+            !events.iter().any(|e| matches!(e, NodEvent::Commit(_))),
+            "must not commit while mid-dip: {events:?}"
+        );
+
+        // Finish the nod and rest: the full count commits.
+        events.extend(ramp(&mut counter, -10.0, 0.0, 0.2, 0.0));
+        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        assert!(
+            events.contains(&NodEvent::Commit(2)),
+            "expected commit of 2 after the slow nods: {events:?}"
+        );
     }
 
     #[test]

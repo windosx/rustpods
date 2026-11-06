@@ -113,7 +113,7 @@ where
     // MPRIS integration info row
     let info_row = ActionRow::new();
     info_row.set_title("Linux MPRIS 播放器集成");
-    info_row.set_subtitle("已自动接管 YesPlayMusic, Spotify, VLC, Rhythmbox, 浏览器音频");
+    info_row.set_subtitle("入耳自动暂停/续播适用于任何实现 MPRIS 接口的正在播放的播放器");
     let check_icon = gtk4::Image::from_icon_name("emblem-ok-symbolic");
     info_row.add_suffix(&check_icon);
     group.add(&info_row);

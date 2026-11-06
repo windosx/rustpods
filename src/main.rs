@@ -95,20 +95,30 @@ struct Cli {
 ///
 /// Uses `flock` on a file under `$XDG_RUNTIME_DIR`, which is the conventional
 /// location for per-user runtime state and is cleared on logout. An advisory
-/// lock is chosen over a pidfile because the kernel releases it when the process
-/// dies, so a crash never leaves a stale lock behind - a pidfile would, and
+/// lock is chosen over a pidfile because the kernel releases it when the
+/// process dies, so a crash never leaves a stale lock behind - a pidfile would, and
 /// checking whether that pid is still alive races with pid reuse.
+///
+/// Every AACP engine takes this one lock - the `--no-gui` daemon, the GUI,
+/// and the head-tracking diagnostics alike - because two engines make the
+/// accessory stop answering for both. The GUI-vs-GUI case is exempted by
+/// checking the GApplication bus name first: a second GUI launch must keep
+/// activating the running window, not fail.
 struct InstanceLock {
     _file: std::fs::File,
 }
 
 impl InstanceLock {
-    fn acquire(role: &str) -> Result<Self, String> {
+    fn acquire() -> Result<Self, String> {
         use std::os::unix::io::AsRawFd;
 
+        // An empty-but-set variable is as good as unset (XDG spec); falling
+        // back per key keeps the lock off the filesystem root either way.
         let dir = std::env::var("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-        let path = format!("{}/rustpods-{}.lock", dir, role);
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+        let path = format!("{}/rustpods-session.lock", dir);
 
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -125,8 +135,8 @@ impl InstanceLock {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
                 return Err(format!(
-                    "Another RustPods instance is already running ({} is locked); \
-only one can use the AACP session at a time",
+                    "Another RustPods engine (GUI or --no-gui daemon) is already running \
+                     ({} is locked); only one can use the AACP session at a time",
                     path,
                 ));
             }
@@ -138,6 +148,30 @@ only one can use the AACP session at a time",
         let _ = std::fs::write(&path, format!("{}\n", std::process::id()));
         Ok(Self { _file: file })
     }
+}
+
+/// Whether a RustPods GUI already owns its application bus name on the
+/// session bus.
+fn gui_already_running() -> bool {
+    use zbus::blocking::Proxy;
+
+    let Ok(conn) = zbus::blocking::Connection::session() else {
+        return false;
+    };
+    let Ok(proxy) = Proxy::new(
+        &conn,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    ) else {
+        return false;
+    };
+    proxy
+        .call::<_, _, bool>(
+            "NameHasOwner",
+            &("io.github.rustpods.RustPods".to_string(),),
+        )
+        .unwrap_or(false)
 }
 
 fn main() {
@@ -209,6 +243,16 @@ fn main() {
     let _guard = rt.enter();
 
     if let Some(target) = cli.head_tracking_test.clone() {
+        // The diagnostic drives the same AACP link as a running GUI or
+        // daemon, so it takes the same exclusive lock instead of silently
+        // yanking the session out from under one.
+        let _instance_lock = match InstanceLock::acquire() {
+            Ok(lock) => lock,
+            Err(reason) => {
+                error!("{}", reason);
+                std::process::exit(1);
+            }
+        };
         info!("Head-tracking diagnostic against {}", target);
         let sweep = cli.sweep;
         let reference = cli.reference;
@@ -271,7 +315,7 @@ fn main() {
         // exclusive lock instead - the usual approach for background services.
         // Only one process may hold the AACP session anyway: a second one makes
         // the accessory stop answering for both.
-        let _instance_lock = match InstanceLock::acquire("daemon") {
+        let _instance_lock = match InstanceLock::acquire() {
             Ok(lock) => lock,
             Err(reason) => {
                 error!("{}", reason);
@@ -321,6 +365,9 @@ fn main() {
             // wins the socket answers the hook, and both run the same engine.
             tokio::spawn(system::zcode_ask::run_socket_server());
 
+            // Head-tracked audio, once per process (see run_audio_follow).
+            tokio::spawn(ui::run_audio_follow(aacp_manager.head_pose()));
+
             tokio::spawn(async move {
                 ui::start_bluetooth_daemon(
                     aacp_manager,
@@ -338,6 +385,19 @@ fn main() {
             info!("Daemon shutting down");
         });
     } else {
+        // The GUI is an AACP engine just like the daemon, so it takes the
+        // same exclusive lock. A second GUI launch is still fine: when the
+        // GApplication bus name is already owned, that instance is simply
+        // activated and this one exits through the usual path.
+        let _instance_lock = match InstanceLock::acquire() {
+            Ok(lock) => Some(lock),
+            Err(_) if gui_already_running() => None,
+            Err(reason) => {
+                error!("{}", reason);
+                std::process::exit(1);
+            }
+        };
+
         // Run Libadwaita / GTK4 application
         ui::run_app();
     }
@@ -409,7 +469,7 @@ async fn run_spatial_session_test(target: &str) {
         tracing::warn!("No samples arrived despite the claim.");
         tracing::warn!("The host side of the chain is in place; the accessory still");
         tracing::warn!("does not answer 0x800, which means the missing piece is not");
-        tracing::warn!("only this state machine - see README 方案 A step 1.");
+        tracing::warn!("only this state machine - cycle the buds through the case and retry.");
     }
 
     // Step 3: releasing must stop the retries.
