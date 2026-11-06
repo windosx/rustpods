@@ -96,7 +96,7 @@ const RATE_WINDOW: usize = 100;
 ///
 /// A head resting against a shoulder is a *rotation*, so it shows up as a large
 /// integral here even though the raw gravity vector barely changes.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct AttitudeIntegrator {
     /// Low-pass filtered gravity unit vector; `None` until the first sample.
     up: Option<[f32; 3]>,
@@ -107,10 +107,44 @@ struct AttitudeIntegrator {
     /// tilted far enough that the default axis is nearly vertical.
     lateral: Option<[f32; 3]>,
     last_sample: Option<Instant>,
+
+    /// Estimated gyro bias, in counts per second.
+    ///
+    /// A MEMS gyro reports a small non-zero rate even when still, and integrating
+    /// that constant offset makes the compass creep in one direction forever -
+    /// which is what repeated head shaking produced: the needle drifted
+    /// anticlockwise a little more each time.
+    bias: [f32; 3],
+    /// Recent rates and gravity vectors, for the stillness test.
+    window: VecDeque<[f32; 3]>,
+    gravity_window: VecDeque<[f32; 3]>,
+    /// How long the head has been still enough to trust as a bias sample.
+    still_seconds: f32,
+    /// Whether a first bias estimate has been taken. The first one is adopted
+    /// whole; later ones are blended in slowly.
+    bias_seeded: bool,
 }
 
 impl AttitudeIntegrator {
     const UP_SMOOTHING: f32 = 0.15;
+
+    /// Peak-to-peak rate range under which the head counts as still, in counts/s.
+    /// The reference implementation uses 3.0 deg/s, converted here with the same
+    /// scale the integrator applies.
+    const STILL_RANGE_COUNTS: f32 = 3.0 / ROTATION_DEG_PER_SEC;
+    /// Gravity may drift by at most this much while "still", as a cosine.
+    const STILL_GRAVITY_DOT: f32 = 0.999_7;
+    /// Stillness has to persist this long before the average is trusted.
+    const STILL_SECONDS: f32 = 0.4;
+    /// How much of a new bias estimate to adopt after the first one.
+    const BIAS_BLEND: f32 = 0.03;
+    /// Samples kept for the stillness test (~0.4 s at 100 Hz).
+    const BIAS_WINDOW: usize = 40;
+    /// Largest first estimate to accept, in counts/s; a bigger one means the
+    /// "still" judgement was wrong and a real rotation is in progress.
+    const BIAS_SEED_LIMIT: f32 = 20.0 / ROTATION_DEG_PER_SEC;
+    /// Largest correction to an existing estimate, in counts/s.
+    const BIAS_TRACK_LIMIT: f32 = 5.0 / ROTATION_DEG_PER_SEC;
 
     fn new() -> Self {
         Self::default()
@@ -118,6 +152,80 @@ impl AttitudeIntegrator {
 
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Updates the gyro bias estimate while the head is still.
+    ///
+    /// A constant offset in the rate integrates into an ever-growing angle, so
+    /// without this the compass creeps even when nothing moves. The test follows
+    /// the reference implementation: the rate must stay within a narrow
+    /// peak-to-peak band and gravity must not rotate, for a sustained period.
+    fn update_bias(&mut self, gyro: [f32; 3], up: [f32; 3], dt: f32) {
+        if self.window.len() >= Self::BIAS_WINDOW {
+            self.window.pop_front();
+            self.gravity_window.pop_front();
+        }
+        self.window.push_back(gyro);
+        self.gravity_window.push_back(up);
+
+        if self.window.len() < 8 {
+            return;
+        }
+
+        let mut range = 0.0f32;
+        for axis in 0..3 {
+            let max = self
+                .window
+                .iter()
+                .map(|s| s[axis])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let min = self
+                .window
+                .iter()
+                .map(|s| s[axis])
+                .fold(f32::INFINITY, f32::min);
+            range = range.max(max - min);
+        }
+
+        let gravity_moved = match (self.gravity_window.front(), self.gravity_window.back()) {
+            (Some(first), Some(last)) => dot3(*first, *last) < Self::STILL_GRAVITY_DOT,
+            _ => true,
+        };
+
+        if range < Self::STILL_RANGE_COUNTS && !gravity_moved {
+            self.still_seconds += dt;
+        } else {
+            self.still_seconds = 0.0;
+        }
+
+        if self.still_seconds < Self::STILL_SECONDS {
+            return;
+        }
+
+        let n = self.window.len() as f32;
+        let mean = [
+            self.window.iter().map(|s| s[0]).sum::<f32>() / n,
+            self.window.iter().map(|s| s[1]).sum::<f32>() / n,
+            self.window.iter().map(|s| s[2]).sum::<f32>() / n,
+        ];
+
+        let jump = len3(sub3(mean, self.bias));
+        let limit = if self.bias_seeded {
+            Self::BIAS_TRACK_LIMIT
+        } else {
+            Self::BIAS_SEED_LIMIT
+        };
+        if jump >= limit {
+            // A slow, steady rotation is not a bias; refuse to learn from it.
+            return;
+        }
+
+        let blend = if self.bias_seeded { Self::BIAS_BLEND } else { 1.0 };
+        self.bias = add3(
+            self.bias,
+            scale3(sub3(mean, self.bias), blend),
+        );
+        self.bias_seeded = true;
     }
 
     /// Feeds one sample. `gyro` is the rotation rate at offsets 26..32 and
@@ -149,13 +257,16 @@ impl AttitudeIntegrator {
             return Some([self.yaw_deg, self.pitch_deg, self.roll_deg]);
         }
 
+        self.update_bias(gyro, up, dt);
+        let corrected = sub3(gyro, self.bias);
+
         // Yaw: rotation about the vertical.
-        let yaw_rate = dot3(gyro, up);
+        let yaw_rate = dot3(corrected, up);
 
         // Pitch and roll live in the plane perpendicular to gravity. The lateral
         // axis is the device's own x axis projected down, kept from the previous
         // sample when the projection degenerates.
-        let horizontal = sub3(gyro, scale3(up, yaw_rate));
+        let horizontal = sub3(corrected, scale3(up, yaw_rate));
         let lateral = match self.lateral {
             Some(prev) if len3(reject3([1.0, 0.0, 0.0], up)) < 0.25 => prev,
             _ => normalize3(reject3([1.0, 0.0, 0.0], up)),
@@ -950,6 +1061,39 @@ mod tests {
         }
         let [yaw, _, _] = integ.update(gyro, gravity).unwrap();
         assert!(yaw > 0.0, "yaw should integrate upward, got {}", yaw);
+    }
+
+    #[test]
+    fn constant_gyro_offset_is_learned_as_bias_and_stops_the_drift() {
+        // This is the drift you saw: the gyro reports a small constant rate while
+        // the head is still, and integrating it walks the needle round the dial.
+        // The bias estimator must absorb it so the angle settles.
+        let mut integ = AttitudeIntegrator::new();
+        let gravity = [0.0, 0.0, 1000.0];
+        // A steady offset well inside the stillness band (2 deg/s worth).
+        let offset = 2.0 / ROTATION_DEG_PER_SEC;
+        let gyro = [0.0, 0.0, offset];
+
+        // Stillness has to persist for 0.4 s before the average is trusted, so
+        // feed well past that. 100 samples at 5 ms is 0.5 s.
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            integ.update(gyro, gravity);
+        }
+        assert!(integ.bias_seeded, "the offset should have been learned");
+        let learned_yaw = integ.yaw_deg;
+
+        // Another half second must not keep accumulating.
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            integ.update(gyro, gravity);
+        }
+        let drift = (integ.yaw_deg - learned_yaw).abs();
+        assert!(
+            drift < 1.0,
+            "yaw kept drifting by {} deg after the bias was learned",
+            drift
+        );
     }
 
     #[test]
