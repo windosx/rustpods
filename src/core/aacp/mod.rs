@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod events;
 pub mod packets;
+pub mod remotehid;
 pub mod rtbuddy;
 
 use bluer::l2cap::{Socket, SocketAddr};
@@ -278,6 +279,11 @@ impl AacpManager {
                                 } else {
                                     info!("Received RTBuddy XML descriptor ({} bytes)", len);
                                 }
+                                // XML bodies are both the SensorDataWX service
+                                // advertisements *and* the RemoteHID
+                                // DeviceConnect plists, so they still have to
+                                // reach the tap.
+                                rtb_acp_tx.send(packet.to_vec()).ok();
                                 continue;
                             }
                             // Short frames on this descriptor are descriptor
@@ -287,13 +293,18 @@ impl AacpManager {
                             } else {
                                 0
                             };
-                            // Samples are recognised by the payload marker, which
-                            // is how newer firmware frames (80/81 bytes) are told
-                            // apart from descriptor traffic on the same channel.
-                            let has_marker = packet
-                                .windows(crate::core::head_tracking::PAYLOAD_MARK.len())
-                                .any(|w| w == crate::core::head_tracking::PAYLOAD_MARK);
-                            if len < crate::core::head_tracking::SENSOR_V2_LEN && !has_marker {
+                            // Every RemoteHID frame belongs to the tap: on
+                            // descriptor 0x800 the accessory sends DeviceConnect
+                            // blobs that are hundreds of bytes long, so a size
+                            // test alone would misroute them into the sample
+                            // parser. Only the SensorDataWX descriptor carries
+                            // attitude samples.
+                            if descriptor == rtbuddy::DESCRIPTOR_SENSOR
+                                || (len < crate::core::head_tracking::SENSOR_V2_LEN
+                                    && !packet
+                                        .windows(crate::core::head_tracking::PAYLOAD_MARK.len())
+                                        .any(|w| w == crate::core::head_tracking::PAYLOAD_MARK))
+                            {
                                 rtb_acp_tx.send(packet.to_vec()).ok();
                                 debug!(
                                     "RTBuddy frame: descriptor=0x{:08X} len={} {:02X?}",

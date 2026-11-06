@@ -51,6 +51,13 @@ struct Cli {
                 audio in head-tracked mode (the macOS precondition) before enabling"
     )]
     spatial: bool,
+
+    #[arg(
+        long,
+        help = "With --head-tracking-test: speak Apple RemoteHID on descriptor 0x800 \
+                (what AirPods 3 actually uses) instead of SensorDataWX"
+    )]
+    remotehid: bool,
 }
 
 fn main() {
@@ -87,8 +94,11 @@ fn main() {
         let reference = cli.reference;
         let linux_reference = cli.linux_reference;
         let spatial = cli.spatial;
+        let remotehid = cli.remotehid;
         rt.block_on(async move {
-            if spatial {
+            if remotehid {
+                run_remotehid_test(&target).await;
+            } else if spatial {
                 run_spatial_session_test(&target).await;
             } else if linux_reference {
                 run_linux_reference_sequence(&target).await;
@@ -236,6 +246,148 @@ async fn run_spatial_session_test(target: &str) {
     // Step 3: releasing must stop the retries.
     aacp.release_spatial_audio("io.github.rustpods.RustPods").await;
     tracing::info!("Spatial claim released; retries should have stopped");
+}
+
+/// Speaks Apple RemoteHID on descriptor `0x800`.
+///
+/// AirPods 3 does not implement `SensorDataWX` (`0x100000`) at all; motion data
+/// arrives through this channel instead. See `core::aacp::remotehid` for the
+/// frame layout and for what is and is not verified on this hardware.
+async fn run_remotehid_test(target: &str) {
+    use crate::core::aacp::remotehid;
+    use std::time::Duration;
+
+    let Some(aacp) = prepare_connection(target).await else {
+        return;
+    };
+
+    tracing::info!("Connecting AACP for RemoteHID...");
+    if let Err(e) = aacp.connect(addr_of(target)).await {
+        tracing::error!("AACP connect failed: {}", e);
+        return;
+    }
+
+    for (label, packet) in [
+        ("handshake", vec![0x00u8, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ("feature flags", vec![0x04, 0x00, 0x04, 0x00, 0x4D, 0x00, 0xD7, 0x00, 0, 0, 0, 0, 0, 0]),
+        ("notifications", vec![0x04, 0x00, 0x04, 0x00, 0x0F, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]),
+    ] {
+        tracing::debug!("Sending {}: {:02X?}", label, packet);
+        let _ = aacp.send_raw(packet).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let mut frames = aacp.subscribe_rtbuddy_frames();
+    let mut registry = remotehid::DeviceRegistry::new();
+    let mut generation = remotehid::Generation::default();
+    let mut generation_counter = 0u8;
+
+    tracing::info!("Sending HostConnect");
+    if let Err(e) = aacp.send_raw(remotehid::make_host_connect(generation.next())).await {
+        tracing::error!("send failed: {}", e);
+        return;
+    }
+    let _ = &mut generation_counter;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(received) = tokio::time::timeout(remaining, frames.recv()).await else {
+            break;
+        };
+        let Ok(frame) = received else { break };
+        let Some((_generation, header, _payload)) = remotehid::parse_frame(&frame) else {
+            continue;
+        };
+        if header.kind() != Some(remotehid::Kind::HostConnect) || header.is_response {
+            continue;
+        }
+        if let Some(start) = frame.iter().position(|&b| b == b'<') {
+            let text = String::from_utf8_lossy(&frame[start..]).to_string();
+            let descriptor = text
+                .find("<key>ReportDescriptor</key><data>")
+                .and_then(|s| {
+                    let rest = &text[s + "<key>ReportDescriptor</key><data>".len()..];
+                    rest.find('<').map(|e| decode_base64(&rest[..e]))
+                })
+                .unwrap_or_default();
+            registry.record(header.device, &text, &descriptor);
+            if let Some(d) = registry.all().find(|d| d.device == header.device) {
+                tracing::info!(
+                    "DeviceConnect: dev={} service={} max_report={:?} reports={} feature={}",
+                    d.device,
+                    d.service,
+                    d.max_report_size,
+                    d.report_ids.len(),
+                    d.has_feature_report
+                );
+            }
+        }
+    }
+
+    let devices: Vec<_> = registry.all().cloned().collect();
+    if devices.is_empty() {
+        tracing::warn!("No DeviceConnect received; the accessory did not announce anything");
+        return;
+    }
+
+    let motion = registry
+        .motion_device()
+        .cloned()
+        .or_else(|| devices.first().cloned());
+    let Some(motion) = motion else {
+        return;
+    };
+    tracing::info!(
+        "Motion service: {} (dev {}), declares Feature report: {}",
+        motion.service,
+        motion.device,
+        motion.has_feature_report
+    );
+    if !motion.has_feature_report {
+        tracing::warn!(
+            "No Feature report declared, so the documented SetReport (Feature \
+             report 1 = interval) has nothing to write to on this firmware."
+        );
+    }
+
+    tracing::info!("Sending SetReport: Feature report 1 = 10000us (100 Hz)");
+    let set = remotehid::make_set_interval(generation.next(), motion.device, 10_000);
+    tracing::debug!("SetReport: {:02X?}", set);
+    let _ = aacp.send_raw(set).await;
+
+    for second in 1..=15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let samples = aacp.head_samples_seen().await;
+        tracing::info!("t={:>2}s  motion samples={}", second, samples);
+        if samples > 0 {
+            tracing::info!(">>> RemoteHID stream is running");
+            break;
+        }
+    }
+
+    let _ = aacp.stop_head_tracking().await;
+    tracing::info!("RemoteHID test complete");
+}
+
+/// Minimal base64 decoder for the descriptor blobs embedded in DeviceConnect.
+fn decode_base64(input: &str) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for byte in input.bytes() {
+        let Some(index) = TABLE.iter().position(|&c| c == byte) else {
+            continue;
+        };
+        buffer = (buffer << 6) | index as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
 }
 
 async fn run_head_tracking_test(target: &str) {
