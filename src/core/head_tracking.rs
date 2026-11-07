@@ -808,7 +808,7 @@ const DESCRIPTOR_REMOTE_HID: u32 = 0x0000_0800;
 /// Kind 2 in the RemoteHID sub-header is an InputReport.
 const REMOTE_HID_KIND_INPUT: u32 = 2;
 /// Bytes of motion data in one RemoteHID InputReport, after the report-type byte.
-const REMOTE_HID_MOTION_LEN: usize = 58;
+pub const REMOTE_HID_MOTION_LEN: usize = 58;
 /// Rotation-rate scale from the protocol document: ~0.122 °/s per count. The
 /// source marks it approximate, so treat derived yaw as indicative only.
 const ROTATION_DEG_PER_SEC: f32 = 0.122;

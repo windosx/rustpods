@@ -1,3 +1,4 @@
+use super::components::agents::build_agents_page;
 use super::components::battery::{build_battery_card, update_battery_widgets, BatteryViewWidgets};
 use super::components::headtracking::{build_head_tracking_page, HeadTrackingWidgets};
 use super::components::hero::build_hero_card;
@@ -165,7 +166,23 @@ where
     stack.add_named(&controls_scrolled, Some("controls"));
 
     // -------------------------------------------------------------
-    // Page 4: 偏好设置与硬件 (Preferences)
+    // Page 4: 智能体接入 (Agent hooks) — its own page, per the management
+    // surface the nod-answer feature needs: master switch, sensitivity, and
+    // per-agent install/uninstall/test in one place.
+    // -------------------------------------------------------------
+    let agents_page = build_agents_page(config);
+
+    let agents_scrolled = ScrolledWindow::new();
+    agents_scrolled.set_vexpand(true);
+    agents_scrolled.set_hexpand(true);
+    agents_scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    agents_scrolled.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
+    agents_scrolled.set_child(Some(&agents_page));
+
+    stack.add_named(&agents_scrolled, Some("agents"));
+
+    // -------------------------------------------------------------
+    // Page 5: 偏好设置与硬件 (Preferences)
     // -------------------------------------------------------------
     let preferences_page = build_preferences_page(initial_state, config, on_toggle_close_to_tray);
 
@@ -185,6 +202,7 @@ where
         ("overview", "audio-headphones-symbolic", "概览首页"),
         ("spatial", "emblem-music-symbolic", "空间音频"),
         ("controls", "preferences-other-symbolic", "控制与交互"),
+        ("agents", "applications-engineering-symbolic", "智能体接入"),
         ("preferences", "emblem-system-symbolic", "偏好设置"),
     ];
 

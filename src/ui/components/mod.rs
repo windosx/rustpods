@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod battery;
 pub mod headtracking;
 pub mod hero;
