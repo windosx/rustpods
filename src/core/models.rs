@@ -35,7 +35,12 @@ impl AirPodsModel {
             0x2002 => Self::AirPods1,
             0x200F => Self::AirPods2,
             0x2013 => Self::AirPods3,
-            0x2024 => Self::AirPods4,
+            // 0x2024 (8228) is AirPods Pro 2nd gen (USB-C), per the published
+            // Bluetooth PID tables. Mapping it to AirPods 4 hid every noise
+            // control from Pro 2 owners. The AirPods 4 (non-ANC) product id is
+            // deliberately unmapped - the id that used to sit here belongs to
+            // the Pro 2, and 0x201B below is the AirPods 4 with ANC.
+            0x2024 => Self::AirPodsPro2UsbC,
             0x201B => Self::AirPods4Anc,
             0x200E => Self::AirPodsPro1,
             0x2014 => Self::AirPodsPro2Lightning,
@@ -184,6 +189,19 @@ mod tests {
         assert!(caps.has_transparency);
         assert!(caps.has_conversational_awareness);
         assert!(caps.has_case_speaker);
+        assert!(caps.has_volume_swipe);
+    }
+
+    #[test]
+    fn test_product_0x2024_is_pro2_usbc_not_airpods4() {
+        // 0x2024 (8228) is AirPods Pro 2nd gen (USB-C) in the published PID
+        // tables. It used to map to AirPods 4, whose capabilities hide every
+        // noise control - the most common modern model lost ANC in the UI.
+        let model = AirPodsModel::from_product_id(0x2024);
+        assert_eq!(model, AirPodsModel::AirPodsPro2UsbC);
+        let caps = model.capabilities();
+        assert!(caps.has_anc, "Pro 2 USB-C has ANC");
+        assert!(caps.has_adaptive_audio);
         assert!(caps.has_volume_swipe);
     }
 }

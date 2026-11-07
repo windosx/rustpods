@@ -374,7 +374,7 @@ impl AacpManager {
                     Ok(len) if len > 0 => {
                         let packet = &buf[..len];
                         if len > 4 && packet[4] == 0x17 {
-                            if packet.contains(&b'<') {
+                            if routes_to_xml(packet) {
                                 // The accessory advertises its RTBuddy services as
                                 // XML right after the handshake. This is the only
                                 // authoritative source for which service ids
@@ -978,6 +978,37 @@ fn record_connect(registry: &mut remotehid::DeviceRegistry, frame: &[u8]) {
     registry.record(header.device, &text, &descriptor);
 }
 
+/// Bytes of motion data in a RemoteHID InputReport, after the report-id byte.
+const MOTION_BLOCK_LEN: usize = crate::core::head_tracking::REMOTE_HID_MOTION_LEN;
+
+/// Whether an opcode-0x17 frame is a RemoteHID InputReport carrying a motion
+/// block, i.e. a sensor sample rather than XML or control traffic.
+fn is_motion_input_report(packet: &[u8]) -> bool {
+    let Some((_, header, payload)) = remotehid::parse_frame(packet) else {
+        return false;
+    };
+    header.kind() == Some(remotehid::Kind::InputReport)
+        && !header.is_response
+        // payload starts at the report-id byte; the motion block follows it.
+        && payload.len() >= 1 + MOTION_BLOCK_LEN
+}
+
+/// The receive-loop routing decision for an opcode-0x17 frame: XML path or
+/// sensor path.
+///
+/// Motion samples are binary and their sensor bytes hit 0x3C (`<`) regularly -
+/// the sample counter alone lands one there every 256 frames - so "contains
+/// '<'" cannot by itself separate XML descriptors from sensor data. A genuine
+/// InputReport carrying a full motion block is a sample; everything else with
+/// a `<` is XML. Advertisements are recognised first: their cookie can
+/// coincide with the InputReport kind bits in [`remotehid::parse_frame`], and
+/// they must stay on the XML path.
+fn routes_to_xml(packet: &[u8]) -> bool {
+    let is_advertisement = rtbuddy::ServiceAdvertisement::parse(packet).is_some();
+    let is_motion_report = !is_advertisement && is_motion_input_report(packet);
+    packet.contains(&b'<') && !is_motion_report
+}
+
 /// Minimal base64 decoder for the descriptor blobs in DeviceConnect.
 fn decode_b64(input: &str) -> Vec<u8> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -996,4 +1027,117 @@ fn decode_b64(input: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a RemoteHID InputReport frame carrying a 58-byte motion block,
+    /// in the layout the AirPods 3 actually streams.
+    fn motion_frame(counter: u32, seed: u8) -> Vec<u8> {
+        let mut block = vec![0u8; 58];
+        block[44..46].copy_from_slice(&1000i16.to_le_bytes()); // gravity x
+        block[54..58].copy_from_slice(&counter.to_le_bytes());
+        for byte in block.iter_mut().skip(20).take(20) {
+            *byte = seed;
+        }
+
+        let header = 7u32 | ((62u32) << 7) | (2u32 << 17); // device 7, kind 2
+        let mut body = vec![0x00, 0x2A, 0x00, 0x00];
+        body.extend_from_slice(&header.to_le_bytes());
+        body.push(0x00); // report id byte
+        body.extend_from_slice(&block);
+
+        let mut frame = vec![0x04, 0x00, 0x04, 0x00, 0x17, 0x00];
+        frame.extend_from_slice(&0x0000_0800u32.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    /// Builds a sensor service advertisement in the captured rtbuddy layout.
+    fn advertisement_frame(cookie: u32) -> Vec<u8> {
+        let mut frame = vec![
+            0x04, 0x00, 0x04, 0x00, 0x17, 0x00, // AACP header
+            0x00, 0x08, 0x00, 0x00, // descriptor 0x800
+            0x40, 0x00, // body length
+            0x00, 0x16, 0x00, 0x00, // flag, service id 22, reserved
+        ];
+        frame.extend_from_slice(&cookie.to_le_bytes());
+        frame.extend_from_slice(
+            b"<?xml?><key>AccessoryService</key><string>neorelay</string></dict>",
+        );
+        let len = (frame.len() - 12) as u16;
+        frame[10..12].copy_from_slice(&len.to_le_bytes());
+        frame
+    }
+
+    #[test]
+    fn motion_sample_with_lt_byte_is_not_routed_to_xml() {
+        // The sample counter's low byte cycles 0x00-0xFF, so one frame in 256
+        // carries 0x3C ('<') - and seed bytes elsewhere in the block can too.
+        // Each such frame used to be mistaken for an XML descriptor and
+        // dropped from the tracker.
+        let frame = motion_frame(0x0000_003C, 0x3C);
+        assert!(frame.contains(&b'<'), "the frame must contain a '<'");
+        assert!(is_motion_input_report(&frame));
+
+        // The receive-loop predicate: contains '<' but rescued by the motion
+        // check, so it reaches the tracker instead of the XML path.
+        let routed_to_xml = routes_to_xml(&frame);
+        assert!(!routed_to_xml);
+    }
+
+    #[test]
+    fn advertisement_is_xml_even_when_its_cookie_looks_like_an_input_report() {
+        // parse_frame reads body[4..8] as a sub-header, so a cookie whose
+        // second byte sets the kind bits can coincide with InputReport (2).
+        // The advertisement check runs first and must win.
+        let frame = advertisement_frame(0x0004_3483); // kind bits come out as 2
+        assert!(rtbuddy::ServiceAdvertisement::parse(&frame).is_some());
+        assert!(is_motion_input_report(&frame)); // coincidence confirmed...
+        let routed_to_xml = routes_to_xml(&frame);
+        assert!(routed_to_xml, "the advertisement check must run first");
+    }
+
+    #[test]
+    fn deviceconnect_is_xml_wherever_its_plist_starts() {
+        // A DeviceConnect has kind 0, so it is never mistaken for a motion
+        // sample - including if its plist does not start at a fixed offset.
+        for plist_offset in [20usize, 21, 24] {
+            let mut body = vec![0x00, 0x2A, 0x00, 0x00];
+            body.extend_from_slice(&7u32.to_le_bytes()); // kind 0 sub-header
+            body.resize(plist_offset - 12, 0xEE);
+            body.extend_from_slice(b"<plist><key>AccessoryService</key><string>x</string>");
+
+            let mut frame = vec![0x04, 0x00, 0x04, 0x00, 0x17, 0x00];
+            frame.extend_from_slice(&0x0000_0800u32.to_le_bytes());
+            frame.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            frame.extend_from_slice(&body);
+
+            assert!(!is_motion_input_report(&frame));
+            let routed_to_xml = routes_to_xml(&frame);
+            assert!(routed_to_xml, "plist at offset {plist_offset} must stay XML");
+        }
+    }
+
+    #[test]
+    fn short_control_frames_stay_xml() {
+        // SetReport responses and the enable ACK are short and kind 3; a '<'
+        // inside them keeps them on the XML path (they are not samples).
+        let mut body = vec![0x00, 0x2A, 0x00, 0x00];
+        body.extend_from_slice(&((3u32 << 17) | (1u32 << 21)).to_le_bytes()); // kind 3, response
+        body.push(0x02);
+        body.extend_from_slice(&[0x3C, 0x3C, 0x00, 0x00]);
+
+        let mut frame = vec![0x04, 0x00, 0x04, 0x00, 0x17, 0x00];
+        frame.extend_from_slice(&0x0000_0800u32.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&body);
+
+        assert!(!is_motion_input_report(&frame));
+        let routed_to_xml = routes_to_xml(&frame);
+        assert!(routed_to_xml);
+    }
 }

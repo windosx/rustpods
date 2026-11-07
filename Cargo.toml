@@ -39,3 +39,15 @@ default = []
 # Pan the stereo image to follow the wearer's head. Requires libpipewire-0.3
 # headers and libclang at build time.
 audio-follow = ["dep:pipewire", "dep:libspa"]
+
+# Both examples speak PipeWire directly, so they can only build with the
+# feature on. Without this, `cargo test` and `cargo clippy` - which compile
+# every target, examples included - fail on `use pipewire` before running a
+# single test.
+[[example]]
+name = "probe_hrtf"
+required-features = ["audio-follow"]
+
+[[example]]
+name = "verify_hrtf_client"
+required-features = ["audio-follow"]
