@@ -54,58 +54,7 @@ where
 
     container.append(&tray_group);
 
-    // Group 2: Hardware & Firmware Info
-    let hw_group = PreferencesGroup::new();
-    hw_group.set_title("硬件与固件详细信息");
-    hw_group.set_description(Some("AirPods 私有固件出厂信息"));
-
-    let model_row = ActionRow::new();
-    model_row.set_title("设备代号与型号");
-    model_row.set_subtitle(&format!("{} (Apple Inc.)", state.capabilities.name));
-    hw_group.add(&model_row);
-
-    let mac_row = ActionRow::new();
-    mac_row.set_title("蓝牙物理地址 (MAC)");
-    mac_row.set_subtitle(&state.mac_address);
-    hw_group.add(&mac_row);
-
-    let fw_row = ActionRow::new();
-    fw_row.set_title("硬件固件架构");
-    fw_row.set_subtitle("A2564 • 65.1868046005000000.52 (官方 6A321 固件)");
-    hw_group.add(&fw_row);
-
-    let serial_row = ActionRow::new();
-    serial_row.set_title("硬件序列号");
-    serial_row.set_subtitle("主盒: CDGJFXHF63 | 左: GX6MGE30035Y | 右: GX6MGMWS0360");
-    hw_group.add(&serial_row);
-
-    container.append(&hw_group);
-
-    // Group 3: Linux Integration
-    let linux_group = PreferencesGroup::new();
-    linux_group.set_title("Linux 系统服务集成");
-
-    let mpris_row = ActionRow::new();
-    mpris_row.set_title("D-Bus MPRIS 媒体联动");
-    mpris_row.set_subtitle("已激活自动入耳暂停、戴上自动续播与耳机按柄交互");
-    let mpris_badge = Label::new(Some("运行中"));
-    mpris_badge.add_css_class("success");
-    mpris_badge.add_css_class("caption");
-    mpris_row.add_suffix(&mpris_badge);
-    linux_group.add(&mpris_row);
-
-    let audio_row = ActionRow::new();
-    audio_row.set_title("PipeWire / PulseAudio 原生音频");
-    audio_row.set_subtitle("支持 A2DP 高清立体声音频流与无缝切换");
-    let pw_badge = Label::new(Some("正常"));
-    pw_badge.add_css_class("success");
-    pw_badge.add_css_class("caption");
-    audio_row.add_suffix(&pw_badge);
-    linux_group.add(&audio_row);
-
-    container.append(&linux_group);
-
-    // Group 4: Agent integration management
+    // Group 2: Agent integration management
     //
     // One row per supported agent, plus the master switch for the nod-answer
     // feature. The install/uninstall buttons drive the same entry points the
@@ -236,6 +185,58 @@ where
     }
 
     container.append(&agents_group);
+
+    // Group 3: Hardware & Firmware Info
+    let hw_group = PreferencesGroup::new();
+    hw_group.set_title("硬件与固件详细信息");
+    hw_group.set_description(Some("AirPods 私有固件出厂信息"));
+
+    let model_row = ActionRow::new();
+    model_row.set_title("设备代号与型号");
+    model_row.set_subtitle(&format!("{} (Apple Inc.)", state.capabilities.name));
+    hw_group.add(&model_row);
+
+    let mac_row = ActionRow::new();
+    mac_row.set_title("蓝牙物理地址 (MAC)");
+    mac_row.set_subtitle(&state.mac_address);
+    hw_group.add(&mac_row);
+
+    let fw_row = ActionRow::new();
+    fw_row.set_title("硬件固件架构");
+    fw_row.set_subtitle("A2564 • 65.1868046005000000.52 (官方 6A321 固件)");
+    hw_group.add(&fw_row);
+
+    let serial_row = ActionRow::new();
+    serial_row.set_title("硬件序列号");
+    serial_row.set_subtitle("主盒: CDGJFXHF63 | 左: GX6MGE30035Y | 右: GX6MGMWS0360");
+    hw_group.add(&serial_row);
+
+    container.append(&hw_group);
+
+    // Group 4: Linux Integration
+    let linux_group = PreferencesGroup::new();
+    linux_group.set_title("Linux 系统服务集成");
+
+    let mpris_row = ActionRow::new();
+    mpris_row.set_title("D-Bus MPRIS 媒体联动");
+    mpris_row.set_subtitle("已激活自动入耳暂停、戴上自动续播与耳机按柄交互");
+    let mpris_badge = Label::new(Some("运行中"));
+    mpris_badge.add_css_class("success");
+    mpris_badge.add_css_class("caption");
+    mpris_row.add_suffix(&mpris_badge);
+    linux_group.add(&mpris_row);
+
+    let audio_row = ActionRow::new();
+    audio_row.set_title("PipeWire / PulseAudio 原生音频");
+    audio_row.set_subtitle("支持 A2DP 高清立体声音频流与无缝切换");
+    let pw_badge = Label::new(Some("正常"));
+    pw_badge.add_css_class("success");
+    pw_badge.add_css_class("caption");
+    audio_row.add_suffix(&pw_badge);
+    linux_group.add(&audio_row);
+
+    container.append(&linux_group);
+
 
     container
 }
