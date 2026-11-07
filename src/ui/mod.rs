@@ -54,6 +54,10 @@ pub fn run_app() {
 fn build_ui(app: &Application) {
     let config = Arc::new(std::sync::RwLock::new(load_config()));
 
+    // Gesture thresholds follow the saved sensitivity from the first sample
+    // on; the preferences combo keeps the global in step from here on.
+    crate::core::nod_counter::set_sensitivity(config.read().unwrap().gesture_sensitivity);
+
     // Shared state between Tokio background engine and UI
     let device_state = Arc::new(RwLock::new(None::<AirPodsDeviceState>));
     let aacp_manager = Arc::new(AacpManager::new());
@@ -500,6 +504,10 @@ pub async fn start_bluetooth_daemon(
     config: Arc<std::sync::RwLock<AppConfig>>,
 ) {
     info!("Starting RustPods Bluetooth Background Daemon...");
+
+    // The daemon is an engine of its own: seed the gesture sensitivity the
+    // same way the GUI does at startup.
+    crate::core::nod_counter::set_sensitivity(config.read().unwrap().gesture_sensitivity);
 
     // Start BLE Proximity Monitor for real-time background battery updates
     let dev_state_le = dev_state.clone();

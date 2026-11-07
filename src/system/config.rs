@@ -41,10 +41,19 @@ pub struct AppConfig {
     /// preference and rewrites the file from scratch).
     #[serde(default = "default_true")]
     pub head_gesture_answers_enabled: bool,
+    /// Gesture sensitivity, 1 (only deliberate, large nods) to 5 (light
+    /// movements already count). Drives the nod counter's thresholds and the
+    /// badge detector's amplitude gates; clamped at the use sites.
+    #[serde(default = "default_gesture_sensitivity")]
+    pub gesture_sensitivity: u8,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_gesture_sensitivity() -> u8 {
+    3
 }
 
 impl Default for AppConfig {
@@ -60,6 +69,7 @@ impl Default for AppConfig {
             start_minimized: false,
             close_to_tray: true,
             head_gesture_answers_enabled: true,
+            gesture_sensitivity: 3,
         }
     }
 }

@@ -5,7 +5,7 @@ use crate::system::zcode_ask::{self, AskReply};
 use gtk4::prelude::*;
 use gtk4::{Box, Button, Label, Orientation};
 use libadwaita::prelude::*;
-use libadwaita::{ActionRow, PreferencesGroup, SwitchRow};
+use libadwaita::{ActionRow, ComboRow, PreferencesGroup, SwitchRow};
 use std::sync::Arc;
 
 pub fn build_preferences_page<C>(
@@ -132,6 +132,32 @@ where
         });
     }
     agents_group.add(&answer_switch);
+
+    // Gesture sensitivity, 1-5. Stored in the config, applied process-wide
+    // immediately, and picked up by the answering task at the next question.
+    let sensitivity_row = ComboRow::new();
+    sensitivity_row.set_title("手势灵敏度");
+    sensitivity_row.set_subtitle("点头计数与摇头取消的判定幅度:1 = 需要明显的动作,5 = 轻微动作即可");
+    sensitivity_row.set_model(Some(&gtk4::StringList::new(&[
+        "1 · 很不灵敏",
+        "2 · 较不灵敏",
+        "3 · 标准",
+        "4 · 较灵敏",
+        "5 · 很灵敏",
+    ])));
+    let current_sensitivity = config.read().unwrap().gesture_sensitivity.clamp(1, 5);
+    sensitivity_row.set_selected((current_sensitivity - 1) as u32);
+    {
+        let cfg = config.clone();
+        sensitivity_row.connect_selected_notify(move |row| {
+            let value = crate::core::nod_counter::set_sensitivity(row.selected() as u8 + 1);
+            if let Ok(mut c) = cfg.write() {
+                c.gesture_sensitivity = value;
+                save_config(&c);
+            }
+        });
+    }
+    agents_group.add(&sensitivity_row);
 
     for agent in registered_agents() {
         if !agent.available {

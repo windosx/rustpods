@@ -10,8 +10,8 @@
 //! the resting pitch followed by a return to it, so the detector is a
 //! hysteresis state machine around a slowly tracked resting baseline:
 //!
-//! * `pitch < baseline − NOD_DEPTH` arms the count (head is down),
-//! * `pitch > baseline − NOD_RETURN` commits one nod (head came back up),
+//! * `pitch < baseline − depth` arms the count (head is down),
+//! * `pitch > baseline − return` commits one nod (head came back up),
 //! * `QUIET_COMMIT_SECS` of silence after the last nod commits the total.
 //!
 //! The baseline only adapts while no count is pending, so pausing between
@@ -20,25 +20,59 @@
 //! the "shake to dismiss" gesture, and it also stops a glance sideways from
 //! being mistaken for the start of a nod sequence.
 
-/// How far below the resting pitch a nod must dip, in degrees.
-const NOD_DEPTH: f32 = 6.0;
-/// How close to the resting pitch the head must come back for the dip to count.
-const NOD_RETURN: f32 = 2.0;
+/// Gestural sensitivity, shared process-wide: 1 means only deliberate, large
+/// movements count, 5 means light movements already do. Surfaced as a combo
+/// on the preferences page; drives both the nod counter's thresholds and the
+/// badge detector's amplitude gates.
+pub const SENSITIVITY_DEFAULT: u8 = 3;
+pub const SENSITIVITY_MIN: u8 = 1;
+pub const SENSITIVITY_MAX: u8 = 5;
+
+static SENSITIVITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SENSITIVITY_DEFAULT);
+
+/// Clamps and stores the process-wide sensitivity, returning the clamped
+/// value.
+pub fn set_sensitivity(value: u8) -> u8 {
+    let value = value.clamp(SENSITIVITY_MIN, SENSITIVITY_MAX);
+    SENSITIVITY.store(value, std::sync::atomic::Ordering::Relaxed);
+    value
+}
+
+/// The current process-wide sensitivity.
+pub fn sensitivity() -> u8 {
+    SENSITIVITY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How deep a nod must dip below the resting pitch, in degrees, per level.
+fn nod_depth_for(sensitivity: u8) -> f32 {
+    [10.0, 8.0, 6.0, 4.5, 3.5][(sensitivity - SENSITIVITY_MIN) as usize]
+}
+
+/// How large a yaw swing, in degrees, reads as a head shake per level:
+/// higher sensitivity means a smaller turn already cancels.
+fn yaw_cancel_for(sensitivity: u8) -> f32 {
+    [18.0, 14.0, 10.0, 7.0, 5.0][(sensitivity - SENSITIVITY_MIN) as usize]
+}
+
+/// Multiplier for the badge detector's amplitude thresholds (accel counts).
+/// Above 1 is stricter than the historical default, below 1 more eager.
+pub fn badge_amplitude_scale() -> f32 {
+    [2.0, 1.4, 1.0, 0.7, 0.5][(sensitivity() - SENSITIVITY_MIN) as usize]
+}
+
 /// Minimum spacing between counted nods, in seconds; filters single-sample bounce.
 const MIN_NOD_INTERVAL: f32 = 0.15;
 /// Silence after the last nod that commits the count, in seconds.
 const QUIET_COMMIT_SECS: f32 = 1.4;
-/// Resting pitch is tracked with an EMA; this is its convergence rate in 1/s
-/// while the head is near the baseline.
+/// Resting pitch is tracked with an EMA; this is its convergence rate in 1/s.
 const BASELINE_RATE: f32 = 1.5;
-/// Outside this deadband (degrees) the baseline adapts at the slow drift
-/// rate instead: a deliberate slow nod must not drag its own reference down
-/// with it, or the dip never crosses the threshold at all.
-const BASELINE_DEADBAND: f32 = 3.0;
-/// Baseline convergence rate while the head is away from the baseline.
-const BASELINE_DRIFT_RATE: f32 = 0.1;
-/// Yaw swing, in degrees, above which a pending count is read as a head shake.
-const YAW_CANCEL_SWING: f32 = 10.0;
+/// The baseline only adapts while the head is essentially still - pitch swing
+/// below this. A deadband on the deviation cannot do this job: an EMA chasing
+/// a ramp lags by slope/rate (a fast nod at ~27°/s already lags ~4° within a
+/// tenth of a second), which silently deepens the very thresholds the
+/// sensitivity level is supposed to set. Nod motion must never drag the
+/// reference along.
+const BASELINE_STILL_SWING: f32 = 1.5;
 /// The shake must dominate the nod motion by this ratio to cancel it.
 const YAW_CANCEL_RATIO: f32 = 1.5;
 /// Swing decay time constant in seconds: how long motion stays "recent".
@@ -59,8 +93,23 @@ pub enum NodEvent {
 
 /// Counts nod cycles on the pitch axis. Feed it every pose sample while a
 /// question is pending, and [`NodCounter::reset`] it when none is.
+///
+/// Thresholds follow the process-wide sensitivity (see [`set_sensitivity`]):
+/// construct with [`NodCounter::with_sensitivity`] where the level is known,
+/// and rebuild when it changes.
 #[derive(Debug, Clone)]
 pub struct NodCounter {
+    /// The sensitivity level these thresholds were built from, so a reset
+    /// restores the same behaviour instead of silently reverting to the
+    /// default level.
+    sensitivity: u8,
+    /// How far below the resting pitch a nod must dip, in degrees.
+    depth: f32,
+    /// How close to the resting pitch the head must come back for the dip to
+    /// count; a third of the depth.
+    return_band: f32,
+    /// Yaw swing, in degrees, above which a pending count is a head shake.
+    yaw_cancel: f32,
     /// Resting pitch in degrees; re-seeded from the first sample after a reset.
     baseline: Option<f32>,
     /// Resting yaw, the reference the yaw swing is measured against.
@@ -84,21 +133,36 @@ impl Default for NodCounter {
 }
 
 impl NodCounter {
+    /// A counter at the default sensitivity.
     pub fn new() -> Self {
+        Self::with_sensitivity(SENSITIVITY_DEFAULT)
+    }
+
+    /// A counter with the thresholds for the given sensitivity level.
+    pub fn with_sensitivity(sensitivity: u8) -> Self {
+        let sensitivity = sensitivity.clamp(SENSITIVITY_MIN, SENSITIVITY_MAX);
+        let depth = nod_depth_for(sensitivity);
         Self {
+            sensitivity,
+            depth,
+            return_band: depth / 3.0,
+            yaw_cancel: yaw_cancel_for(sensitivity),
             baseline: None,
             yaw_ref: None,
             pitch_swing: 0.0,
             yaw_swing: 0.0,
             down: false,
             count: 0,
-            since_count: 0.0,
+            // A fresh counter has no recent count to debounce against, so the
+            // first nod may arm immediately - otherwise a wearer answering
+            // right away loses the nod that crosses within the first 150 ms.
+            since_count: MIN_NOD_INTERVAL,
         }
     }
 
     /// Clears everything; the next sample re-seeds the baselines.
     pub fn reset(&mut self) {
-        *self = Self::new();
+        *self = Self::with_sensitivity(self.sensitivity);
     }
 
     /// Nods counted so far in the current sequence.
@@ -138,32 +202,28 @@ impl NodCounter {
         // A deliberate head turn while a count is pending means "dismiss":
         // cancel, and never let it half-count as a nod.
         if self.count > 0
-            && self.yaw_swing > YAW_CANCEL_SWING
+            && self.yaw_swing > self.yaw_cancel
             && self.yaw_swing > self.pitch_swing * YAW_CANCEL_RATIO
         {
             self.reset();
             return Some(NodEvent::Cancelled);
         }
 
-        // The resting pitch only adapts while nothing is pending. Once a nod
-        // has been counted, freezing the baseline keeps the next nod equally
-        // easy to reach even if the wearer rests slightly dipped.
-        if self.count == 0 {
-            let deviation = pitch_deg - baseline;
-            let rate = if deviation.abs() < BASELINE_DEADBAND {
-                BASELINE_RATE
-            } else {
-                BASELINE_DRIFT_RATE
-            };
-            self.baseline = Some(baseline + deviation * (rate * dt).min(1.0));
+        // The resting pitch only adapts while nothing is pending *and* the
+        // head is near-still. Once a nod has been counted, freezing the
+        // baseline keeps the next nod equally easy to reach even if the
+        // wearer rests slightly dipped.
+        if self.count == 0 && self.pitch_swing < BASELINE_STILL_SWING {
+            self.baseline =
+                Some(baseline + (pitch_deg - baseline) * (BASELINE_RATE * dt).min(1.0));
         }
 
         // Hysteresis: arm on the way down, count on the way back up.
         if !self.down {
-            if self.since_count >= MIN_NOD_INTERVAL && pitch_deg < baseline - NOD_DEPTH {
+            if self.since_count >= MIN_NOD_INTERVAL && pitch_deg < baseline - self.depth {
                 self.down = true;
             }
-        } else if pitch_deg > baseline - NOD_RETURN {
+        } else if pitch_deg > baseline - self.return_band {
             self.count += 1;
             self.since_count = 0.0;
             // Back to neutral: the next nod must dip below the threshold
@@ -378,6 +438,53 @@ mod tests {
     }
 
     #[test]
+    fn sensitivity_5_counts_a_shallow_nod_the_default_rejects() {
+        // A 4-degree dip: below the level-3 depth (6°) but past level 5
+        // (3.5°). The two counters must disagree exactly as labelled.
+        let nod_at = |sensitivity: u8| {
+            let mut counter = NodCounter::with_sensitivity(sensitivity);
+            let mut events = ramp(&mut counter, 0.0, -4.0, 0.15, 0.0);
+            events.extend(hold(&mut counter, -4.0, 0.05, 0.0));
+            events.extend(ramp(&mut counter, -4.0, 0.0, 0.15, 0.0));
+            events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+            events
+        };
+        assert_eq!(nod_at(3).len(), 0, "level 3 must ignore a 4° nod");
+        assert!(
+            nod_at(5).contains(&NodEvent::Commit(1)),
+            "level 5 must count a 4° nod"
+        );
+    }
+
+    #[test]
+    fn sensitivity_1_requires_deliberate_nods() {
+        let mut counter = NodCounter::with_sensitivity(1);
+        // Level 1 needs a 10° dip: a standard-depth 6° nod is ignored.
+        let mut events = nod(&mut counter, -6.0);
+        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        assert!(events.is_empty(), "level 1 must ignore a 6° nod: {events:?}");
+        // A deliberate 12° nod still counts.
+        let mut events = nod(&mut counter, -12.0);
+        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        assert!(events.contains(&NodEvent::Commit(1)), "{events:?}");
+    }
+
+    #[test]
+    fn reset_keeps_the_counter_sensitivity() {
+        let mut counter = NodCounter::with_sensitivity(5);
+        counter.update(-4.0, 0.0, 0.01);
+        counter.reset();
+        // Still level 5: a fresh 4° nod must count again after the reset.
+        let mut events = ramp(&mut counter, 0.0, -4.0, 0.15, 0.0);
+        events.extend(ramp(&mut counter, -4.0, 0.0, 0.15, 0.0));
+        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        assert!(
+            events.contains(&NodEvent::Commit(1)),
+            "reset must not revert the sensitivity: {events:?}"
+        );
+    }
+
+    #[test]
     fn baseline_reseeds_where_the_question_finds_the_head() {
         let mut counter = NodCounter::new();
         // The wearer is already looking 15 degrees down when the question pops.
@@ -393,3 +500,4 @@ mod tests {
         );
     }
 }
+

@@ -27,7 +27,7 @@ RustPods 是使用 Rust 语言重构并全面升级的 Linux 端 AirPods 高级�
   - 用**陀螺仪积分**得到姿态（`gravity` 只作参考系，不直接当角度读），并做静止检测估计零偏，长时间不漂；
   - 输出 pitch / yaw / roll，「空间音频」页以 Cairo 绘制实时罗盘；
   - 识别点头（是）与摇头（否）手势；
-  - **点头代答智能体选择题**：ZCode 弹出 AskUserQuestion 时经 PreToolUse hook 把问题推送到 RustPods，点头 N 次即选择第 N 项，摇头/超时/未佩戴自动回退到 ZCode 原生界面；在「偏好设置 → 智能体接入」中一键安装/卸载/测试（Codex 等其他智能体已预留接入位）。
+  - **点头代答智能体选择题**：ZCode 弹出 AskUserQuestion 时经 PreToolUse hook 把问题推送到 RustPods，点头 N 次即选择第 N 项，摇头/超时/未佩戴自动回退到 ZCode 原生界面；在「偏好设置 → 智能体接入」中一键安装/卸载/测试（Codex 等其他智能体已预留接入位）；**手势灵敏度 1–5 可调**，同时作用于点头计数、摇头取消与手势识别的判定幅度。
 - 🎧 **头部追踪空间音频**：
   - PipeWire `filter-chain` + `sofa` spatializer 做 HRTF 卷积，方位角由头姿实时驱动；
   - 5° 量化 + 50 ms 下限节流，避免 100 Hz 重建卷积器；

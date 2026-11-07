@@ -390,14 +390,22 @@ impl AxisDetector {
     }
 
     /// Variance-adaptive direction-change threshold over the recent window.
+    ///
+    /// Both the floor and the ceiling follow the user's gesture sensitivity
+    /// (see `nod_counter::badge_amplitude_scale`): higher sensitivity means
+    /// smaller direction changes already register.
     fn dynamic_threshold(&self) -> f32 {
+        let scale = crate::core::nod_counter::badge_amplitude_scale();
         let recent: Vec<f32> = self.history.iter().rev().take(4).copied().collect();
         if recent.len() < 2 {
-            return MIN_DIRECTION_CHANGE;
+            return MIN_DIRECTION_CHANGE * scale;
         }
         let mean = recent.iter().sum::<f32>() / recent.len() as f32;
         let variance = recent.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / recent.len() as f32;
-        (variance / 3.0).clamp(MIN_DIRECTION_CHANGE, DIRECTION_CHANGE_THRESHOLD)
+        (variance / 3.0).clamp(
+            MIN_DIRECTION_CHANGE * scale,
+            DIRECTION_CHANGE_THRESHOLD * scale,
+        )
     }
 
     /// Feeds one sample and records an extremity if the direction just flipped.
@@ -422,7 +430,8 @@ impl AxisDetector {
             None
         };
 
-        let Some(extremity) = turned.filter(|v| v.abs() > AMPLITUDE_FLOOR) else {
+        let amplitude_gate = AMPLITUDE_FLOOR * crate::core::nod_counter::badge_amplitude_scale();
+        let Some(extremity) = turned.filter(|v| v.abs() > amplitude_gate) else {
             return;
         };
 

@@ -569,7 +569,8 @@ static ASK_TASK_GEN: AtomicU64 = AtomicU64::new(0);
 /// connection spawns its own task or the pose stream closes.
 pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>) {
     let task_gen = ASK_TASK_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    let mut counter = NodCounter::new();
+    let mut cur_sensitivity = crate::core::nod_counter::sensitivity();
+    let mut counter = NodCounter::with_sensitivity(cur_sensitivity);
     let mut last_sample: Option<Instant> = None;
 
     loop {
@@ -579,6 +580,14 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
         if ASK_TASK_GEN.load(Ordering::SeqCst) != task_gen {
             debug!("A newer head-gesture task took over; retiring this one");
             return;
+        }
+        // A sensitivity change takes effect at the next question, not the
+        // next restart: rebuild the counter, resetting any partial count
+        // with it (changing thresholds mid-sequence would strand it).
+        let sensitivity = crate::core::nod_counter::sensitivity();
+        if sensitivity != cur_sensitivity {
+            cur_sensitivity = sensitivity;
+            counter = NodCounter::with_sensitivity(sensitivity);
         }
         let now = Instant::now();
         let dt = last_sample.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32());
