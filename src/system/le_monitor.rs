@@ -42,7 +42,7 @@ pub async fn start_le_monitor(
                 .flatten()
                 .unwrap_or_default();
             if let Some(apple_data) = mfg.get(&76) {
-                parse_proximity_message(apple_data, &dev_state, &ui_tx).await;
+                parse_proximity_message(apple_data, addr, &dev_state, &ui_tx).await;
             }
 
             // Every device in range would otherwise park one event task for
@@ -68,7 +68,7 @@ pub async fn start_le_monitor(
                     while let Some(ev) = events.next().await {
                         if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ManufacturerData(mfg)) = ev {
                             if let Some(apple_data) = mfg.get(&76) {
-                                parse_proximity_message(apple_data, &dev_state_clone, &ui_tx_clone).await;
+                                parse_proximity_message(apple_data, addr, &dev_state_clone, &ui_tx_clone).await;
                             }
                         }
                     }
@@ -82,6 +82,7 @@ pub async fn start_le_monitor(
 
 async fn parse_proximity_message(
     data: &[u8],
+    device_addr: bluer::Address,
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
@@ -145,6 +146,16 @@ async fn parse_proximity_message(
 
     let mut lock = dev_state.write().await;
     if let Some(ref mut state) = *lock {
+        // Only our own device: every AirPods case within range broadcasts the
+        // same proximity message, and without this a neighbour's case being
+        // opened rewrote the local battery and in-ear state.
+        if state.mac_address != device_addr.to_string() {
+            debug!(
+                "Ignoring proximity message from {} (tracked device is {})",
+                device_addr, state.mac_address
+            );
+            return;
+        }
         if let Some(lb) = parse_nibble_battery(left_nibble) {
             state.battery_left = Some(lb);
             state.battery_left_charging = left_charging;

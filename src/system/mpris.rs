@@ -107,7 +107,14 @@ impl MprisController {
 
             if let Ok(builder) = proxy_res {
                 if let Ok(proxy) = builder.build().await {
-                    if let Ok(_) = proxy.play().await {
+                    // Only resume what is still paused. If the user resumed or
+                    // stopped the player themselves while the buds were out,
+                    // forcing play() here would start playback they ended.
+                    let still_paused = matches!(
+                        proxy.playback_status().await.as_deref(),
+                        Ok("Paused")
+                    );
+                    if still_paused && proxy.play().await.is_ok() {
                         info!("Resumed player: {}", player_name);
                     }
                 }

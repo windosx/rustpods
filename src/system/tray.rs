@@ -313,7 +313,9 @@ pub fn generate_circular_battery_icon(
     let outer_r = cx - 1.2;
     let inner_r = cx - (size as f32 * 0.22).max(3.5);
 
-    let pct = level.unwrap_or(100) as f32 / 100.0;
+    // Unknown level draws the track only: pretending 100% (the old
+    // unwrap_or(100)) showed a full green ring before any battery report.
+    let pct = level.unwrap_or(0) as f32 / 100.0;
 
     // Color determination (ARGB)
     let arc_color = if charging {

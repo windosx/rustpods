@@ -47,12 +47,18 @@ impl BluetoothManager {
                 let uuids = device.uuids().await.unwrap_or_default().unwrap_or_default();
                 let modalias_opt = device.modalias().await.unwrap_or_default();
 
-                let is_apple = modalias_opt
+                // Vendor 0x004C alone matches every Apple product - a Magic
+                // Mouse or Keyboard would be adopted as "AirPods" and the
+                // daemon would hammer it with AACP connects. The modalias
+                // fallback therefore requires a product id this project
+                // actually knows; a future AirPods model still matches through
+                // the AACP UUID. Beats ids are unmapped, so they stay out too.
+                let modalias_model = modalias_opt
                     .as_ref()
-                    .map(|m| m.vendor == APPLE_VENDOR_ID)
-                    .unwrap_or(false);
-
-                let is_airpods = uuids.contains(&APPLE_AACP_UUID) || is_apple;
+                    .filter(|m| m.vendor == APPLE_VENDOR_ID)
+                    .map(|m| AirPodsModel::from_product_id(m.product as u16));
+                let is_airpods = uuids.contains(&APPLE_AACP_UUID)
+                    || matches!(&modalias_model, Some(m) if !matches!(m, AirPodsModel::Unknown(_)));
 
                 if is_airpods && is_connected {
                     let name = device
@@ -61,11 +67,7 @@ impl BluetoothManager {
                         .ok()
                         .unwrap_or_else(|| "AirPods".to_string());
 
-                    let model = if let Some(m) = modalias_opt {
-                        AirPodsModel::from_product_id(m.product as u16)
-                    } else {
-                        AirPodsModel::AirPods3
-                    };
+                    let model = modalias_model.unwrap_or(AirPodsModel::AirPods3);
 
                     list.push(DiscoveredAirPods {
                         address: addr,
@@ -93,12 +95,14 @@ impl BluetoothManager {
                 let uuids = device.uuids().await.unwrap_or_default().unwrap_or_default();
                 let modalias_opt = device.modalias().await.unwrap_or_default();
 
-                let is_apple = modalias_opt
+                // Same rule as find_connected_airpods: vendor 0x004C alone
+                // would adopt every Apple peripheral as an AirPods.
+                let modalias_model = modalias_opt
                     .as_ref()
-                    .map(|m| m.vendor == APPLE_VENDOR_ID)
-                    .unwrap_or(false);
-
-                let is_airpods = uuids.contains(&APPLE_AACP_UUID) || is_apple;
+                    .filter(|m| m.vendor == APPLE_VENDOR_ID)
+                    .map(|m| AirPodsModel::from_product_id(m.product as u16));
+                let is_airpods = uuids.contains(&APPLE_AACP_UUID)
+                    || matches!(&modalias_model, Some(m) if !matches!(m, AirPodsModel::Unknown(_)));
 
                 if is_airpods {
                     let name = device
@@ -107,11 +111,7 @@ impl BluetoothManager {
                         .ok()
                         .unwrap_or_else(|| "AirPods".to_string());
 
-                    let model = if let Some(m) = modalias_opt {
-                        AirPodsModel::from_product_id(m.product as u16)
-                    } else {
-                        AirPodsModel::AirPods3
-                    };
+                    let model = modalias_model.unwrap_or(AirPodsModel::AirPods3);
 
                     list.push(DiscoveredAirPods {
                         address: addr,

@@ -124,7 +124,7 @@ fn build_single_circular_battery_column(
         let _ = cr.stroke();
 
         // Foreground animated progress arc
-        if level.is_some() && pct > 0.01 {
+        if level.is_some() && pct > 0.0 {
             let color = if is_charging {
                 [0.20, 0.78, 0.35, 1.0] // Electric Green
             } else if pct > 0.40 {
