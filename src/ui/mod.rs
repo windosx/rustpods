@@ -335,9 +335,15 @@ fn build_ui(app: &Application) {
         }
     });
 
-    // Live head-tracking feed: pull the latest pose on every frame rather than
-    // forwarding all ~50 samples/s through the GTK main loop.
+    // Live head-tracking feed. The stream delivers a fresh pose roughly every
+    // 10 ms, but the compass and labels only need redrawing at display rate:
+    // wakes that land inside the render interval are dropped, and the next one
+    // - at most 10 ms later - renders with the newest pose. A `None` pose is
+    // never throttled: it is the disconnect sentinel, and no further wake
+    // would follow to render it late.
     {
+        const RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
         let aacp_feed = aacp_manager.clone();
         let handles_feed = handles.clone();
         let tx_gesture = ui_event_tx.clone();
@@ -354,34 +360,45 @@ fn build_ui(app: &Application) {
                 }
             });
 
+            let mut last_render = None::<std::time::Instant>;
             loop {
-                let pose = (*pose_rx.borrow_and_update()).clone();
+                if pose_rx.changed().await.is_err() {
+                    break;
+                }
+                // Marks the current value as seen even on a skipped frame, so
+                // the next `changed()` waits for the next sample, not this one.
+                let pose = *pose_rx.borrow_and_update();
+                let now = std::time::Instant::now();
+                if pose.is_some()
+                    && last_render.is_some_and(|t| now.duration_since(t) < RENDER_INTERVAL)
+                {
+                    continue;
+                }
+                last_render = Some(now);
+
                 let calibrated = aacp_feed.is_head_tracking_active().await;
                 let rate = aacp_feed.head_tracking_rate_hz().await;
-
-                // Report what the negotiation is actually doing, not a fixed
-                // string. A failure and a still-starting stream used to look
-                // identical here, which made the page useless for diagnosis.
-                let negotiation = aacp_feed.head_tracking_status().await;
                 {
                     let mut state = handles_feed.head_tracking.state.borrow_mut();
                     state.pose = pose;
                     state.calibrated = calibrated;
                     state.rate_hz = rate;
-                    state.status = match (pose, calibrated) {
-                        (Some(_), true) => match rate {
-                            Some(hz) => format!("实时姿态流 · {:.0} Hz", hz),
-                            None => "实时姿态流".to_string(),
-                        },
-                        (Some(_), false) => "正在校准中立姿态…（保持头部静止）".to_string(),
-                        (None, _) => format!("等待数据流 · {}", negotiation),
-                    };
+                    // A `None` pose leaves the status line alone: the
+                    // disconnected wording comes from the ConnectedChanged
+                    // handler, and once the stream is gone there is no
+                    // negotiation progress left to report.
+                    if pose.is_some() {
+                        state.status = if calibrated {
+                            match rate {
+                                Some(hz) => format!("实时姿态流 · {:.0} Hz", hz),
+                                None => "实时姿态流".to_string(),
+                            }
+                        } else {
+                            "正在校准中立姿态…（保持头部静止）".to_string()
+                        };
+                    }
                 }
                 components::headtracking::update_head_tracking_widgets(&handles_feed.head_tracking);
-
-                if pose_rx.changed().await.is_err() {
-                    break;
-                }
             }
         });
     }
