@@ -102,31 +102,84 @@ fn build_ui(app: &Application) {
     };
 
     let aacp_noise = aacp_manager.clone();
+    let dev_noise = device_state.clone();
+    let tx_noise = ui_event_tx.clone();
     let on_set_noise_mode = move |mode: NoiseControlMode| {
         let aacp = aacp_noise.clone();
+        let dev = dev_noise.clone();
+        let tx = tx_noise.clone();
         tokio::spawn(async move {
             let _ = aacp.set_noise_mode(mode).await;
+            // The accessory never echoes the mode back, so without this the
+            // window and tray would show the old mode until restart.
+            let updated = {
+                let mut guard = dev.write().await;
+                match guard.as_mut() {
+                    Some(state) => {
+                        state.noise_mode = mode;
+                        Some(state.clone())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(state) = updated {
+                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
+            }
         });
     };
 
     let aacp_adapt = aacp_manager.clone();
+    let dev_adapt = device_state.clone();
+    let tx_adapt = ui_event_tx.clone();
     let on_set_adaptive = move |val: u8| {
         let aacp = aacp_adapt.clone();
+        let dev = dev_adapt.clone();
+        let tx = tx_adapt.clone();
         tokio::spawn(async move {
             let _ = aacp.set_adaptive_strength(val).await;
+            let updated = {
+                let mut guard = dev.write().await;
+                match guard.as_mut() {
+                    Some(state) => {
+                        state.adaptive_strength = val;
+                        Some(state.clone())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(state) = updated {
+                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
+            }
         });
     };
 
     let aacp_ear = aacp_manager.clone();
     let cfg_ear = config.clone();
+    let dev_ear = device_state.clone();
+    let tx_ear = ui_event_tx.clone();
     let on_toggle_ear = move |enabled: bool| {
         let aacp = aacp_ear.clone();
         if let Ok(mut c) = cfg_ear.write() {
             c.ear_detection_enabled = enabled;
             save_config(&c);
         }
+        let dev = dev_ear.clone();
+        let tx = tx_ear.clone();
         tokio::spawn(async move {
             let _ = aacp.set_ear_detection(enabled).await;
+            let updated = {
+                let mut guard = dev.write().await;
+                match guard.as_mut() {
+                    Some(state) => {
+                        state.ear_detection_enabled = enabled;
+                        Some(state.clone())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(state) = updated {
+                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
+            }
         });
     };
 
@@ -201,17 +254,62 @@ fn build_ui(app: &Application) {
         let _ = tx_tray_open.send(UiEvent::OpenWindow);
     });
     let aacp_tray_noise = aacp_manager.clone();
+    let dev_tray_noise = device_state.clone();
+    let tx_tray_noise = ui_event_tx.clone();
     let on_tray_noise = Arc::new(move |mode: NoiseControlMode| {
         let aacp = aacp_tray_noise.clone();
+        let dev = dev_tray_noise.clone();
+        let tx = tx_tray_noise.clone();
         tokio::spawn(async move {
             let _ = aacp.set_noise_mode(mode).await;
+            // Same optimistic update as the window callback: the tray menu is
+            // rendered from device state, so without this its radio items
+            // would keep showing the old mode forever.
+            let updated = {
+                let mut guard = dev.write().await;
+                match guard.as_mut() {
+                    Some(state) => {
+                        state.noise_mode = mode;
+                        Some(state.clone())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(state) = updated {
+                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
+            }
         });
     });
     let aacp_tray_ear = aacp_manager.clone();
+    let cfg_tray_ear = config.clone();
+    let dev_tray_ear = device_state.clone();
+    let tx_tray_ear = ui_event_tx.clone();
     let on_tray_ear = Arc::new(move |enabled: bool| {
         let aacp = aacp_tray_ear.clone();
+        // Persist like the window switch does: the daemon's auto-pause gate
+        // reads the config, so a tray-only toggle used to have no effect on
+        // whether removing a bud paused playback.
+        if let Ok(mut c) = cfg_tray_ear.write() {
+            c.ear_detection_enabled = enabled;
+            save_config(&c);
+        }
+        let dev = dev_tray_ear.clone();
+        let tx = tx_tray_ear.clone();
         tokio::spawn(async move {
             let _ = aacp.set_ear_detection(enabled).await;
+            let updated = {
+                let mut guard = dev.write().await;
+                match guard.as_mut() {
+                    Some(state) => {
+                        state.ear_detection_enabled = enabled;
+                        Some(state.clone())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(state) = updated {
+                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
+            }
         });
     });
 
@@ -318,6 +416,7 @@ fn build_ui(app: &Application) {
                     } else {
                         handles_listener.hero_status.set_text("○ 未连接");
                         handles_listener.hero_status.remove_css_class("success");
+                        handles_listener.hero_status.remove_css_class("accent");
                         handles_listener.hero_status.add_css_class("dim-label");
 
                         // Drop the last pose so the compass does not keep showing
@@ -557,6 +656,9 @@ pub async fn start_bluetooth_daemon(
                 let mut current_state =
                     AirPodsDeviceState::new(pod.address.to_string(), pod.name.clone(), pod.model);
                 current_state.is_connected = false;
+                // The tray checkmark renders from this field; seed it from the
+                // persisted config instead of the hard-coded true in new().
+                current_state.ear_detection_enabled = config.read().unwrap().ear_detection_enabled;
 
                 // Subscribe to AACP events BEFORE connect so no initial packets (battery, ear status) are missed
                 let mut event_rx = aacp.subscribe();

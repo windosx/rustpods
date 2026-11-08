@@ -8,12 +8,60 @@ use super::components::settings::build_smart_settings_group;
 use super::components::zcode_ask::{build_zcode_ask_card, ZcodeAskWidgets};
 use crate::core::aacp::commands::{MicrophoneMode, NoiseControlMode};
 use crate::core::device::AirPodsDeviceState;
+use crate::core::models::AirPodsModel;
 use crate::system::config::{AppConfig, PauseBehavior};
 use gtk4::prelude::*;
 use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow, Stack};
 use libadwaita::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView};
+use std::cell::Cell;
 use std::sync::Arc;
+
+/// A card that is rebuilt wholesale when the connected device's model changes.
+///
+/// The noise card and the settings group branch on the device model at build
+/// time (ANC segmented control vs the half-in-ear banner, case-chime row vs
+/// nothing), and those branches cannot be flipped on an existing widget tree.
+/// The slot holds exactly one child; [`sync`](Self::sync) swaps in a fresh
+/// card whenever the model differs from the one the current child was built
+/// for. A real device replacing the build-time placeholder is the case that
+/// matters: without this, a Pro/Max unit inherits whatever the placeholder
+/// was built with, and the noise controls never appear.
+pub struct RebuildableCard {
+    slot: Box,
+    model: Cell<Option<AirPodsModel>>,
+    rebuild: std::boxed::Box<dyn Fn(&AirPodsDeviceState)>,
+}
+
+impl RebuildableCard {
+    fn new(
+        slot: Box,
+        initial: &AirPodsDeviceState,
+        build: impl Fn(&AirPodsDeviceState) -> gtk4::Widget + 'static,
+    ) -> Self {
+        slot.append(&build(initial));
+        let rebuild_slot = slot.clone();
+        Self {
+            slot,
+            model: Cell::new(Some(initial.capabilities.model)),
+            rebuild: std::boxed::Box::new(move |state| {
+                while let Some(child) = rebuild_slot.first_child() {
+                    rebuild_slot.remove(&child);
+                }
+                rebuild_slot.append(&build(state));
+            }),
+        }
+    }
+
+    /// Rebuilds the card if `state`'s model differs from the current one.
+    pub fn sync(&self, state: &AirPodsDeviceState) {
+        let model = state.capabilities.model;
+        if self.model.get() != Some(model) {
+            self.model.set(Some(model));
+            (self.rebuild)(state);
+        }
+    }
+}
 
 pub struct MainWindowHandles {
     pub window: ApplicationWindow,
@@ -22,6 +70,8 @@ pub struct MainWindowHandles {
     pub hero_status: Label,
     pub connect_btn: Button,
     pub battery_widgets: BatteryViewWidgets,
+    pub noise_card: RebuildableCard,
+    pub controls_card: RebuildableCard,
     pub head_tracking: HeadTrackingWidgets,
     pub zcode_ask: ZcodeAskWidgets,
 }
@@ -90,7 +140,24 @@ where
         build_hero_card(initial_state, on_rename, on_connect);
 
     let battery_widgets = build_battery_card(initial_state);
-    let noise_card = build_noise_control_card(initial_state, on_set_noise_mode, on_set_adaptive);
+
+    // The noise card and the settings group depend on the device model, and
+    // the build-time state is a placeholder. Keep them in rebuildable slots so
+    // a real device with different capabilities gets its own card instead of
+    // inheriting the placeholder's.
+    let on_noise_mode: Arc<dyn Fn(NoiseControlMode) + Send + Sync> = Arc::new(on_set_noise_mode);
+    let on_adaptive: Arc<dyn Fn(u8) + Send + Sync> = Arc::new(on_set_adaptive);
+
+    let noise_slot = Box::new(Orientation::Vertical, 0);
+    let noise_card = RebuildableCard::new(noise_slot.clone(), initial_state, {
+        let n = on_noise_mode.clone();
+        let a = on_adaptive.clone();
+        move |state| {
+            let n = n.clone();
+            let a = a.clone();
+            build_noise_control_card(state, move |m| n(m), move |v| a(v)).upcast()
+        }
+    });
 
     let overview_box = Box::new(Orientation::Vertical, 14);
     overview_box.set_margin_top(14);
@@ -100,7 +167,7 @@ where
 
     overview_box.append(&hero_container);
     overview_box.append(&battery_widgets.container);
-    overview_box.append(&noise_card);
+    overview_box.append(&noise_slot);
 
     let overview_scrolled = ScrolledWindow::new();
     overview_scrolled.set_vexpand(true);
@@ -134,27 +201,49 @@ where
     // -------------------------------------------------------------
     // Page 3: 耳机控制与交互 (Controls & Gestures)
     // -------------------------------------------------------------
-    let current_cfg = config.read().unwrap().clone();
-    let settings_group = build_smart_settings_group(
-        current_cfg.ear_detection_enabled,
-        current_cfg.pause_behavior,
-        current_cfg.conversational_awareness_enabled,
-        initial_state.mic_mode,
-        initial_state.case_chime_enabled,
-        initial_state.capabilities.has_case_speaker,
-        on_toggle_ear,
-        on_change_pause,
-        on_toggle_conv,
-        on_change_mic,
-        on_toggle_case_chime,
-    );
+    let on_toggle_ear: Arc<dyn Fn(bool) + Send + Sync> = Arc::new(on_toggle_ear);
+    let on_change_pause: Arc<dyn Fn(PauseBehavior) + Send + Sync> = Arc::new(on_change_pause);
+    let on_toggle_conv: Arc<dyn Fn(bool) + Send + Sync> = Arc::new(on_toggle_conv);
+    let on_change_mic: Arc<dyn Fn(MicrophoneMode) + Send + Sync> = Arc::new(on_change_mic);
+    let on_toggle_chime: Arc<dyn Fn(bool) + Send + Sync> = Arc::new(on_toggle_case_chime);
+
+    let controls_slot = Box::new(Orientation::Vertical, 0);
+    let controls_card = RebuildableCard::new(controls_slot.clone(), initial_state, {
+        let config = config.clone();
+        let e = on_toggle_ear.clone();
+        let p = on_change_pause.clone();
+        let c = on_toggle_conv.clone();
+        let m = on_change_mic.clone();
+        let k = on_toggle_chime.clone();
+        move |state| {
+            // Re-read the config at rebuild time: the switches must show the
+            // values that are actually in force, not the ones from launch.
+            let cfg = config.read().unwrap().clone();
+            let (e, p, c, m, k) =
+                (e.clone(), p.clone(), c.clone(), m.clone(), k.clone());
+            build_smart_settings_group(
+                cfg.ear_detection_enabled,
+                cfg.pause_behavior,
+                cfg.conversational_awareness_enabled,
+                state.mic_mode,
+                state.case_chime_enabled,
+                state.capabilities.has_case_speaker,
+                move |b| e(b),
+                move |b| p(b),
+                move |b| c(b),
+                move |b| m(b),
+                move |b| k(b),
+            )
+            .upcast()
+        }
+    });
 
     let controls_box = Box::new(Orientation::Vertical, 14);
     controls_box.set_margin_top(16);
     controls_box.set_margin_bottom(24);
     controls_box.set_margin_start(20);
     controls_box.set_margin_end(20);
-    controls_box.append(&settings_group);
+    controls_box.append(&controls_slot);
 
     let controls_scrolled = ScrolledWindow::new();
     controls_scrolled.set_vexpand(true);
@@ -327,6 +416,8 @@ where
         hero_status,
         connect_btn,
         battery_widgets,
+        noise_card,
+        controls_card,
         head_tracking,
         zcode_ask,
     }
@@ -362,4 +453,6 @@ pub fn update_ui_state(handles: &MainWindowHandles, state: &AirPodsDeviceState) 
     }
 
     update_battery_widgets(&handles.battery_widgets, state);
+    handles.noise_card.sync(state);
+    handles.controls_card.sync(state);
 }

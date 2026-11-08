@@ -335,6 +335,7 @@ fn main() {
             let tray_state = device_state.clone();
             let aacp_noise = aacp_manager.clone();
             let aacp_ear = aacp_manager.clone();
+            let tray_config = config.clone();
             let tray = system::tray::RustPodsTray {
                 device_state: tray_state,
                 on_open_window: Arc::new(|| {}),
@@ -346,6 +347,13 @@ fn main() {
                 }),
                 on_toggle_ear_detection: Arc::new(move |enabled| {
                     let aacp = aacp_ear.clone();
+                    // Persist like the GUI tray does: the daemon's auto-pause
+                    // gate reads the config, so a tray-only toggle used to
+                    // leave the pause behaviour untouched.
+                    if let Ok(mut c) = tray_config.write() {
+                        c.ear_detection_enabled = enabled;
+                        system::config::save_config(&c);
+                    }
                     tokio::spawn(async move {
                         let _ = aacp.set_ear_detection(enabled).await;
                     });
