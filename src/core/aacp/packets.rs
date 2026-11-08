@@ -270,10 +270,17 @@ pub fn parse_aacp_packet(packet: &[u8]) -> Option<AacpEvent> {
         }
 
         opcodes::RENAME => {
+            // The packet this project sends (and librepods' linux client too)
+            // is `[01, size, 00, name...]`, so parse that shape: the length
+            // sits at payload[1] and the name at payload[3..]. The old offsets
+            // read the constant 0x00 as the length and started one byte into
+            // the name, so an echo of our own packet parsed back as "".
+            // No accessory-originated rename capture exists to confirm a
+            // different layout; self-consistency is the grounded choice.
             if payload.len() >= 4 && payload[0] == 0x01 {
-                let len = payload[2] as usize;
-                if payload.len() >= 4 + len {
-                    if let Ok(name) = std::str::from_utf8(&payload[4..4 + len]) {
+                let len = payload[1] as usize;
+                if payload.len() >= 3 + len {
+                    if let Ok(name) = std::str::from_utf8(&payload[3..3 + len]) {
                         return Some(AacpEvent::Renamed(name.to_string()));
                     }
                 }
@@ -468,6 +475,19 @@ mod tests {
             Some(AacpEvent::Renamed(parsed_name)) => {
                 assert_eq!(parsed_name, name);
             }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rename_packet_round_trips_through_our_own_parser() {
+        // make_rename_packet emits `[01, size, 00, name...]`; the parser used
+        // to read the length from payload[2] (the constant 0x00) and start the
+        // name one byte late, so an echo of our own packet parsed back as "".
+        let name = "浩的AirPods";
+        let packet = make_rename_packet(name);
+        match parse_aacp_packet(&packet) {
+            Some(AacpEvent::Renamed(parsed)) => assert_eq!(parsed, name),
             other => panic!("Unexpected event: {:?}", other),
         }
     }

@@ -878,9 +878,18 @@ async fn drive_remote_hid(
             let Ok(received) = tokio::time::timeout(remaining, frames.recv()).await else {
                 break;
             };
-            let Ok(_frame) = received else {
-                return Err("AACP receive channel closed".to_string());
-            };
+            match received {
+                Ok(_frame) => {}
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err("AACP receive channel closed".to_string());
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // Lagging only means the announcement burst outran this
+                    // receiver; the channel keeps working. Treating it as
+                    // fatal used to abort the whole negotiation.
+                    debug!("rtbuddy frame tap lagged, skipped {} frames", n);
+                }
+            }
             // The receive loop records these already; nothing to do per frame.
         }
         let registry = { remotes.lock().await.clone() };

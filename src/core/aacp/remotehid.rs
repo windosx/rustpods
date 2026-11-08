@@ -265,7 +265,6 @@ pub fn parse_frame(frame: &[u8]) -> Option<(u8, SubHeader, &[u8])> {
 /// the current report.
 pub fn scan_report_ids(descriptor: &[u8]) -> (Vec<u8>, bool) {
     let mut ids = Vec::new();
-    let mut pending_id: Option<u8> = None;
     let mut has_feature = false;
     let mut i = 0;
     while i < descriptor.len() {
@@ -279,8 +278,12 @@ pub fn scan_report_ids(descriptor: &[u8]) -> (Vec<u8>, bool) {
             i += 3 + size;
             continue;
         }
+        // HID short item: the size field encodes 0/1/2/4 data bytes. Mapping
+        // 0 to 4 used to skip four phantom bytes per no-data item (0xC0 End
+        // Collection and friends), desynchronising the scan and losing every
+        // Report ID that followed one.
         let size = match prefix & 0x03 {
-            0 => 4,
+            0 => 0,
             1 => 1,
             2 => 2,
             _ => 4,
@@ -293,13 +296,11 @@ pub fn scan_report_ids(descriptor: &[u8]) -> (Vec<u8>, bool) {
                 if !ids.contains(&id) {
                     ids.push(id);
                 }
-                pending_id = Some(id);
             }
         } else if tag == 0xB0 {
             // Feature
             has_feature = true;
         }
-        let _ = pending_id.take();
         i += 1 + size;
     }
     (ids, has_feature)
@@ -536,6 +537,29 @@ mod tests {
             "this descriptor declares Input reports only - which is exactly why \
              the document's Feature-report SetReport is rejected on this unit"
         );
+    }
+
+    #[test]
+    fn scan_report_ids_does_not_skip_past_end_collection() {
+        // A size-0 item (0xC0 End Collection) advances one byte, not five: the
+        // old size table mapped the 0-size field to 4 data bytes, so anything
+        // after a collection close was scanned misaligned and its Report IDs
+        // were missed.
+        let descriptor = [
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x02, // Usage (Mouse)
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x05, // Report ID (5)
+            0x81, 0x02, // Input
+            0xC0, // End Collection - no data bytes
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x09, // Report ID (9)
+            0x81, 0x02, // Input
+            0xC0, // End Collection
+        ];
+        let (ids, has_feature) = scan_report_ids(&descriptor);
+        assert_eq!(ids, vec![5, 9], "the id after the collection close must be found");
+        assert!(!has_feature);
     }
 
     #[test]
