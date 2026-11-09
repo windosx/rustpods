@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 /// The control to drive. filter-graph splices sofa control ports into the node's
 /// Props under this name.
-const CONTROL: &str = "spat:Azimuth";
+const CONTROL: &str = "spatL:Azimuth";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let name = std::env::args()

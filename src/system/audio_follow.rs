@@ -321,13 +321,14 @@ mod pipewire_link {
     /// SPA_PROP_params: SPA_PROP_START_Other (0x80000) + 1.
     const SPA_PROP_PARAMS: u32 = 0x80001;
 
-    /// Control name for the sofa spatializer's azimuth.
+    /// Control name for the sofa spatializers' azimuth.
     ///
     /// filter-graph prefixes a control port with the node name from
-    /// `filter.graph.nodes[].name`, which the shipped config sets to `spat`.
-    /// Confirmed by reading the node's Props back: they contain
-    /// `spat:Azimuth`, `spat:Elevation` and `spat:Radius`.
-    const CONTROL_AZIMUTH: &str = "spat:Azimuth";
+    /// `filter.graph.nodes[].name`. The shipped config now runs two
+    /// spatializers - one per input channel, so the stereo image survives -
+    /// named `spatL` and `spatR`, and both get the same azimuth: the whole
+    /// stage rotates as one, which is what keeps a source pinned in the room.
+    const CONTROL_AZIMUTH: [&str; 2] = ["spatL:Azimuth", "spatR:Azimuth"];
 
     /// A message for the PipeWire thread.
     #[derive(Debug, Clone, Copy)]
@@ -365,7 +366,7 @@ mod pipewire_link {
             let thread = std::thread::Builder::new()
                 .name("rustpods-hrtf".to_string())
                 .spawn(move || {
-                    if let Err(e) = run_loop(receiver, running_thread, &node_name) {
+                    if let Err(e) = run_loop(receiver, running_thread, node_name) {
                         warn!("HRTF audio stage stopped: {}", e);
                     }
                 })?;
@@ -415,7 +416,7 @@ mod pipewire_link {
     fn run_loop(
         receiver: pw::channel::Receiver<HrtfCommand>,
         running: Arc<AtomicBool>,
-        expected_node: &str,
+        expected_node: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
         pw::init();
         let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -423,22 +424,129 @@ mod pipewire_link {
         let core = context.connect_rc(None)?;
         let registry = core.get_registry_rc()?;
 
+        // Routing: while head tracking is live, applications must play into the
+        // filter chain, or the chain sits idle and nothing is audible. WirePlumber
+        // stores the default sink in the `default` metadata object under
+        // `default.audio.sink` as a `{ "name": "..." }` JSON string, so writing
+        // there is what the mixer UI does.
+        //
+        // Ordering: the HRTF node and the metadata object arrive as independent
+        // registry events, in no fixed order, and a metadata property read is
+        // itself asynchronous - the value only arrives as an event. So neither
+        // side may act at bind time alone: whichever arrives last triggers the
+        // switch, and the first observed metadata value before that switch is
+        // remembered as the thing to restore on Quit.
+        let default_meta: Rc<RefCell<Option<pw::metadata::Metadata>>> =
+            Rc::new(RefCell::new(None));
+        let current_sink: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let saved_sink: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let node_slot: Rc<RefCell<Option<pw::node::Node>>> = Rc::new(RefCell::new(None));
+        let routed: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+
+        // Switches the default sink once, when every input is available.
+        let ensure_route = {
+            let meta = Rc::clone(&default_meta);
+            let current = Rc::clone(&current_sink);
+            let saved = Rc::clone(&saved_sink);
+            let node = Rc::clone(&node_slot);
+            let done = Rc::clone(&routed);
+            let name = expected_node.clone();
+            move || {
+                if done.get() {
+                    return;
+                }
+                let m = meta.borrow();
+                let Some(m) = m.as_ref() else { return };
+                if node.borrow().is_none() {
+                    return;
+                }
+                let cur = match current.borrow().as_ref() {
+                    Some(c) => c.clone(),
+                    // No value observed yet: the property event has not fired.
+                    None => return,
+                };
+                *saved.borrow_mut() = Some(cur);
+                let ours = format!("{{ \"name\": \"{}\" }}", name);
+                done.set(true); // before the write: the echo event must not re-enter
+                m.set_property(0, "default.audio.sink", Some("Spa:Json"), Some(&ours));
+                info!(
+                    "Default sink -> '{}'; will restore {:?} on stop",
+                    name,
+                    saved.borrow()
+                );
+            }
+        };
+
+        // Watch the metadata's default-sink value. The first event seen before
+        // we switch is the user's own choice; later events keep `current` fresh
+        // so Quit can tell "still ours" from "the user moved it".
+        let attach_meta_listener = {
+            let current = Rc::clone(&current_sink);
+            let saved = Rc::clone(&saved_sink);
+            let done = Rc::clone(&routed);
+            let name = expected_node.clone();
+            let ensure = ensure_route.clone();
+            move |m: &pw::metadata::Metadata| -> pw::metadata::MetadataListener {
+                let done = Rc::clone(&done);
+                let saved = Rc::clone(&saved);
+                let current = Rc::clone(&current);
+                let ensure = ensure.clone();
+                m.add_listener_local()
+                    .property(move |_s, key, _ty, value| {
+                        if key != Some("default.audio.sink") {
+                            return 0;
+                        }
+                        let value = value.map(|v| v.to_string());
+                        if !done.get() {
+                            // Pre-switch: remember the original exactly once.
+                            let mut saved = saved.borrow_mut();
+                            if saved.is_none() {
+                                *saved = value.clone();
+                            }
+                        }
+                        *current.borrow_mut() = value;
+                        ensure();
+                        0
+                    })
+                    .register()
+            }
+        };
+
         // Bind while inside the callback: `GlobalObject` borrows the event's
         // properties, so it cannot be stashed and bound later without a
         // lifetime error, and the API documents this as the place to do it.
-        let node_slot: Rc<RefCell<Option<pw::node::Node>>> = Rc::new(RefCell::new(None));
         let node_slot_cb = Rc::clone(&node_slot);
         let running_cb = Arc::clone(&running);
+        let meta_slot = Rc::clone(&default_meta);
         let registry_cb = registry.clone();
-        let expected = expected_node.to_string();
+        let expected_cb = expected_node.clone();
+        let ensure_on_node = ensure_route.clone();
         let _global_listener = registry
             .add_listener_local()
             .global(move |global| {
+                // Pick up the default metadata object when it appears; binding
+                // it into the slot is all the closure does. The listener is
+                // attached after `.register()` below, once the slot is filled.
+                if global.type_ == pw::types::ObjectType::Metadata {
+                    if let Some(props) = global.props {
+                        if props.get("metadata.name") == Some("default")
+                            && meta_slot.borrow().is_none()
+                        {
+                            match registry_cb.bind::<pw::metadata::Metadata, _>(global) {
+                                Ok(m) => {
+                                    *meta_slot.borrow_mut() = Some(m);
+                                }
+                                Err(e) => warn!("Could not bind default metadata: {}", e),
+                            }
+                        }
+                    }
+                    return;
+                }
                 if global.type_ != pw::types::ObjectType::Node {
                     return;
                 }
                 let Some(props) = global.props else { return };
-                if props.get("node.name") != Some(expected.as_str()) {
+                if props.get("node.name") != Some(expected_cb.as_str()) {
                     return;
                 }
                 let mut slot = node_slot_cb.borrow_mut();
@@ -447,19 +555,44 @@ mod pipewire_link {
                 }
                 match registry_cb.bind::<pw::node::Node, _>(global) {
                     Ok(node) => {
-                        info!("Bound HRTF node '{}'", expected);
+                        info!("Bound HRTF node '{}'", expected_cb);
                         *slot = Some(node);
                         running_cb.store(true, Ordering::Relaxed);
+                        ensure_on_node();
                     }
-                    Err(e) => warn!("Could not bind HRTF node '{}': {}", expected, e),
+                    Err(e) => warn!("Could not bind HRTF node '{}': {}", expected_cb, e),
                 }
             })
             .register();
 
+        // The metadata listener is attached lazily from the command handler
+        // below: registry globals arrive asynchronously, so a one-shot pump
+        // after `.register()` races the node bind. Azimuth commands arrive
+        // continuously while tracking is live, which makes them a heartbeat -
+        // each one first completes pending setup work, then writes.
+
+        let meta_listener: Rc<RefCell<Option<pw::metadata::MetadataListener>>> =
+            Rc::new(RefCell::new(None));
+        let attach_fn: Rc<dyn Fn(&pw::metadata::Metadata) -> pw::metadata::MetadataListener> =
+            Rc::new(attach_meta_listener);
+        let meta_listener_cb = Rc::clone(&meta_listener);
+        let attach_fn_cb = Rc::clone(&attach_fn);
+        let expected_quit = expected_node.clone();
         let ml_cb = mainloop.clone();
         let running_quit = Arc::clone(&running);
+        let meta_quit = Rc::clone(&default_meta);
+        let current_quit = Rc::clone(&current_sink);
+        let saved_quit = Rc::clone(&saved_sink);
         let _recv = receiver.attach(&mainloop.loop_(), move |command| match command {
             HrtfCommand::Azimuth(deg) => {
+                // Heartbeat: complete pending setup (metadata listener + route)
+                // before the write. See the note above the command handler.
+                if let Some(m) = default_meta.borrow().as_ref() {
+                    if meta_listener_cb.borrow().is_none() {
+                        *meta_listener_cb.borrow_mut() = Some(attach_fn_cb(m));
+                    }
+                    ensure_route();
+                }
                 // The node may not be bound yet; dropping the value here is fine
                 // because the schedule will send another as the head moves.
                 let slot = match node_slot.try_borrow() {
@@ -467,7 +600,7 @@ mod pipewire_link {
                     Err(_) => return,
                 };
                 let Some(node) = slot.as_ref() else { return };
-                match props_pod(CONTROL_AZIMUTH, deg) {
+                match props_pod(&CONTROL_AZIMUTH, deg) {
                     Ok(bytes) => {
                         if let Some(pod) = Pod::from_bytes(&bytes) {
                             node.set_param(ParamType::Props, 0, pod);
@@ -478,17 +611,45 @@ mod pipewire_link {
                 }
             }
             HrtfCommand::Quit => {
+                // Hand the default sink back before leaving - but only when it
+                // is still ours. If the user switched sinks by hand while
+                // tracking was live, their latest choice wins.
+                if let Some(m) = meta_quit.borrow().as_ref() {
+                    let ours = format!("{{ \"name\": \"{}\" }}", expected_quit);
+                    if current_quit.borrow().as_deref() == Some(ours.as_str()) {
+                        match saved_quit.borrow().as_deref() {
+                            Some(json) if !json.is_empty() => {
+                                m.set_property(
+                                    0,
+                                    "default.audio.sink",
+                                    Some("Spa:Json"),
+                                    Some(json),
+                                );
+                                info!("Restored default sink to {}", json);
+                            }
+                            _ => {
+                                m.set_property(0, "default.audio.sink", Some("Spa:Json"), None);
+                                info!("Cleared default sink override");
+                            }
+                        }
+                    } else {
+                        info!("Default sink changed elsewhere; leaving it alone");
+                    }
+                }
                 running_quit.store(false, Ordering::Relaxed);
                 ml_cb.quit();
             }
         });
 
         mainloop.run();
+        drop(meta_listener);
+        drop(attach_fn);
         Ok(())
     }
 
-    /// Serialises `SPA_TYPE_OBJECT_Props { SPA_PROP_params: Struct(name, value) }`.
-    fn props_pod(control: &str, value: f32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    /// Serialises `SPA_TYPE_OBJECT_Props { SPA_PROP_params: Struct(name, value) }`
+    /// for every control in `names`, all set to `value`.
+    fn props_pod(names: &[&str; 2], value: f32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         use pw::spa::pod::Object;
 
         let object = Object {
@@ -496,10 +657,17 @@ mod pipewire_link {
             id: ParamType::Props.as_raw(),
             properties: vec![Property::new(
                 SPA_PROP_PARAMS,
-                Value::Struct(vec![
-                    Value::String(control.to_string()),
-                    Value::Float(value),
-                ]),
+                Value::Struct(
+                    names
+                        .iter()
+                        .flat_map(|name| {
+                            [
+                                Value::String((*name).to_string()),
+                                Value::Float(value),
+                            ]
+                        })
+                        .collect(),
+                ),
             )],
         };
         let mut buffer = Vec::new();

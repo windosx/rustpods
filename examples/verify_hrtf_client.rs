@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Reads `spat:Azimuth` back from the node's Props.
+/// Reads `spatL:Azimuth` (left spatialiser) back from the node's Props.
 fn read_azimuth(node_name: &str) -> Result<Option<f32>, Box<dyn std::error::Error>> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -144,7 +144,7 @@ fn read_azimuth(node_name: &str) -> Result<Option<f32>, Box<dyn std::error::Erro
     Ok(*found.borrow())
 }
 
-/// Pulls `spat:Azimuth` out of a Props pod.
+/// Pulls `spatL:Azimuth` out of a Props pod.
 fn azimuth_in(pod: &Pod) -> Option<f32> {
     let (_, value) = pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(
         pod.as_bytes(),
@@ -156,7 +156,7 @@ fn azimuth_in(pod: &Pod) -> Option<f32> {
         let mut i = 0;
         while i + 1 < items.len() {
             if let (Value::String(k), Value::Float(v)) = (&items[i], &items[i + 1]) {
-                if k == "spat:Azimuth" {
+                if k == "spatL:Azimuth" {
                     return Some(*v);
                 }
             }
