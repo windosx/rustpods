@@ -52,6 +52,8 @@ const HOOK_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const TRACKING_FRESH_AFTER: Duration = Duration::from_secs(3);
 /// A question payload larger than this is treated as garbage.
 const MAX_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
+/// How often the pending-question heartbeat logs what the counter sees.
+const TELEMETRY_EVERY: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -152,25 +154,40 @@ fn decision_for_commit(count: usize, options: &[String]) -> AskReply {
 
 /// Renders the hook's stdout JSON for a reply.
 ///
-/// A selection is a `deny` whose reason states the answer; the agent reading
-/// the denial treats it as the user's choice. A pass-through is `ask`, which
-/// restores the normal ZCode question UI.
-fn hook_output_for(reply: &AskReply) -> String {
+/// The selection is an `allow` whose `updatedInput` injects the choice as the
+/// tool's `answers` field: ZCode's AskUserQuestion refuses to execute until
+/// its input carries answers, and a plain deny leaves them missing - the UI
+/// then reports the tool call as failed (live, 2026-11-09). Allowing with the
+/// answer written into the input is exactly what the native widget does on an
+/// accept, so the question renders as answered and the reason tells the agent
+/// which choice was made. A pass-through is `ask`, which restores the normal
+/// ZCode question UI.
+fn hook_output_for(reply: &AskReply, question: &str) -> String {
     match reply {
-        AskReply::Select { index, label } => json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": format!(
-                    "【头部手势应答】用户点头 {} 次,选择第 {} 项「{}」。(RustPods 通过点头手势代答;\
-                     请直接采用该选项并继续,不要重复提问。)",
-                    index + 1,
-                    index + 1,
-                    label
-                ),
-            }
-        })
-        .to_string(),
+        AskReply::Select { index, label } => {
+            // answers is keyed by the question text (M0e: answers =
+            // record<string>, validated non-blank; the native accept path
+            // writes {question: label}).
+            let answers = json!({ question: label });
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": format!(
+                        "【头部手势应答】用户点头 {} 次,选择第 {} 项「{}」。(RustPods 通过点头手势代答;\
+                         答案已写入工具输入的 answers 字段,直接继续即可;\
+                         并在下一条回复的第一句向用户复述这个选择,例如「已按你的点头选择:第 {} 项「{}」。」)",
+                        index + 1,
+                        index + 1,
+                        label,
+                        index + 1,
+                        label
+                    ),
+                    "updatedInput": { "answers": answers },
+                }
+            })
+            .to_string()
+        }
         AskReply::Pass => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -479,10 +496,11 @@ async fn ask_core(request: HookRequest) -> AskReply {
         return AskReply::Pass;
     }
     info!(
-        "Question pending: {:?} with {} options (id {})",
+        "Question pending: {:?} with {} options (id {}, sensitivity {})",
         q.question,
         q.options.len(),
-        id
+        id,
+        crate::core::nod_counter::sensitivity()
     );
     notify_question(&q.question, &q.header, &q.options);
 
@@ -494,8 +512,14 @@ async fn ask_core(request: HookRequest) -> AskReply {
         }
         // Timeout, or the pose task vanished without answering. `abandon`
         // clears the registration itself so the next question can register.
+        // Whether the pose stream was still alive at the end distinguishes
+        // "the wearer never gestured" from "gestures could not be seen".
         _ => {
-            warn!("Question {} timed out; passing through", id);
+            warn!(
+                "Question {} timed out; passing through (tracking_fresh={})",
+                id,
+                ASK_HUB.tracking_fresh()
+            );
             ASK_HUB.abandon(id);
             AskReply::Pass
         }
@@ -572,6 +596,8 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
     let mut cur_sensitivity = crate::core::nod_counter::sensitivity();
     let mut counter = NodCounter::with_sensitivity(cur_sensitivity);
     let mut last_sample: Option<Instant> = None;
+    let mut was_answering = false;
+    let mut last_telemetry: Option<Instant> = None;
 
     loop {
         if pose_rx.changed().await.is_err() {
@@ -597,14 +623,48 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
             // registering for gestures nothing can answer.
             ASK_HUB.retire_pose();
             counter.reset();
+            was_answering = false;
             continue;
         };
         ASK_HUB.note_pose();
 
         let Some(progress) = ASK_HUB.progress_snapshot() else {
-            counter.reset();
+            // Nothing pending: keep the resting pose warm instead of
+            // resetting. A question that registers while the wearer is
+            // moving - or seconds after they stopped - then meets a
+            // baseline already sitting on their rest pose, rather than one
+            // seeded from the single sample that happened to be current at
+            // registration.
+            if was_answering {
+                counter.reset_count();
+                was_answering = false;
+            }
+            counter.observe_idle(pose.pitch, pose.yaw, dt);
             continue;
         };
+        was_answering = true;
+
+        // A pending question that never counts is undiagnosable from the
+        // outside - live it has happened twice (2026-11-09, ids 7 and the
+        // post-fix retest). The heartbeat shows the motion the counter
+        // actually saw against the thresholds it actually uses: a nod must
+        // dip below `baseline - depth` (6° at sensitivity 3) and return
+        // above `baseline - depth/3`.
+        if last_telemetry.map_or(true, |t| t.elapsed() >= TELEMETRY_EVERY) {
+            last_telemetry = Some(now);
+            let (min_dev, max_yaw) = counter.take_telemetry();
+            let (baseline, pitch_swing, count, down) = counter.snapshot();
+            info!(
+                "Q{} telemetry: min(pitch-baseline) {:+.1}°, yaw swing {:.1}°, baseline {:+.1}°, pitch swing {:.1}°, count {}, down {}",
+                progress.id,
+                min_dev,
+                max_yaw,
+                baseline.unwrap_or(f32::NAN),
+                pitch_swing,
+                count,
+                down
+            );
+        }
 
         let Some(event) = counter.update(pose.pitch, pose.yaw, dt) else {
             continue;
@@ -613,7 +673,7 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
         let reply = match event {
             NodEvent::Counted(n) => {
                 ASK_HUB.set_count(progress.id, n);
-                debug!("Nod count {} for question {}", n, progress.id);
+                info!("Nod count {} for question {}", n, progress.id);
                 continue;
             }
             NodEvent::Cancelled => AskReply::Pass,
@@ -621,7 +681,10 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
         };
 
         resolve_question(progress.id, reply);
-        counter.reset();
+        // Drop the gesture state but keep the tracked resting pose: the
+        // wearer is mid-motion right now, and a full reset would re-seed
+        // the baseline from exactly that.
+        counter.reset_count();
     }
 }
 
@@ -634,7 +697,13 @@ fn resolve_question(id: u64, reply: AskReply) {
     };
     if let Some(pending) = ASK_HUB.take_pending(id) {
         if pending.reply.send(reply).is_ok() {
-            ASK_HUB.mark_resolved(note);
+            ASK_HUB.mark_resolved(note.clone());
+            // The deny reason travels to the agent, not to the wearer, and
+            // ZCode renders nothing for a denied AskUserQuestion - without
+            // this, a nodded answer is invisible everywhere. The question
+            // notification is too long to re-read, so the outcome gets its
+            // own short pop-up.
+            notify_resolved(&note);
         } else {
             // The server timed out first and already answered pass-through:
             // the choice is moot, so the card must not claim it was applied.
@@ -644,6 +713,21 @@ fn resolve_question(id: u64, reply: AskReply) {
         // The server timed out first; drop the card so it does not linger.
         ASK_HUB.clear_progress(id);
     }
+}
+
+/// Shows a short desktop notification with the answer the gesture committed.
+fn notify_resolved(note: &str) {
+    let note = note.to_string();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = notify_rust::Notification::new()
+            .summary("RustPods · 手势应答")
+            .body(&note)
+            .timeout(notify_rust::Timeout::Milliseconds(8000))
+            .show()
+        {
+            debug!("Could not show resolution notification: {}", e);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -718,7 +802,10 @@ pub async fn run_hook_mode() -> i32 {
         }
     };
 
-    println!("{}", hook_output_for(&reply));
+    println!(
+        "{}",
+        hook_output_for(&reply, &request.questions[0].question)
+    );
     0
 }
 
@@ -1107,13 +1194,21 @@ mod tests {
     }
 
     #[test]
-    fn hook_output_carries_the_choice_in_a_deny_reason() {
-        let out = hook_output_for(&AskReply::Select { index: 2, label: "第三个".into() });
-        assert!(out.contains("\"permissionDecision\":\"deny\""), "{out}");
+    fn hook_output_carries_the_choice_in_updated_answers() {
+        let out = hook_output_for(
+            &AskReply::Select { index: 2, label: "第三个".into() },
+            "选哪个?",
+        );
+        assert!(out.contains("\"permissionDecision\":\"allow\""), "{out}");
         assert!(out.contains("点头 3 次"), "{out}");
         assert!(out.contains("第三个"), "{out}");
+        // The answer is injected as the tool's answers field, keyed by the
+        // question text - the shape the native accept path writes.
+        assert!(out.contains("updatedInput"), "{out}");
+        assert!(out.contains("\"answers\""), "{out}");
+        assert!(out.contains("\"选哪个?\":\"第三个\""), "{out}");
 
-        let out = hook_output_for(&AskReply::Pass);
+        let out = hook_output_for(&AskReply::Pass, "q");
         assert!(out.contains("\"permissionDecision\":\"ask\""), "{out}");
     }
 

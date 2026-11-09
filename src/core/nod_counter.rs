@@ -63,22 +63,51 @@ pub fn badge_amplitude_scale() -> f32 {
 /// Minimum spacing between counted nods, in seconds; filters single-sample bounce.
 const MIN_NOD_INTERVAL: f32 = 0.15;
 /// Silence after the last nod that commits the count, in seconds.
-const QUIET_COMMIT_SECS: f32 = 1.4;
+///
+/// This must outlast the natural pause between two deliberate nods: a wearer
+/// counting out "option two" regularly holds still between nods while they
+/// check the count on the card. Committed live at 1.4 s, that pause
+/// truncated every such answer to "option one" (seen on hardware,
+/// 2026-11-09: two questions answered with a single nod each). The cost is
+/// answer latency: the commit lands this long after the final nod.
+const QUIET_COMMIT_SECS: f32 = 2.5;
 /// Resting pitch is tracked with an EMA; this is its convergence rate in 1/s.
 const BASELINE_RATE: f32 = 1.5;
-/// The baseline only adapts while the head is essentially still - pitch swing
-/// below this. A deadband on the deviation cannot do this job: an EMA chasing
-/// a ramp lags by slope/rate (a fast nod at ~27°/s already lags ~4° within a
-/// tenth of a second), which silently deepens the very thresholds the
-/// sensitivity level is supposed to set. Nod motion must never drag the
-/// reference along.
-const BASELINE_STILL_SWING: f32 = 1.5;
 /// The shake must dominate the nod motion by this ratio to cancel it.
 const YAW_CANCEL_RATIO: f32 = 1.5;
 /// Swing decay time constant in seconds: how long motion stays "recent".
 const SWING_TAU: f32 = 0.8;
 /// Largest integration step accepted, in seconds; bigger gaps reset hysteresis.
 const MAX_DT: f32 = 0.25;
+/// Peak-to-peak pitch motion within [`Self::BASELINE_WINDOW`] above which the
+/// baseline is forbidden to move. This replaces the old swing-decay gate:
+/// `pitch_swing` is a decaying memory, and live it read 0.2-0.5° *during*
+/// the nod (the nod is short; the decay outruns it), so the gate never
+/// closed and the baseline followed the dip down - dragging the return
+/// band below the return stroke, which then never counted (live telemetry
+/// 02:38:17: baseline +2.0 → -5.0 within one nod, nod not counted).
+const BASELINE_WINDOW_SWING: f32 = 2.0;
+/// Length of that recent-motion window, in seconds.
+const BASELINE_WINDOW: f32 = 0.5;
+/// A return stroke counts once the head has climbed this far back from the
+/// dip's lowest point, as a fraction of the dip depth below baseline.
+/// Anchoring the return on the *dip itself* instead of the baseline matches
+/// how people actually nod: the head rarely returns above the rest pose.
+const RETURN_FROM_DIP: f32 = 0.5;
+/// Rate of the always-on reference EMA, in 1/s. Unlike the gated baseline it
+/// never freezes, so over a nod oscillation it settles on the cycle midline
+/// (a 1 s-period wave is attenuated ~7x) - that midline is where a
+/// mis-anchored baseline must be pulled back to.
+const REF_BASELINE_RATE: f32 = 1.0;
+/// When the head stays below the dip threshold this long while nothing is
+/// counted yet, the baseline is anchored above the wearer's actual answering
+/// posture (live: they nod while looking down at the RustPods card, ~19°
+/// below the screen-watching baseline, and no up-stroke ever reaches the old
+/// return band). Re-anchor to the reference EMA.
+const REANCHOR_AFTER_SECS: f32 = 1.5;
+/// A wearer who finishes a sequence parked below the dip threshold still
+/// gets their commit - this many extra seconds on top of the quiet window.
+const PARKED_COMMIT_GRACE: f32 = 1.0;
 
 /// What one fed sample produced.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -105,25 +134,53 @@ pub struct NodCounter {
     sensitivity: u8,
     /// How far below the resting pitch a nod must dip, in degrees.
     depth: f32,
-    /// How close to the resting pitch the head must come back for the dip to
-    /// count; a third of the depth.
-    return_band: f32,
     /// Yaw swing, in degrees, above which a pending count is a head shake.
     yaw_cancel: f32,
     /// Resting pitch in degrees; re-seeded from the first sample after a reset.
     baseline: Option<f32>,
+    /// Always-on reference EMA. It tracks the pitch unconditionally - through
+    /// nods, holds and posture changes - and serves as the re-anchoring
+    /// target when the gated baseline is provably in the wrong place.
+    ref_ema: Option<f32>,
     /// Resting yaw, the reference the yaw swing is measured against.
     yaw_ref: Option<f32>,
     /// Recent pitch motion magnitude, decays exponentially.
     pitch_swing: f32,
     /// Recent yaw motion magnitude, decays exponentially.
     yaw_swing: f32,
+    /// Ring of recent `(time, pitch)` samples for the baseline gate's
+    /// peak-to-peak test; older than [`BASELINE_WINDOW`] falls off.
+    window: Vec<(f32, f32)>,
+    /// Running clock, seconds since construction.
+    clock: f32,
+    /// Lowest pitch reached since the current dip armed; the count
+    /// threshold is measured from here, not from the baseline.
+    dip_low: f32,
+    /// Highest pitch since the last count (or since construction); the arm
+    /// threshold is measured from here. See the hysteresis comment in
+    /// [`Self::update`].
+    peak: Option<f32>,
     /// Hysteresis state: is the head currently below the dip threshold?
     down: bool,
+    /// Seconds the head has been continuously below the dip threshold; the
+    /// re-anchor trigger.
+    down_secs: f32,
     /// Nods counted so far in the current sequence.
     count: usize,
     /// Seconds since the last counted nod.
     since_count: f32,
+    /// Deepest pitch excursion below the baseline since the last
+    /// [`Self::take_telemetry`]. A 1 Hz heartbeat would otherwise miss a
+    /// 300 ms nod entirely, and "nods never count" is undiagnosable without
+    /// knowing the depth the counter actually saw.
+    tel_min_dev: f32,
+    /// Highest pitch excursion above the baseline since the last
+    /// [`Self::take_telemetry`] - the up-stroke level, which is what decides
+    /// whether a nod in a lowered posture can ever be counted.
+    tel_max_dev: f32,
+    /// Largest yaw excursion from the yaw reference since the last
+    /// [`Self::take_telemetry`], for the same reason.
+    tel_max_yaw_dev: f32,
 }
 
 impl Default for NodCounter {
@@ -145,18 +202,26 @@ impl NodCounter {
         Self {
             sensitivity,
             depth,
-            return_band: depth / 3.0,
             yaw_cancel: yaw_cancel_for(sensitivity),
             baseline: None,
+            ref_ema: None,
             yaw_ref: None,
             pitch_swing: 0.0,
             yaw_swing: 0.0,
+            window: Vec::new(),
+            clock: 0.0,
+            dip_low: 0.0,
+            peak: None,
             down: false,
+            down_secs: 0.0,
             count: 0,
             // A fresh counter has no recent count to debounce against, so the
             // first nod may arm immediately - otherwise a wearer answering
             // right away loses the nod that crosses within the first 150 ms.
             since_count: MIN_NOD_INTERVAL,
+            tel_min_dev: 0.0,
+            tel_max_dev: 0.0,
+            tel_max_yaw_dev: 0.0,
         }
     }
 
@@ -165,9 +230,63 @@ impl NodCounter {
         *self = Self::with_sensitivity(self.sensitivity);
     }
 
+    /// Clears the gesture state but keeps the tracked resting pose.
+    ///
+    /// Used when a question ends: the next question then starts from the
+    /// baseline the wearer settled into, not from whatever pose they happen
+    /// to hold at the instant it registers. A full re-seed caught mid-nod
+    /// anchors the thresholds to the bottom of the nod - seen live, every
+    /// following nod was then unreachable for minutes.
+    pub fn reset_count(&mut self) {
+        self.down = false;
+        self.peak = None;
+        self.count = 0;
+        self.since_count = MIN_NOD_INTERVAL;
+    }
+
+    /// Feeds one sample while nothing is pending, keeping only the resting
+    /// pose warm: the swing memory decays and the baselines follow the
+    /// wearer, but nothing is armed, counted or cancelled.
+    ///
+    /// The baseline moves unconditionally here (unlike [`Self::update`]'s
+    /// stillness gate): a wearer who shifts to a new resting pose while no
+    /// question is up must not keep a stale reference, and the drag a nod
+    /// itself causes cancels out over its down-and-up stroke. By the time a
+    /// question registers, the baseline already sits on their rest.
+    pub fn observe_idle(&mut self, pitch_deg: f32, yaw_deg: f32, dt: f32) {
+        let dt = dt.clamp(0.0, MAX_DT);
+        let decay = (-dt / SWING_TAU).exp();
+        self.pitch_swing *= decay;
+        self.yaw_swing *= decay;
+        let baseline = *self.baseline.get_or_insert(pitch_deg);
+        let yaw_ref = *self.yaw_ref.get_or_insert(yaw_deg);
+        let ref_ema = *self.ref_ema.get_or_insert(pitch_deg);
+        self.yaw_ref = Some(yaw_ref + (yaw_deg - yaw_ref) * (BASELINE_RATE * dt).min(1.0));
+        self.baseline =
+            Some(baseline + (pitch_deg - baseline) * (BASELINE_RATE * dt).min(1.0));
+        self.ref_ema =
+            Some(ref_ema + (pitch_deg - ref_ema) * (REF_BASELINE_RATE * dt).min(1.0));
+    }
+
     /// Nods counted so far in the current sequence.
     pub fn count(&self) -> usize {
         self.count
+    }
+
+    /// Motion extremes since the last call: `(deepest pitch excursion below
+    /// the baseline, largest yaw excursion from the yaw reference)`, reset on
+    /// read. Feeds the pending-question heartbeat.
+    pub fn take_telemetry(&mut self) -> (f32, f32) {
+        let out = (self.tel_min_dev, self.tel_max_yaw_dev);
+        self.tel_min_dev = 0.0;
+        self.tel_max_yaw_dev = 0.0;
+        out
+    }
+
+    /// `(baseline, pitch swing, count, armed)` at this instant, for the
+    /// pending-question heartbeat.
+    pub fn snapshot(&self) -> (Option<f32>, f32, usize, bool) {
+        (self.baseline, self.pitch_swing, self.count, self.down)
     }
 
     /// Feeds one sample (`dt` in seconds) and returns what it produced.
@@ -183,8 +302,13 @@ impl NodCounter {
         let dt = dt.clamp(0.0, MAX_DT);
         if dt >= MAX_DT {
             self.down = false;
+            // Re-seed the peak from the post-gap pitch: the old peak is from
+            // a stale context, and a nod straddling the gap must re-arm on
+            // fresh motion.
+            self.peak = None;
         }
         self.since_count += dt;
+        self.clock += dt;
 
         let decay = (-dt / SWING_TAU).exp();
         self.pitch_swing *= decay;
@@ -194,6 +318,16 @@ impl NodCounter {
         // the wearer holds when the question arrives is the resting pose.
         let baseline = *self.baseline.get_or_insert(pitch_deg);
         let yaw_ref = *self.yaw_ref.get_or_insert(yaw_deg);
+        // The reference EMA never freezes and never gates: over a nod
+        // oscillation it settles on the cycle midline, which is exactly where
+        // a mis-anchored baseline must be pulled back to. Slow enough that a
+        // single nod moves it little (BASELINE_RATE=1.5/s over a 0.3 s nod
+        // shifts it ~30% of the excursion's midpoint deficit).
+        let ref_ema = *self.ref_ema.get_or_insert(pitch_deg);
+        self.ref_ema = Some(ref_ema + (pitch_deg - ref_ema) * (REF_BASELINE_RATE * dt).min(1.0));
+
+        self.tel_min_dev = self.tel_min_dev.min(pitch_deg - baseline);
+        self.tel_max_yaw_dev = self.tel_max_yaw_dev.max((yaw_deg - yaw_ref).abs());
 
         self.pitch_swing = self.pitch_swing.max((pitch_deg - baseline).abs());
         self.yaw_swing = self.yaw_swing.max((yaw_deg - yaw_ref).abs());
@@ -210,27 +344,76 @@ impl NodCounter {
         }
 
         // The resting pitch only adapts while nothing is pending *and* the
-        // head is near-still. Once a nod has been counted, freezing the
-        // baseline keeps the next nod equally easy to reach even if the
-        // wearer rests slightly dipped.
-        if self.count == 0 && self.pitch_swing < BASELINE_STILL_SWING {
+        // head has been genuinely quiet: peak-to-peak over the last
+        // BASELINE_WINDOW seconds must be under the gate. A decaying-swing
+        // gate read 0.2° *during* a live nod (the decay outruns the nod),
+        // let the baseline chase the dip, and the return stroke never
+        // reached the band it had dragged down with it.
+        self.window.push((self.clock, pitch_deg));
+        self.window.retain(|(t, _)| self.clock - t <= BASELINE_WINDOW);
+        let (w_min, w_max) = self
+            .window
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), (_, p)| (lo.min(*p), hi.max(*p)));
+        if self.count == 0 && w_max - w_min < BASELINE_WINDOW_SWING {
             self.baseline =
                 Some(baseline + (pitch_deg - baseline) * (BASELINE_RATE * dt).min(1.0));
         }
 
-        // Hysteresis: arm on the way down, count on the way back up.
+        // Symmetric peak/dip hysteresis. A nod is a *relative* motion: the
+        // arm threshold is DEPTH below the recent peak, the count threshold
+        // is half a DEPTH above the recent dip - both anchored on the
+        // oscillation itself, never on the rest pose. Earlier revisions
+        // anchored the return on the baseline (live: the head never returns
+        // above rest, so no nod counted) or the climb-out on the rest or
+        // last-count pitch (live: a wearer answering in a lowered posture
+        // never gets back there either, so the second nod never armed; and
+        // with a window anchor the same climb re-armed and counted twice).
+        // Peak/dip needs no posture anchor at all.
+        self.peak = self.peak.map_or(Some(pitch_deg), |p| Some(p.max(pitch_deg)));
         if !self.down {
-            if self.since_count >= MIN_NOD_INTERVAL && pitch_deg < baseline - self.depth {
+            if pitch_deg < self.peak.unwrap_or(pitch_deg) - self.depth
+                && self.since_count >= MIN_NOD_INTERVAL
+            {
                 self.down = true;
+                self.down_secs = 0.0;
+                self.dip_low = pitch_deg;
             }
-        } else if pitch_deg > baseline - self.return_band {
-            self.count += 1;
-            self.since_count = 0.0;
-            // Back to neutral: the next nod must dip below the threshold
-            // again, otherwise the whole return stroke counts sample by
-            // sample.
-            self.down = false;
-            return Some(NodEvent::Counted(self.count));
+        } else {
+            self.down_secs += dt;
+            self.dip_low = self.dip_low.min(pitch_deg);
+            // The peak rides along while armed: without this, a slow
+            // continuous nodding motion inflates the gap between peak and
+            // current pitch until every next cycle re-arms immediately.
+            if let Some(p) = self.peak.as_mut() {
+                *p = (*p).max(pitch_deg);
+            }
+            // Head parked below the dip threshold with nothing counted: the
+            // baseline is anchored above the wearer's actual answering
+            // posture (they nod while reading the question card, ~19° below
+            // the screen-watching baseline - live telemetry, 2026-11-09).
+            // Re-anchor onto the always-on reference EMA, which has settled
+            // on the midline of their actual answering oscillation.
+            if self.count == 0 && self.down_secs > REANCHOR_AFTER_SECS {
+                if let Some(reference) = self.ref_ema {
+                    self.baseline = Some(reference);
+                    self.down_secs = 0.0;
+                    self.down = false;
+                    self.peak = Some(pitch_deg);
+                    self.dip_low = pitch_deg;
+                    return None;
+                }
+            }
+            // Return stroke: climbed halfway out of the dip.
+            if pitch_deg > self.dip_low + self.depth * RETURN_FROM_DIP {
+                self.count += 1;
+                self.since_count = 0.0;
+                // Reset the reference: the next dip must fall DEPTH below
+                // the peak this stroke reached - the stroke's own top.
+                self.peak = Some(pitch_deg);
+                self.down = false;
+                return Some(NodEvent::Counted(self.count));
+            }
         }
 
         // The wearer has stopped nodding: commit whatever was counted. The
@@ -276,9 +459,17 @@ mod tests {
 
     /// One nod: down over 0.15 s, hold briefly, back up over 0.15 s.
     fn nod(counter: &mut NodCounter, depth: f32) -> Vec<NodEvent> {
-        let mut events = ramp(counter, 0.0, depth, 0.15, 0.0);
+        nod_from(counter, 0.0, depth)
+    }
+
+    /// One nod from an arbitrary resting pitch `rest` down to `depth`.
+    /// A nod is relative to wherever the head currently is; a helper that
+    /// always started at 0.0 injected a phantom 19° up-jump when the head
+    /// was held lower, and the counter dutifully counted it.
+    fn nod_from(counter: &mut NodCounter, rest: f32, depth: f32) -> Vec<NodEvent> {
+        let mut events = ramp(counter, rest, depth, 0.15, 0.0);
         events.extend(hold(counter, depth, 0.05, 0.0));
-        events.extend(ramp(counter, depth, 0.0, 0.15, 0.0));
+        events.extend(ramp(counter, depth, rest, 0.15, 0.0));
         events
     }
 
@@ -290,7 +481,7 @@ mod tests {
             events.extend(nod(&mut counter, -10.0));
             events.extend(hold(&mut counter, 0.0, 0.3, 0.0));
         }
-        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
 
         let counts: Vec<_> = events
             .iter()
@@ -312,12 +503,175 @@ mod tests {
     fn single_nod_commits_one() {
         let mut counter = NodCounter::new();
         let mut events = nod(&mut counter, -10.0);
-        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
         assert_eq!(
             events.last(),
             Some(&NodEvent::Commit(1)),
             "a lone nod must still commit"
         );
+    }
+
+    #[test]
+    fn two_nods_with_a_counting_pause_commit_two() {
+        let mut counter = NodCounter::new();
+        let mut events = nod(&mut counter, -10.0);
+        assert!(events.contains(&NodEvent::Counted(1)), "{events:?}");
+        // The wearer checks the count on the card before deciding to nod
+        // again: this pause sits between the old 1.4 s window and the new
+        // one, and live it truncated every such answer to "option one".
+        events.extend(hold(&mut counter, 0.0, 2.0, 0.0));
+        assert!(
+            !events.iter().any(|e| matches!(e, NodEvent::Commit(_))),
+            "a 2 s pause between nods must not commit early: {events:?}"
+        );
+        events.extend(nod(&mut counter, -10.0));
+        events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
+        assert!(
+            events.contains(&NodEvent::Commit(2)),
+            "the second nod must land in the same sequence: {events:?}"
+        );
+    }
+
+    #[test]
+    fn idle_observations_never_count() {
+        let mut counter = NodCounter::new();
+        // Vigorous nodding while nothing is pending must arm nothing.
+        for i in 0..100 {
+            let pitch = if i % 20 < 10 { -10.0 } else { 0.0 };
+            counter.observe_idle(pitch, 0.0, DT);
+        }
+        assert_eq!(counter.count(), 0);
+        assert!(!counter.down);
+    }
+
+    #[test]
+    fn idle_observations_keep_the_baseline_warm() {
+        let mut counter = NodCounter::new();
+        // Nothing pending: the wearer shifts to resting 12 degrees down.
+        // The idle baseline follows unconditionally.
+        for _ in 0..400 {
+            counter.observe_idle(-12.0, 0.0, DT);
+        }
+        assert_eq!(counter.count(), 0);
+        // A question registers; the wearer nods relative to their rest pose.
+        let mut events = ramp(&mut counter, -12.0, -22.0, 0.15, 0.0);
+        events.extend(hold(&mut counter, -22.0, 0.05, 0.0));
+        events.extend(ramp(&mut counter, -22.0, -12.0, 0.15, 0.0));
+        events.extend(hold(&mut counter, -12.0, 2.8, 0.0));
+        assert!(
+            events.contains(&NodEvent::Commit(1)),
+            "a nod relative to the idle-warmed baseline must count: {events:?}"
+        );
+    }
+
+    #[test]
+    fn reset_count_keeps_the_warm_baseline() {
+        let mut counter = NodCounter::new();
+        for _ in 0..400 {
+            counter.observe_idle(-12.0, 0.0, DT);
+        }
+        // A question came and went: the count clears, the resting pose
+        // survives, and the next question starts from the same reference.
+        counter.update(-22.0, 0.0, DT);
+        counter.reset_count();
+        assert_eq!(counter.count(), 0);
+        assert!(!counter.down);
+        let mut events = ramp(&mut counter, -12.0, -22.0, 0.15, 0.0);
+        events.extend(hold(&mut counter, -22.0, 0.05, 0.0));
+        events.extend(ramp(&mut counter, -22.0, -12.0, 0.15, 0.0));
+        events.extend(hold(&mut counter, -12.0, 2.8, 0.0));
+        assert!(
+            events.contains(&NodEvent::Commit(1)),
+            "the next question must reuse the warm baseline: {events:?}"
+        );
+    }
+
+    #[test]
+    fn nods_in_a_lowered_answering_posture_still_count() {
+        // Live telemetry (2026-11-09, Q1): the wearer reads the question
+        // card ~19° below the screen-watching baseline and nods there. The
+        // old gated baseline never adapted (the nod keeps the swing gate
+        // closed), so no up-stroke ever reached the return band and not one
+        // nod counted for the whole 172 s window.
+        let mut counter = NodCounter::new();
+        // Question arrives while looking at the screen: baseline 0.
+        hold(&mut counter, 0.0, 0.5, 0.0);
+        // The wearer lowers their head to read the card, then nods there.
+        hold(&mut counter, -19.0, 2.0, 0.0);
+        let mut events = nod_from(&mut counter, -19.0, -26.0);
+        events.extend(hold(&mut counter, -19.0, 0.3, 0.0));
+        events.extend(nod_from(&mut counter, -19.0, -26.0));
+        events.extend(hold(&mut counter, -19.0, 2.8, 0.0));
+        assert!(
+            events.contains(&NodEvent::Commit(2)),
+            "two nods made while looking down must commit: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_fast_shallow_nod_from_rest_counts_without_returning_above_rest() {
+        // Live telemetry 02:38:17: the wearer rests at +2°, nods quickly to
+        // about -7° and back to -2°. The old rules needed the head back above
+        // baseline - return_band; a real return stroke stops AT the rest
+        // pose, below that line, so the nod never counted even though the
+        // dip was plainly past the depth threshold.
+        let mut counter = NodCounter::new();
+        hold(&mut counter, 2.0, 0.5, 0.0);
+        let mut events = ramp(&mut counter, 2.0, -7.0, 0.3, 0.0);
+        events.extend(hold(&mut counter, -7.0, 0.2, 0.0));
+        events.extend(ramp(&mut counter, -7.0, -2.0, 0.5, 0.0));
+        assert!(
+            events.contains(&NodEvent::Counted(1)),
+            "a nod whose return stops at the rest pose must still count: {events:?}"
+        );
+        // And with a pause between two such nods, both count.
+        events.extend(hold(&mut counter, -2.0, 0.4, 0.0));
+        events.extend(ramp(&mut counter, -2.0, -11.0, 0.3, 0.0));
+        events.extend(hold(&mut counter, -11.0, 0.2, 0.0));
+        events.extend(ramp(&mut counter, -11.0, -2.0, 0.5, 0.0));
+        events.extend(hold(&mut counter, -2.0, 2.8, 0.0));
+        assert!(
+            events.contains(&NodEvent::Commit(2)),
+            "the second nod in the lowered posture must complete the pair: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_nod_cannot_drag_the_baseline_down() {
+        // The old swing-decay gate read 0.2-0.5° DURING the nod (decay
+        // outruns the motion), so the baseline chased the dip: live it moved
+        // +2.0 → -5.0 within one nod, pulling the return band below the
+        // return stroke. The peak-to-peak window gate must hold the
+        // baseline flat through the dip.
+        let mut counter = NodCounter::new();
+        hold(&mut counter, 2.0, 0.5, 0.0);
+        let before = counter.snapshot().0;
+        ramp(&mut counter, 2.0, -7.0, 0.3, 0.0);
+        hold(&mut counter, -7.0, 0.2, 0.0);
+        let during = counter.snapshot().0;
+        let (Some(before), Some(during)) = (before, during) else {
+            panic!("baselines must be seeded");
+        };
+        assert!(
+            (during - before).abs() < 1.0,
+            "baseline moved {:.1}° during a nod - it must stay put",
+            during - before
+        );
+    }
+
+    #[test]
+    fn telemetry_captures_the_nod_depth() {
+        let mut counter = NodCounter::new();
+        nod(&mut counter, -10.0);
+        let (min_dev, max_yaw) = counter.take_telemetry();
+        assert!(
+            min_dev <= -6.0,
+            "a full nod must show as a deep excursion: {min_dev}"
+        );
+        assert_eq!(max_yaw, 0.0);
+        // Reading resets the window.
+        let (min_dev, _) = counter.take_telemetry();
+        assert_eq!(min_dev, 0.0);
     }
 
     #[test]
@@ -338,7 +692,7 @@ mod tests {
             .count();
         assert_eq!(counted, 4);
 
-        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
         assert!(
             events.contains(&NodEvent::Commit(4)),
             "silence must commit the running total"
@@ -414,7 +768,7 @@ mod tests {
 
         // Finish the nod and rest: the full count commits.
         events.extend(ramp(&mut counter, -10.0, 0.0, 0.2, 0.0));
-        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
         assert!(
             events.contains(&NodEvent::Commit(2)),
             "expected commit of 2 after the slow nods: {events:?}"
@@ -430,7 +784,7 @@ mod tests {
         let _ = counter.update(0.0, 0.0, 5.0);
         assert_eq!(counter.count(), 1);
         let mut events = nod(&mut counter, -10.0);
-        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
         assert!(
             events.contains(&NodEvent::Commit(2)),
             "the second nod after a gap must still commit: {events:?}"
@@ -446,7 +800,7 @@ mod tests {
             let mut events = ramp(&mut counter, 0.0, -4.0, 0.15, 0.0);
             events.extend(hold(&mut counter, -4.0, 0.05, 0.0));
             events.extend(ramp(&mut counter, -4.0, 0.0, 0.15, 0.0));
-            events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+            events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
             events
         };
         assert_eq!(nod_at(3).len(), 0, "level 3 must ignore a 4° nod");
@@ -461,11 +815,11 @@ mod tests {
         let mut counter = NodCounter::with_sensitivity(1);
         // Level 1 needs a 10° dip: a standard-depth 6° nod is ignored.
         let mut events = nod(&mut counter, -6.0);
-        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
         assert!(events.is_empty(), "level 1 must ignore a 6° nod: {events:?}");
         // A deliberate 12° nod still counts.
         let mut events = nod(&mut counter, -12.0);
-        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
         assert!(events.contains(&NodEvent::Commit(1)), "{events:?}");
     }
 
@@ -477,7 +831,7 @@ mod tests {
         // Still level 5: a fresh 4° nod must count again after the reset.
         let mut events = ramp(&mut counter, 0.0, -4.0, 0.15, 0.0);
         events.extend(ramp(&mut counter, -4.0, 0.0, 0.15, 0.0));
-        events.extend(hold(&mut counter, 0.0, 1.6, 0.0));
+        events.extend(hold(&mut counter, 0.0, 2.8, 0.0));
         assert!(
             events.contains(&NodEvent::Commit(1)),
             "reset must not revert the sensitivity: {events:?}"
@@ -493,7 +847,7 @@ mod tests {
         let mut events = ramp(&mut counter, -15.0, -25.0, 0.15, 0.0);
         events.extend(hold(&mut counter, -25.0, 0.05, 0.0));
         events.extend(ramp(&mut counter, -25.0, -15.0, 0.15, 0.0));
-        events.extend(hold(&mut counter, -15.0, 1.6, 0.0));
+        events.extend(hold(&mut counter, -15.0, 2.8, 0.0));
         assert!(
             events.contains(&NodEvent::Commit(1)),
             "a nod relative to the current head pose must count: {events:?}"
