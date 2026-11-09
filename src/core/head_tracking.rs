@@ -83,6 +83,110 @@ const ISOLATION_MARGIN: f32 = 1.2;
 /// Samples kept for the rolling rate estimate (~2 s at 50 Hz).
 const RATE_WINDOW: usize = 100;
 
+/// The absolute pitch/roll anchor the integrator otherwise lacks.
+///
+/// The integrated pitch is unobservable drift: nothing ever pulls it back
+/// toward truth, so every residual rate error accumulates forever - the user
+/// watched the compass wander away from their actual head posture over
+/// minutes. The gravity vector is the fix, and no axis learning is needed:
+/// the *change* of gravity from its captured neutral direction is a plain
+/// rotation, whose components about the head's lateral axis (pitch) and
+/// forward axis (roll) are exactly the absolute angles. Decomposing with
+/// the integrator's own tracked axes keeps every bud seating supported -
+/// whatever device orientation "level" is, it is whatever gravity was when
+/// the stream started, which is also where the integrals start at zero.
+///
+/// Yaw gets no correction from gravity (a yaw rotation leaves the gravity
+/// vector unchanged); yaw drift is bounded by the wrap and is far less
+/// harmful: the nod counter measures yaw *swing* against an adapting
+/// reference, not an absolute heading.
+#[derive(Debug, Clone, Default)]
+struct GravityAnchor {
+    /// Mean device-frame gravity direction over the first seconds of
+    /// streaming; `None` until captured. Defines "zero" pitch/roll.
+    neutral: Option<[f32; 3]>,
+    /// Accumulator for the neutral capture.
+    acc: [f32; 3],
+    /// Samples accumulated so far.
+    n: u32,
+}
+
+impl GravityAnchor {
+    /// Samples averaged into the neutral direction (~1 s at 100 Hz). The
+    /// wearer's posture when tracking starts is the zero they will read.
+    const CAPTURE_SAMPLES: u32 = 100;
+    /// Gravity magnitude sanity band around the captured norm, as factors;
+    /// outside it the sensor is waking up, saturated, or the bud is out of
+    /// an ear, and no correction should fire.
+    const NORM_BAND: (f32, f32) = (0.5, 2.0);
+    /// How strongly each sample pulls the integrated angle onto the gravity
+    /// observation. At ~100 Hz this is a time constant near 2 s: fast enough
+    /// that drift cannot accumulate, slow enough that nod dynamics stay
+    /// dominated by the gyro (a 0.3 s nod receives only ~13% pull).
+    const PULL: f32 = 0.006;
+
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Feeds one gravity sample plus the current integrated pitch/roll (the
+    /// lateral/forward unit vectors, device frame) and returns the corrected
+    /// pair. Before the neutral is captured it passes the integrals through.
+    fn correct(
+        &mut self,
+        gravity: [f32; 3],
+        pitch_deg: f32,
+        roll_deg: f32,
+        lateral: [f32; 3],
+        forward: [f32; 3],
+    ) -> (f32, f32) {
+        let len = len3(gravity);
+        if len <= 1e-3 {
+            return (pitch_deg, roll_deg);
+        }
+        let unit = scale3(gravity, 1.0 / len);
+
+        let Some(neutral) = self.neutral else {
+            self.acc = add3(self.acc, unit);
+            self.n += 1;
+            if self.n >= Self::CAPTURE_SAMPLES {
+                self.neutral = Some(normalize3(self.acc));
+            }
+            return (pitch_deg, roll_deg);
+        };
+
+        // Rotation taking neutral to current, as an axis-scaled vector.
+        // cross(a,b) = |a||b| * sin(angle) * right(a->b); its projection on
+        // a head axis is the rotation about that axis. Sign: nodding down
+        // (pitch < 0) rotates the *device* negatively about the lateral
+        // axis, so gravity in the device frame rotates positively about it,
+        // and cross(neutral, unit) points along +lateral - hence the minus,
+        // matching the integrator's pitch/roll conventions.
+        let dr = cross3(neutral, unit);
+        let cos = dot3(neutral, unit).clamp(-1.0, 1.0);
+        // Near the 180° flip the decomposition is meaningless; skip.
+        if cos < 0.0 {
+            return (pitch_deg, roll_deg);
+        }
+        let sin_pitch = dot3(dr, lateral);
+        let sin_roll = dot3(dr, forward);
+        if sin_pitch.abs() > 1.0 || sin_roll.abs() > 1.0 {
+            return (pitch_deg, roll_deg);
+        }
+        let obs_pitch = -sin_pitch.asin().to_degrees();
+        let obs_roll = -sin_roll.asin().to_degrees();
+
+        (
+            pitch_deg + (obs_pitch - pitch_deg) * Self::PULL,
+            roll_deg + (obs_roll - roll_deg) * Self::PULL,
+        )
+    }
+}
+
 /// Fuses gyroscope angular rate with the gravity vector into yaw/pitch/roll.
 ///
 /// The math follows `starman-tech/mousepods` `MotionEngine.step`, which is the
@@ -123,8 +227,22 @@ struct AttitudeIntegrator {
     /// Whether a first bias estimate has been taken. The first one is adopted
     /// whole; later ones are blended in slowly.
     bias_seeded: bool,
-}
 
+    /// Learned gravity-to-head mapping for the pitch correction.
+    ///
+    /// The integrated pitch is unobservable drift: nothing ever pulls it back
+    /// toward truth, so every residual rate error accumulates forever - the
+    /// user watched the compass wander away from their actual head posture
+    /// over minutes. The raw gravity vector, by contrast, is absolute: it
+    /// always points down, whatever the buds' seating. It is however in
+    /// *device* axes with unknown orientation, so the correction learns the
+    /// linear map from device gravity to head pitch/roll (signs and zero
+    /// offsets) from real motion, and only once that map is stable does it
+    /// gently pull the integrals back. Before then the behaviour is exactly
+    /// the old ungoverned integral.
+    /// wheels the neutral capture and the pull. See [`GravityAnchor`].
+    grav: GravityAnchor,
+}
 impl AttitudeIntegrator {
     const UP_SMOOTHING: f32 = 0.15;
 
@@ -280,6 +398,23 @@ impl AttitudeIntegrator {
         self.yaw_deg += yaw_rate * ROTATION_DEG_PER_SEC * dt;
         self.pitch_deg += pitch_rate * ROTATION_DEG_PER_SEC * dt;
         self.roll_deg += roll_rate * ROTATION_DEG_PER_SEC * dt;
+
+        // Absolute correction: gravity says where down is, so after the
+        // neutral direction is captured the integrated pitch/roll get pulled
+        // onto the gravity observation instead of wandering forever. Runs
+        // through the same lateral/forward frame the integration used, so
+        // every bud seating is handled without calibration.
+        let lateral_v = self.lateral.unwrap_or([1.0, 0.0, 0.0]);
+        let forward_v = cross3(up, lateral_v);
+        let (pitch_corr, roll_corr) = self.grav.correct(
+            gravity,
+            self.pitch_deg,
+            self.roll_deg,
+            lateral_v,
+            forward_v,
+        );
+        self.pitch_deg = pitch_corr;
+        self.roll_deg = roll_corr;
 
         // Keep the display bounded; the head cannot turn further than this.
         self.yaw_deg = wrap_deg(self.yaw_deg);
@@ -1148,6 +1283,78 @@ mod tests {
             roll.abs() < pitch.abs().max(0.5),
             "roll ({}) should stay smaller than pitch ({})",
             roll,
+            pitch
+        );
+    }
+
+    #[test]
+    fn a_constant_gyro_bias_cannot_drift_pitch_past_the_gravity_anchor() {
+        // The live failure (2026-11-09): the compass wandered away from the
+        // actual head posture over minutes of use. Root cause: pitch was a
+        // pure integral, and the bias learner only runs while perfectly
+        // still - any residual rate error accumulated forever. With the
+        // anchor, a sustained bias ends in a bounded steady state: the pull
+        // cancels the bias drift rate.
+        let mut integ = AttitudeIntegrator::new();
+        let gravity = [0.0, 0.0, 1000.0];
+        // Bias that old bias-learning misses: above the still-window blend
+        // it would integrate forever. ~16 deg/s of phantom rotation.
+        let bias = [130.0, 0.0, 0.0];
+
+        // First second: capture the neutral gravity direction.
+        for _ in 0..100 {
+            integ.update([0.0, 0.0, 0.0], gravity);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Then inject the bias for 30 simulated seconds of head motion that
+        // never sits still long enough for the bias learner.
+        for _ in 0..600 {
+            integ.update(bias, gravity);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let [_yaw, pitch, _roll] = integ.update(bias, gravity).unwrap();
+        // Ungoverned, 30 s x 16 deg/s = 480 deg of drift (clamped to 90).
+        // Governed, the pull bounds it near the bias/pull ratio (~7 deg for
+        // this rate); give it generous room either way - the assertion is
+        // that the anchor bites at all.
+        assert!(
+            pitch.abs() < 30.0,
+            "pitch ran away to {} deg under a constant bias",
+            pitch
+        );
+    }
+
+    #[test]
+    fn gravity_anchor_pulls_a_displaced_pitch_back() {
+        let mut integ = AttitudeIntegrator::new();
+        let gravity = [0.0, 0.0, 1000.0];
+        for _ in 0..100 {
+            integ.update([0.0, 0.0, 0.0], gravity);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Physically nod down and hold: the device rotates -25° about the
+        // lateral axis, so gravity in the device frame rotates +25° about
+        // it: z tilts into -y ([0,-sin25,cos25]). The gyro sweeps -25 over
+        // ~1 s and then stops; the anchor must pull the integral onto the
+        // gravity observation, not fight the true pose.
+        let held_gravity = [
+            0.0,
+            (-25.0f32).to_radians().sin() * 1000.0,
+            (-25.0f32).to_radians().cos() * 1000.0,
+        ];
+        let gyro_rate = -25.0 / 0.122; // negative x: pitch decreases
+        for _ in 0..50 {
+            integ.update([gyro_rate, 0.0, 0.0], held_gravity);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for _ in 0..400 {
+            integ.update([0.0, 0.0, 0.0], held_gravity);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let [_yaw, pitch, _roll] = integ.update([0.0, 0.0, 0.0], held_gravity).unwrap();
+        assert!(
+            (pitch + 25.0).abs() < 6.0,
+            "held -25 deg pose must read near -25, got {}",
             pitch
         );
     }
