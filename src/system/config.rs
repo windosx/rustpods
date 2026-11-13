@@ -46,6 +46,18 @@ pub struct AppConfig {
     /// badge detector's amplitude gates; clamped at the use sites.
     #[serde(default = "default_gesture_sensitivity")]
     pub gesture_sensitivity: u8,
+    /// Show an iOS-style floating popup card with 3D model animation when the
+    /// AirPods case lid is opened nearby.
+    #[serde(default = "default_true")]
+    pub case_popup_enabled: bool,
+    /// Cached Apple Proximity IRK (16 bytes, lowercase hex) for verifying BLE
+    /// Resolvable Private Addresses when the case lid opens before Classic BT connects.
+    #[serde(default)]
+    pub proximity_irk: Option<String>,
+    /// Cached Apple Proximity AES-128 key (16 bytes, lowercase hex) for decrypting
+    /// exact battery levels from BLE advertisements.
+    #[serde(default)]
+    pub proximity_enc_key: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -70,6 +82,9 @@ impl Default for AppConfig {
             close_to_tray: true,
             head_gesture_answers_enabled: true,
             gesture_sensitivity: 3,
+            case_popup_enabled: true,
+            proximity_irk: None,
+            proximity_enc_key: None,
         }
     }
 }
@@ -256,6 +271,9 @@ mod tests {
         cfg.start_minimized = true;
         cfg.close_to_tray = false;
         cfg.head_gesture_answers_enabled = false;
+        cfg.case_popup_enabled = false;
+        cfg.proximity_irk = Some("0123456789abcdef0123456789abcdef".to_string());
+        cfg.proximity_enc_key = Some("fedcba9876543210fedcba9876543210".to_string());
         save_config_to(&path, &cfg);
 
         let (loaded, outcome) = load_config_from(&path);

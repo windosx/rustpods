@@ -97,9 +97,10 @@ const RATE_WINDOW: usize = 100;
 /// the stream started, which is also where the integrals start at zero.
 ///
 /// Yaw gets no correction from gravity (a yaw rotation leaves the gravity
-/// vector unchanged); yaw drift is bounded by the wrap and is far less
-/// harmful: the nod counter measures yaw *swing* against an adapting
-/// reference, not an absolute heading.
+/// vector unchanged). Instead it decays gently toward the session centre -
+/// see [`AttitudeIntegrator::YAW_RECENTER_TAU_S`]. The nod counter measures
+/// yaw *swing* against an adapting reference, not an absolute heading, so a
+/// slow recentering does not disturb it.
 #[derive(Debug, Clone, Default)]
 struct GravityAnchor {
     /// Mean device-frame gravity direction over the first seconds of
@@ -245,6 +246,21 @@ struct AttitudeIntegrator {
 }
 impl AttitudeIntegrator {
     const UP_SMOOTHING: f32 = 0.15;
+
+    /// Time constant of the yaw pull toward the session centre, in seconds.
+    ///
+    /// There is no magnetometer, so absolute heading is unobservable: gravity
+    /// cannot see a yaw rotation at all, and the bias learner only runs while
+    /// the head is perfectly still. Any residual rate error - temperature
+    /// drift, the scale being approximate - integrated forever, which is the
+    /// "the longer it runs, the worse the offset" failure. A gentle leak makes
+    /// the error bounded instead of cumulative: a constant residual rate ends
+    /// at `rate * tau` degrees, and while the wearer rests the needle settles
+    /// back to centre the way macOS spatial audio recentres its stage. The
+    /// constant is long enough that deliberate turns dominate it (a 3 s turn
+    /// keeps ~97% of its angle) and short enough that drift cannot accumulate
+    /// over minutes.
+    const YAW_RECENTER_TAU_S: f32 = 90.0;
 
     /// Peak-to-peak rate range under which the head counts as still, in counts/s.
     /// The reference implementation uses 3.0 deg/s, converted here with the same
@@ -398,6 +414,12 @@ impl AttitudeIntegrator {
         self.yaw_deg += yaw_rate * ROTATION_DEG_PER_SEC * dt;
         self.pitch_deg += pitch_rate * ROTATION_DEG_PER_SEC * dt;
         self.roll_deg += roll_rate * ROTATION_DEG_PER_SEC * dt;
+
+        // Yaw has no absolute reference (gravity cannot observe it), so a
+        // residual rate error would integrate forever. The leak bounds it and
+        // recentres the stage while the head rests; pitch/roll need no such
+        // decay because the gravity anchor already pulls them onto truth.
+        self.yaw_deg *= 1.0 - dt / Self::YAW_RECENTER_TAU_S;
 
         // Absolute correction: gravity says where down is, so after the
         // neutral direction is captured the integrated pitch/roll get pulled
@@ -1242,6 +1264,71 @@ mod tests {
             drift < 1.0,
             "yaw kept drifting by {} deg after the bias was learned",
             drift
+        );
+    }
+
+    #[test]
+    fn yaw_drift_under_a_constant_residual_rate_stays_bounded() {
+        // The live failure (2026-11-09): the longer the stream ran, the further
+        // the needle sat from the real heading. Yaw has no absolute reference,
+        // so any rate error the stillness learner misses integrates forever.
+        // With the recentering leak a constant residual rate must end in a
+        // bounded steady state (rate * tau), not a walk to the wrap.
+        let mut integ = AttitudeIntegrator::new();
+        let gravity = [0.0, 0.0, 1000.0];
+        // ~2.4 deg/s of phantom rotation: above the stillness band, so the
+        // bias learner never runs, and below the seed limit it would reject.
+        let residual = [0.0, 0.0, 20.0];
+
+        // Capture the neutral first.
+        for _ in 0..60 {
+            integ.update([0.0, 0.0, 0.0], gravity);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // ~4 s of continuous residual rate. Ungoverned this is ~10 deg and
+        // growing without bound; governed it must stay far below the steady
+        // state (2.4 deg/s * 90 s = 220 deg) because the leak fights it.
+        for _ in 0..800 {
+            integ.update(residual, gravity);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let yaw = integ.yaw_deg;
+        assert!(
+            yaw.abs() < 20.0,
+            "yaw walked to {} deg under a constant residual rate; the leak is not biting",
+            yaw
+        );
+    }
+
+    #[test]
+    fn displaced_yaw_recenters_while_the_head_rests() {
+        // After a turn, the stage must settle back to centre while the wearer
+        // faces forward again - the macOS spatial-audio behaviour, and the
+        // reason drift cannot accumulate across a session.
+        let mut integ = AttitudeIntegrator::new();
+        let gravity = [0.0, 0.0, 1000.0];
+        for _ in 0..60 {
+            integ.update([0.0, 0.0, 0.0], gravity);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Turn the head: ~0.3 s of yaw rate.
+        for _ in 0..60 {
+            integ.update([0.0, 0.0, 2000.0], gravity);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let turned = integ.yaw_deg;
+        assert!(turned.abs() > 3.0, "the turn should register, got {}", turned);
+
+        // Rest for ~6 s: the leak must visibly shrink the angle toward zero.
+        for _ in 0..1200 {
+            integ.update([0.0, 0.0, 0.0], gravity);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            integ.yaw_deg.abs() < turned.abs() * 0.95,
+            "yaw stayed at {} after resting (was {}); it never recentred",
+            integ.yaw_deg,
+            turned
         );
     }
 

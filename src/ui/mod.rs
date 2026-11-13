@@ -1,372 +1,389 @@
 pub mod components;
+pub mod popup;
+pub mod state;
+pub mod theme;
 pub mod window;
 
-use crate::core::aacp::commands::{MicrophoneMode, NoiseControlMode};
+use crate::core::aacp::commands::NoiseControlMode;
 use crate::core::aacp::events::AacpEvent;
 use crate::core::aacp::AacpManager;
 use crate::core::device::AirPodsDeviceState;
-use crate::core::models::AirPodsModel;
 use crate::system::bluetooth::BluetoothManager;
 use crate::system::config::{load_config, save_config, AppConfig, PauseBehavior, StemAction};
 use crate::system::mpris::MprisController;
 use crate::system::tray::RustPodsTray;
-use gtk4::prelude::*;
-use libadwaita::Application;
-use std::rc::Rc;
+use gpui_kit::assets::{icon_assets, Assets as DefaultKitAssets};
+use gpui_kit::component::ThemeMode;
+use gpui_kit::{
+    AnyWindowHandle, App, AppContext as _, AssetSource, Entity, QuitMode, Result, SharedString,
+};
+use state::{RustPodsController, RustPodsState};
+use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
+use window::{window_options, MainWindow};
 
 pub enum UiEvent {
     DeviceStateUpdated(AirPodsDeviceState),
     ConnectedChanged(bool),
     OpenWindow,
+    CaseLidOpened,
+    CaseLidClosed,
     HeadGesture(crate::core::head_tracking::HeadGesture),
 }
 
-/// Starts the GTK application, enforcing one instance per session.
-///
-/// Single-instance behaviour is what a `GApplication` with an application id
-/// gives for free: the first process owns `io.github.rustpods.RustPods` on the
-/// session bus, and a second launch just triggers `activate` on the first one
-/// instead of running its own Bluetooth engine. That matters here because two
-/// instances fight over the one AACP session the accessory allows, and the loser
-/// sees a device that never answers.
-///
-/// `run_with_args` is called with no arguments. Passing anything - even just the
-/// program name - makes `GApplication` treat the invocation as having unknown
-/// arguments, which makes it skip the registration that provides the
-/// single-instance behaviour. Custom flags are already parsed by Clap before we
-/// get here, so there is nothing left to forward.
-pub fn run_app() {
-    let app = Application::builder()
-        .application_id("io.github.rustpods.RustPods")
-        .build();
+// Extra Lucide icons used in RustPods beyond gpui-component's default bundle.
+icon_assets!(
+    RustPodsExtraIcons,
+    [
+        Headphones,
+        Pencil,
+        AudioLines,
+        SlidersHorizontal,
+        Volume2,
+        Bluetooth,
+        BluetoothConnected,
+        Compass,
+        Zap,
+        MessageCircleQuestionMark,
+    ]
+);
 
-    app.connect_activate(build_ui);
-    let status = app.run_with_args::<&str>(&[]);
+struct CompositeAssets;
 
-    // A second launch exits through this path once the running instance has been
-    // activated, so it is not an error worth a non-zero code.
-    debug!("GUI exited with status {:?}", status);
+const ANIM_AIRPODS_1: &[u8] = include_bytes!("../../assets/animations/airpods_1.webp");
+const ANIM_AIRPODS_2: &[u8] = include_bytes!("../../assets/animations/airpods_2.webp");
+const ANIM_AIRPODS_3: &[u8] = include_bytes!("../../assets/animations/airpods_3.webp");
+const ANIM_AIRPODS_4: &[u8] = include_bytes!("../../assets/animations/airpods_4.webp");
+const ANIM_AIRPODS_PRO: &[u8] = include_bytes!("../../assets/animations/airpods_pro.webp");
+const ANIM_AIRPODS_PRO_2: &[u8] = include_bytes!("../../assets/animations/airpods_pro_2.webp");
+const ANIM_AIRPODS_MAX: &[u8] = include_bytes!("../../assets/animations/airpods_max.webp");
+
+impl AssetSource for CompositeAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        let embedded = match path {
+            "animations/airpods_1.webp" => Some(ANIM_AIRPODS_1),
+            "animations/airpods_2.webp" => Some(ANIM_AIRPODS_2),
+            "animations/airpods_3.webp" => Some(ANIM_AIRPODS_3),
+            "animations/airpods_4.webp" => Some(ANIM_AIRPODS_4),
+            "animations/airpods_pro.webp" => Some(ANIM_AIRPODS_PRO),
+            "animations/airpods_pro_2.webp" => Some(ANIM_AIRPODS_PRO_2),
+            "animations/airpods_max.webp" => Some(ANIM_AIRPODS_MAX),
+            _ => None,
+        };
+        if let Some(bytes) = embedded {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
+        if let Some(bytes) = RustPodsExtraIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
+        DefaultKitAssets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut items = DefaultKitAssets.list(path)?;
+        items.extend(RustPodsExtraIcons.list(path)?);
+        Ok(items)
+    }
 }
 
-fn build_ui(app: &Application) {
-    let config = Arc::new(std::sync::RwLock::new(load_config()));
+struct SingleInstanceService {
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+}
 
-    // Gesture thresholds follow the saved sensitivity from the first sample
-    // on; the preferences combo keeps the global in step from here on.
+#[zbus::interface(name = "io.github.rustpods.RustPods")]
+impl SingleInstanceService {
+    fn activate(&self) {
+        let _ = self.ui_tx.send(UiEvent::OpenWindow);
+    }
+}
+
+async fn serve_single_instance_dbus(ui_tx: mpsc::UnboundedSender<UiEvent>) {
+    match zbus::connection::Builder::session() {
+        Ok(builder) => {
+            match builder
+                .name("io.github.rustpods.RustPods")
+                .and_then(|b| {
+                    b.serve_at(
+                        "/io/github/rustpods/RustPods",
+                        SingleInstanceService { ui_tx },
+                    )
+                }) {
+                Ok(b) => {
+                    if let Err(e) = b.build().await {
+                        warn!("Failed to register single-instance D-Bus service: {}", e);
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                Err(e) => warn!("Failed to configure single-instance D-Bus service: {}", e),
+            }
+        }
+        Err(e) => warn!("D-Bus session connection unavailable for single-instance: {}", e),
+    }
+}
+
+/// Starts the GPUI desktop application.
+pub fn run_app(rt_handle: tokio::runtime::Handle) {
+    gpui_kit::application()
+        .with_assets(CompositeAssets)
+        .with_quit_mode(QuitMode::Explicit)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            let initial_mode = ThemeMode::Dark;
+            theme::apply_apple_theme(initial_mode, cx);
+            bootstrap_gui(rt_handle, initial_mode, cx);
+        });
+}
+
+fn bootstrap_gui(
+    rt_handle: tokio::runtime::Handle,
+    initial_mode: ThemeMode,
+    cx: &mut App,
+) {
+    let config = Arc::new(std::sync::RwLock::new(load_config()));
     crate::core::nod_counter::set_sensitivity(config.read().unwrap().gesture_sensitivity);
 
-    // Shared state between Tokio background engine and UI
     let device_state = Arc::new(RwLock::new(None::<AirPodsDeviceState>));
     let aacp_manager = Arc::new(AacpManager::new());
     let mpris_controller = Arc::new(MprisController::new());
-
-    // Channels for UI updates: Tokio -> GLib Main Context
     let (ui_event_tx, mut ui_event_rx) = mpsc::unbounded_channel::<UiEvent>();
 
-    // Initial dummy state for UI creation
-    let init_state = AirPodsDeviceState::new(
-        "CC:68:E0:38:9C:E9".to_string(),
-        "浩的AirPods".to_string(),
-        AirPodsModel::AirPods3,
-    );
-
-    // Callbacks for UI user interactions
-    let aacp_rename = aacp_manager.clone();
-    let on_rename = move |new_name: String| {
-        let aacp = aacp_rename.clone();
-        tokio::spawn(async move {
-            let _ = aacp.rename(&new_name).await;
-        });
+    let controller = RustPodsController {
+        rt: rt_handle.clone(),
+        aacp: aacp_manager.clone(),
+        device_state: device_state.clone(),
+        config: config.clone(),
+        ui_tx: ui_event_tx.clone(),
     };
 
-    let dev_state_conn = device_state.clone();
-    let on_connect = move || {
-        let dev_state = dev_state_conn.clone();
-        tokio::spawn(async move {
-            let mac = {
-                let guard = dev_state.read().await;
-                guard.as_ref().map(|s| s.mac_address.clone())
-            };
-            if let Some(mac_addr) = mac {
-                info!("Triggering connect to {}", mac_addr);
-                let _ = tokio::process::Command::new("bluetoothctl")
-                    .arg("connect")
-                    .arg(&mac_addr)
-                    .output()
-                    .await;
-            }
-        });
-    };
+    let app_state = cx.new(|_| RustPodsState::new(controller, initial_mode));
 
-    let aacp_noise = aacp_manager.clone();
-    let dev_noise = device_state.clone();
-    let tx_noise = ui_event_tx.clone();
-    let on_set_noise_mode = move |mode: NoiseControlMode| {
-        let aacp = aacp_noise.clone();
-        let dev = dev_noise.clone();
-        let tx = tx_noise.clone();
-        tokio::spawn(async move {
-            let _ = aacp.set_noise_mode(mode).await;
-            // The accessory never echoes the mode back, so without this the
-            // window and tray would show the old mode until restart.
-            let updated = {
-                let mut guard = dev.write().await;
-                match guard.as_mut() {
-                    Some(state) => {
-                        state.noise_mode = mode;
-                        Some(state.clone())
-                    }
-                    None => None,
-                }
-            };
-            if let Some(state) = updated {
-                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
-            }
-        });
-    };
+    // Open initial main window and track its handle so OpenWindow can either
+    // activate the live window or recreate it after close-to-tray.
+    let active_window: Arc<std::sync::Mutex<Option<AnyWindowHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let popup_window: Arc<std::sync::Mutex<Option<gpui_kit::WindowHandle<popup::CasePopupWindow>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    open_or_activate_window(&app_state, &active_window, cx);
 
-    let aacp_adapt = aacp_manager.clone();
-    let dev_adapt = device_state.clone();
-    let tx_adapt = ui_event_tx.clone();
-    let on_set_adaptive = move |val: u8| {
-        let aacp = aacp_adapt.clone();
-        let dev = dev_adapt.clone();
-        let tx = tx_adapt.clone();
-        tokio::spawn(async move {
-            let _ = aacp.set_adaptive_strength(val).await;
-            let updated = {
-                let mut guard = dev.write().await;
-                match guard.as_mut() {
-                    Some(state) => {
-                        state.adaptive_strength = val;
-                        Some(state.clone())
-                    }
-                    None => None,
-                }
-            };
-            if let Some(state) = updated {
-                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
-            }
-        });
-    };
+    // Register D-Bus single-instance Activate handler.
+    rt_handle.spawn(serve_single_instance_dbus(ui_event_tx.clone()));
 
-    let aacp_ear = aacp_manager.clone();
-    let cfg_ear = config.clone();
-    let dev_ear = device_state.clone();
-    let tx_ear = ui_event_tx.clone();
-    let on_toggle_ear = move |enabled: bool| {
-        let aacp = aacp_ear.clone();
-        if let Ok(mut c) = cfg_ear.write() {
-            c.ear_detection_enabled = enabled;
-            save_config(&c);
-        }
-        let dev = dev_ear.clone();
-        let tx = tx_ear.clone();
-        tokio::spawn(async move {
-            let _ = aacp.set_ear_detection(enabled).await;
-            let updated = {
-                let mut guard = dev.write().await;
-                match guard.as_mut() {
-                    Some(state) => {
-                        state.ear_detection_enabled = enabled;
-                        Some(state.clone())
-                    }
-                    None => None,
-                }
-            };
-            if let Some(state) = updated {
-                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
-            }
-        });
-    };
-
-    let cfg_pause = config.clone();
-    let on_change_pause = move |behavior: PauseBehavior| {
-        if let Ok(mut c) = cfg_pause.write() {
-            c.pause_behavior = behavior;
-            save_config(&c);
-        }
-    };
-
-    let aacp_conv = aacp_manager.clone();
-    let cfg_conv = config.clone();
-    let on_toggle_conv = move |enabled: bool| {
-        let aacp = aacp_conv.clone();
-        if let Ok(mut c) = cfg_conv.write() {
-            c.conversational_awareness_enabled = enabled;
-            save_config(&c);
-        }
-        tokio::spawn(async move {
-            let _ = aacp.set_conversational_awareness(enabled).await;
-        });
-    };
-
-    let aacp_mic = aacp_manager.clone();
-    let on_change_mic = move |mode: MicrophoneMode| {
-        let aacp = aacp_mic.clone();
-        tokio::spawn(async move {
-            let _ = aacp.set_microphone_mode(mode).await;
-        });
-    };
-
-    let aacp_chime = aacp_manager.clone();
-    let on_toggle_case_chime = move |enabled: bool| {
-        let aacp = aacp_chime.clone();
-        tokio::spawn(async move {
-            let _ = aacp.set_case_chime(enabled).await;
-        });
-    };
-
-    let cfg_close = config.clone();
-    let on_toggle_close_to_tray = move |enabled: bool| {
-        if let Ok(mut c) = cfg_close.write() {
-            c.close_to_tray = enabled;
-            save_config(&c);
-        }
-    };
-
-    // Create Main Window
-    let handles = Rc::new(window::create_main_window(
-        app,
-        &init_state,
-        &config,
-        on_rename,
-        on_connect,
-        on_set_noise_mode,
-        on_set_adaptive,
-        on_toggle_ear,
-        on_change_pause,
-        on_toggle_conv,
-        on_change_mic,
-        on_toggle_case_chime,
-        on_toggle_close_to_tray,
-    ));
-
-    handles.window.present();
-
-    // Spawn System Tray
-    let tray_dev_state = device_state.clone();
-    let tx_tray_open = ui_event_tx.clone();
-    let on_open_win = Arc::new(move || {
-        let _ = tx_tray_open.send(UiEvent::OpenWindow);
-    });
-    let aacp_tray_noise = aacp_manager.clone();
-    let dev_tray_noise = device_state.clone();
-    let tx_tray_noise = ui_event_tx.clone();
-    let on_tray_noise = Arc::new(move |mode: NoiseControlMode| {
-        let aacp = aacp_tray_noise.clone();
-        let dev = dev_tray_noise.clone();
-        let tx = tx_tray_noise.clone();
-        tokio::spawn(async move {
-            let _ = aacp.set_noise_mode(mode).await;
-            // Same optimistic update as the window callback: the tray menu is
-            // rendered from device state, so without this its radio items
-            // would keep showing the old mode forever.
-            let updated = {
-                let mut guard = dev.write().await;
-                match guard.as_mut() {
-                    Some(state) => {
-                        state.noise_mode = mode;
-                        Some(state.clone())
-                    }
-                    None => None,
-                }
-            };
-            if let Some(state) = updated {
-                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
-            }
-        });
-    });
-    let aacp_tray_ear = aacp_manager.clone();
-    let cfg_tray_ear = config.clone();
-    let dev_tray_ear = device_state.clone();
-    let tx_tray_ear = ui_event_tx.clone();
-    let on_tray_ear = Arc::new(move |enabled: bool| {
-        let aacp = aacp_tray_ear.clone();
-        // Persist like the window switch does: the daemon's auto-pause gate
-        // reads the config, so a tray-only toggle used to have no effect on
-        // whether removing a bud paused playback.
-        if let Ok(mut c) = cfg_tray_ear.write() {
-            c.ear_detection_enabled = enabled;
-            save_config(&c);
-        }
-        let dev = dev_tray_ear.clone();
-        let tx = tx_tray_ear.clone();
-        tokio::spawn(async move {
-            let _ = aacp.set_ear_detection(enabled).await;
-            let updated = {
-                let mut guard = dev.write().await;
-                match guard.as_mut() {
-                    Some(state) => {
-                        state.ear_detection_enabled = enabled;
-                        Some(state.clone())
-                    }
-                    None => None,
-                }
-            };
-            if let Some(state) = updated {
-                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
-            }
-        });
-    });
-
-    let tray = RustPodsTray {
-        device_state: tray_dev_state,
-        on_open_window: on_open_win,
-        on_set_noise_mode: on_tray_noise,
-        on_toggle_ear_detection: on_tray_ear,
-    };
-
+    // Spawn System Tray (StatusNotifierItem via ksni).
     let tray_handle_holder: Arc<tokio::sync::Mutex<Option<ksni::Handle<RustPodsTray>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
-    let tray_holder_clone = tray_handle_holder.clone();
-
-    tokio::spawn(async move {
-        use ksni::TrayMethods;
-        match tray.spawn().await {
-            Ok(handle) => {
-                let mut guard = tray_holder_clone.lock().await;
-                *guard = Some(handle);
-            }
-            Err(e) => warn!("Failed to spawn system tray: {}", e),
-        }
-    });
-
-    // Live head-tracking feed. The stream delivers a fresh pose roughly every
-    // 10 ms, but the compass and labels only need redrawing at display rate:
-    // wakes that land inside the render interval are dropped, and the next one
-    // - at most 10 ms later - renders with the newest pose. A `None` pose is
-    // never throttled: it is the disconnect sentinel, and no further wake
-    // would follow to render it late.
     {
-        const RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+        let tray_dev_state = device_state.clone();
+        let tx_tray_open = ui_event_tx.clone();
+        let on_open_win = Arc::new(move || {
+            let _ = tx_tray_open.send(UiEvent::OpenWindow);
+        });
+        let aacp_tray_noise = aacp_manager.clone();
+        let dev_tray_noise = device_state.clone();
+        let tx_tray_noise = ui_event_tx.clone();
+        let rt_noise = rt_handle.clone();
+        let on_tray_noise = Arc::new(move |mode: NoiseControlMode| {
+            let aacp = aacp_tray_noise.clone();
+            let dev = dev_tray_noise.clone();
+            let tx = tx_tray_noise.clone();
+            rt_noise.spawn(async move {
+                let _ = aacp.set_noise_mode(mode).await;
+                let updated = {
+                    let mut guard = dev.write().await;
+                    match guard.as_mut() {
+                        Some(state) => {
+                            state.noise_mode = mode;
+                            Some(state.clone())
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(state) = updated {
+                    let _ = tx.send(UiEvent::DeviceStateUpdated(state));
+                }
+            });
+        });
 
+        let aacp_tray_ear = aacp_manager.clone();
+        let cfg_tray_ear = config.clone();
+        let dev_tray_ear = device_state.clone();
+        let tx_tray_ear = ui_event_tx.clone();
+        let rt_ear = rt_handle.clone();
+        let on_tray_ear = Arc::new(move |enabled: bool| {
+            let aacp = aacp_tray_ear.clone();
+            if let Ok(mut c) = cfg_tray_ear.write() {
+                c.ear_detection_enabled = enabled;
+                save_config(&c);
+            }
+            let dev = dev_tray_ear.clone();
+            let tx = tx_tray_ear.clone();
+            rt_ear.spawn(async move {
+                let _ = aacp.set_ear_detection(enabled).await;
+                let updated = {
+                    let mut guard = dev.write().await;
+                    match guard.as_mut() {
+                        Some(state) => {
+                            state.ear_detection_enabled = enabled;
+                            Some(state.clone())
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(state) = updated {
+                    let _ = tx.send(UiEvent::DeviceStateUpdated(state));
+                }
+            });
+        });
+
+        let tray = RustPodsTray {
+            device_state: tray_dev_state,
+            on_open_window: on_open_win,
+            on_set_noise_mode: on_tray_noise,
+            on_toggle_ear_detection: on_tray_ear,
+        };
+
+        let tray_holder_clone = tray_handle_holder.clone();
+        rt_handle.spawn(async move {
+            use ksni::TrayMethods;
+            match tray.spawn().await {
+                Ok(handle) => {
+                    let mut guard = tray_holder_clone.lock().await;
+                    *guard = Some(handle);
+                }
+                Err(e) => warn!("Failed to spawn system tray: {}", e),
+            }
+        });
+    }
+
+    // Spawn Tokio background engines.
+    rt_handle.spawn(crate::system::zcode_ask::run_socket_server());
+    rt_handle.spawn(run_audio_follow(aacp_manager.head_pose()));
+    {
+        let aacp_bg = aacp_manager.clone();
+        let dev_bg = device_state.clone();
+        let mpris_bg = mpris_controller.clone();
+        let tx_bg = ui_event_tx.clone();
+        let cfg_bg = config.clone();
+        rt_handle.spawn(async move {
+            start_bluetooth_daemon(aacp_bg, dev_bg, mpris_bg, tx_bg, cfg_bg).await;
+        });
+    }
+
+    // GPUI foreground listener for UiEvent (device state, connection, window open, gestures).
+    {
+        let state_ev = app_state.clone();
+        let win_ev = active_window.clone();
+        let popup_ev = popup_window.clone();
+        let tray_ev = tray_handle_holder.clone();
+        let rt_ev = rt_handle.clone();
+        cx.spawn(async move |cx| {
+            let mut gesture_gen: u64 = 0;
+            while let Some(evt) = ui_event_rx.recv().await {
+                match evt {
+                    UiEvent::DeviceStateUpdated(new_dev) => {
+                        let _ = state_ev.update(cx, |s, cx| {
+                            s.device = new_dev;
+                            cx.notify();
+                        });
+                        let holder = tray_ev.clone();
+                        rt_ev.spawn(async move {
+                            let guard = holder.lock().await;
+                            if let Some(h) = guard.as_ref() {
+                                h.update(|_| {}).await;
+                            }
+                        });
+                    }
+                    UiEvent::OpenWindow => {
+                        let _ = cx.update(|cx| {
+                            open_or_activate_window(&state_ev, &win_ev, cx);
+                        });
+                    }
+                    UiEvent::CaseLidOpened => {
+                        let _ = cx.update(|cx| {
+                            popup::open_or_refresh_case_popup(&state_ev, &popup_ev, cx);
+                        });
+                    }
+                    UiEvent::CaseLidClosed => {
+                        let _ = cx.update(|cx| {
+                            popup::close_case_popup(&popup_ev, cx);
+                        });
+                    }
+                    UiEvent::ConnectedChanged(connected) => {
+                        let _ = state_ev.update(cx, |s, cx| {
+                            s.device.is_connected = connected;
+                            if !connected {
+                                s.head_tracking.pose = None;
+                                s.head_tracking.calibrated = false;
+                                s.head_tracking.rate_hz = None;
+                                s.head_tracking.status =
+                                    "等待数据流…（请确认 AirPods 已连接）".to_string();
+                            }
+                            cx.notify();
+                        });
+                        let holder = tray_ev.clone();
+                        rt_ev.spawn(async move {
+                            let guard = holder.lock().await;
+                            if let Some(h) = guard.as_ref() {
+                                h.update(|_| {}).await;
+                            }
+                        });
+                    }
+                    UiEvent::HeadGesture(gesture) => {
+                        info!("Head gesture: {:?}", gesture);
+                        gesture_gen = gesture_gen.wrapping_add(1);
+                        let expected = gesture_gen;
+                        let _ = state_ev.update(cx, |s, cx| {
+                            s.head_tracking.gesture = Some(gesture);
+                            cx.notify();
+                        });
+                        let state_clear = state_ev.clone();
+                        cx.spawn(async move |cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1800))
+                                .await;
+                            let _ = state_clear.update(cx, |s, cx| {
+                                if s.head_tracking.gesture == Some(gesture) {
+                                    let _ = expected;
+                                    s.head_tracking.gesture = None;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    // Live head-tracking feed (throttled to ~30 Hz; None disconnect sentinels pass immediately).
+    {
+        const RENDER_INTERVAL: Duration = Duration::from_millis(33);
         let aacp_feed = aacp_manager.clone();
-        let handles_feed = handles.clone();
+        let state_feed = app_state.clone();
         let tx_gesture = ui_event_tx.clone();
         let mut pose_rx = aacp_manager.head_pose();
         let mut gesture_rx = aacp_manager.subscribe_gestures();
 
-        glib::MainContext::default().spawn_local(async move {
-            // Gestures are rare, so they are pushed as they happen.
-            glib::MainContext::default().spawn_local(async move {
-                while let Ok(gesture) = gesture_rx.recv().await {
-                    if tx_gesture.send(UiEvent::HeadGesture(gesture)).is_err() {
-                        break;
-                    }
+        cx.spawn(async move |_cx| {
+            while let Ok(gesture) = gesture_rx.recv().await {
+                if tx_gesture.send(UiEvent::HeadGesture(gesture)).is_err() {
+                    break;
                 }
-            });
+            }
+        })
+        .detach();
 
+        cx.spawn(async move |cx| {
             let mut last_render = None::<std::time::Instant>;
             loop {
                 if pose_rx.changed().await.is_err() {
                     break;
                 }
-                // Marks the current value as seen even on a skipped frame, so
-                // the next `changed()` waits for the next sample, not this one.
                 let pose = *pose_rx.borrow_and_update();
                 let now = std::time::Instant::now();
                 if pose.is_some()
@@ -378,17 +395,12 @@ fn build_ui(app: &Application) {
 
                 let calibrated = aacp_feed.is_head_tracking_active().await;
                 let rate = aacp_feed.head_tracking_rate_hz().await;
-                {
-                    let mut state = handles_feed.head_tracking.state.borrow_mut();
-                    state.pose = pose;
-                    state.calibrated = calibrated;
-                    state.rate_hz = rate;
-                    // A `None` pose leaves the status line alone: the
-                    // disconnected wording comes from the ConnectedChanged
-                    // handler, and once the stream is gone there is no
-                    // negotiation progress left to report.
+                let _ = state_feed.update(cx, |s, cx| {
+                    s.head_tracking.pose = pose;
+                    s.head_tracking.calibrated = calibrated;
+                    s.head_tracking.rate_hz = rate;
                     if pose.is_some() {
-                        state.status = if calibrated {
+                        s.head_tracking.status = if calibrated {
                             match rate {
                                 Some(hz) => format!("实时姿态流 · {:.0} Hz", hz),
                                 None => "实时姿态流".to_string(),
@@ -397,170 +409,77 @@ fn build_ui(app: &Application) {
                             "正在校准中立姿态…（保持头部静止）".to_string()
                         };
                     }
-                }
-                components::headtracking::update_head_tracking_widgets(&handles_feed.head_tracking);
+                    cx.notify();
+                });
             }
-        });
+        })
+        .detach();
     }
 
-    // GLib Main Loop Listener for UI Updates
-    let handles_listener = handles.clone();
-    let tray_holder_events = tray_handle_holder.clone();
-    glib::MainContext::default().spawn_local(async move {
-        while let Some(evt) = ui_event_rx.recv().await {
-            match evt {
-                UiEvent::DeviceStateUpdated(state) => {
-                    window::update_ui_state(&handles_listener, &state);
-
-                    // Refresh tray icon with new battery level
-                    let holder = tray_holder_events.clone();
-                    tokio::spawn(async move {
-                        let guard = holder.lock().await;
-                        if let Some(h) = guard.as_ref() {
-                            h.update(|_| {}).await;
-                        }
-                    });
-                }
-                UiEvent::OpenWindow => {
-                    handles_listener.window.set_visible(true);
-                    handles_listener.window.present();
-                }
-                UiEvent::ConnectedChanged(connected) => {
-                    if connected {
-                        handles_listener.hero_status.set_text("● 已连接");
-                        handles_listener.hero_status.remove_css_class("dim-label");
-                        handles_listener.hero_status.add_css_class("success");
-                    } else {
-                        handles_listener.hero_status.set_text("○ 未连接");
-                        handles_listener.hero_status.remove_css_class("success");
-                        handles_listener.hero_status.remove_css_class("accent");
-                        handles_listener.hero_status.add_css_class("dim-label");
-
-                        // Drop the last pose so the compass does not keep showing
-                        // a stale orientation after the stream stops.
-                        {
-                            let mut state = handles_listener.head_tracking.state.borrow_mut();
-                            state.pose = None;
-                            state.calibrated = false;
-                            state.rate_hz = None;
-                            state.status = "等待数据流…（请确认 AirPods 已连接）".to_string();
-                        }
-                        components::headtracking::update_head_tracking_widgets(
-                            &handles_listener.head_tracking,
-                        );
-                    }
-
-                    let holder = tray_holder_events.clone();
-                    tokio::spawn(async move {
-                        let guard = holder.lock().await;
-                        if let Some(h) = guard.as_ref() {
-                            h.update(|_| {}).await;
-                        }
-                    });
-                }
-
-                UiEvent::HeadGesture(gesture) => {
-                    info!("Head gesture: {:?}", gesture);
-                    {
-                        let mut state = handles_listener.head_tracking.state.borrow_mut();
-                        state.gesture = Some(gesture);
-                    }
-                    components::headtracking::update_head_tracking_widgets(
-                        &handles_listener.head_tracking,
-                    );
-
-                    // Clear the badge so a stale gesture is not shown forever.
-                    let handles_clear = handles_listener.clone();
-                    glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(1800),
-                        move || {
-                            {
-                                let mut state =
-                                    handles_clear.head_tracking.state.borrow_mut();
-                                state.gesture = None;
-                            }
-                            components::headtracking::update_head_tracking_widgets(
-                                &handles_clear.head_tracking,
-                            );
-                        },
-                    );
-                }
-            }
-        }
-    });
-
-    // Spawn Tokio Background Services
-    let aacp_bg = aacp_manager.clone();
-    let dev_state_bg = device_state.clone();
-    let mpris_bg = mpris_controller.clone();
-    let ui_tx_bg = ui_event_tx.clone();
-    let cfg_bg = config.clone();
-
-    // Serve ZCode question hooks. If the --no-gui daemon already owns the
-    // socket, this quietly does nothing; either way the hook finds a server.
-    tokio::spawn(crate::system::zcode_ask::run_socket_server());
-
-    // Head-tracked audio, once per process. The watch channel and the
-    // PipeWire filter-chain node both outlive any single AACP connection, so
-    // re-spawning per reconnect would pile up one PipeWire thread and one
-    // HRTF client per flapping link.
-    tokio::spawn(run_audio_follow(aacp_manager.head_pose()));
-
-    tokio::spawn(async move {
-        start_bluetooth_daemon(aacp_bg, dev_state_bg, mpris_bg, ui_tx_bg, cfg_bg).await;
-    });
-
-    // Poll the ZCode question state for the card. The hub is plain shared
-    // state, and the card is a status surface, so a 5 Hz poll is simpler than
-    // bridging another async channel into the GTK loop.
+    // 5 Hz poll for ZCode question card.
     {
-        let handles_ask = handles.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+        let state_ask = app_state.clone();
+        cx.spawn(async move |cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
             let progress = crate::system::zcode_ask::ASK_HUB.progress_snapshot();
             let resolved = crate::system::zcode_ask::ASK_HUB.resolved_note();
-            components::zcode_ask::update_zcode_ask_widgets(
-                &handles_ask.zcode_ask,
-                progress,
-                resolved,
-            );
-            glib::ControlFlow::Continue
-        });
+            state_ask.update(cx, |s, cx| {
+                if s.zcode_progress != progress || s.zcode_resolved != resolved {
+                    s.zcode_progress = progress;
+                    s.zcode_resolved = resolved;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+fn open_or_activate_window(
+    app_state: &Entity<RustPodsState>,
+    slot: &Arc<std::sync::Mutex<Option<AnyWindowHandle>>>,
+    cx: &mut App,
+) {
+    if let Ok(mut guard) = slot.lock() {
+        if let Some(handle) = guard.as_ref() {
+            if handle
+                .update(cx, |_, window, _| {
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            *guard = None;
+        }
+    }
+
+    let state_for_win = app_state.clone();
+    match gpui_kit::open_window(window_options(cx), cx, move |window, cx| {
+        cx.new(|cx| MainWindow::new(state_for_win, window, cx))
+    }) {
+        Ok((handle, _)) => {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(handle);
+            }
+            let _ = handle.update(cx, |_, window, _| {
+                window.activate_window();
+            });
+        }
+        Err(e) => {
+            error!("Failed to open GPUI main window: {}", e);
+        }
     }
 }
 
 /// Drives the head-tracked audio stage for as long as poses arrive.
-///
-/// Spawned once per process: the watch channel and the PipeWire node both
-/// outlive any single AACP connection, and a fresh instance per reconnect
-/// would leak a PipeWire thread and an HRTF client per flapping link.
-///
-/// ## Rate
-///
-/// Poses arrive at roughly 100 Hz. The mixer must not be retuned at that rate:
-/// every update costs a full convolution-kernel rebuild inside PipeWire, so the
-/// [`AzimuthSchedule`](crate::system::audio_follow::AzimuthSchedule) quantises to
-/// five degrees with a 50 ms floor, turning a hundred writes a second into a
-/// handful.
-///
-/// ## Why only the HRTF path is driven
-///
-/// An amplitude pan is also available here, and an earlier version updated it
-/// alongside the azimuth. That was wrong: with the filter chain in the audio
-/// path the sound is already spatialised by convolution, and stacking a channel
-/// gain on top would apply the head position twice and exaggerate it. The pan
-/// stays in the code as a fallback for builds without HRTF, not as a second
-/// effect.
-///
-/// ## Failure
-///
-/// Audio is optional. If PipeWire is not running, or the filter chain has not
-/// been configured, the stage reports itself unavailable and this returns
-/// quietly; the compass and battery display are unaffected.
 #[cfg(feature = "audio-follow")]
 pub async fn run_audio_follow(
     pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
 ) {
-    use crate::system::audio_follow::{AzimuthSchedule, FilterPlan, HrtfClient};
+    use crate::system::audio_follow::{FilterPlan, HrtfClient, StageSchedule};
 
     let plan = FilterPlan::default();
     let mut client = match HrtfClient::start(&plan) {
@@ -571,7 +490,7 @@ pub async fn run_audio_follow(
         }
     };
 
-    let mut schedule = AzimuthSchedule::new();
+    let mut schedule = StageSchedule::new();
     let mut rx = pose_rx;
     let started = std::time::Instant::now();
     let mut announced = false;
@@ -588,17 +507,17 @@ pub async fn run_audio_follow(
 
         let pose = *rx.borrow_and_update();
         let Some(pose) = pose else {
-            // Tracking stopped: recentre so a stale head angle does not persist.
             schedule.reset();
             let now_ms = started.elapsed().as_millis() as u64;
-            client.set_azimuth(schedule.commit(0.0, now_ms));
+            client.set_stage(schedule.commit([0.0, 0.0, 0.0], now_ms));
             continue;
         };
 
         let now_ms = started.elapsed().as_millis() as u64;
-        if schedule.should_update(pose.yaw, now_ms) {
-            let azimuth = schedule.commit(pose.yaw, now_ms);
-            client.set_azimuth(azimuth);
+        let axes = [pose.yaw, pose.pitch, pose.roll];
+        if schedule.should_update(axes, now_ms) {
+            let stage = schedule.commit(axes, now_ms);
+            client.set_stage(stage);
         }
     }
 
@@ -621,20 +540,19 @@ pub async fn start_bluetooth_daemon(
 ) {
     info!("Starting RustPods Bluetooth Background Daemon...");
 
-    // The daemon is an engine of its own: seed the gesture sensitivity the
-    // same way the GUI does at startup.
     crate::core::nod_counter::set_sensitivity(config.read().unwrap().gesture_sensitivity);
 
-    // Start BLE Proximity Monitor for real-time background battery updates
     let dev_state_le = dev_state.clone();
     let ui_tx_le = ui_tx.clone();
+    let cfg_le = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::system::le_monitor::start_le_monitor(dev_state_le, ui_tx_le).await {
+        if let Err(e) =
+            crate::system::le_monitor::start_le_monitor(dev_state_le, ui_tx_le, cfg_le).await
+        {
             warn!("BLE Proximity Monitor error: {}", e);
         }
     });
 
-    // Start periodic battery status refresh task
     let aacp_poll = aacp.clone();
     tokio::spawn(async move {
         loop {
@@ -660,6 +578,8 @@ pub async fn start_bluetooth_daemon(
         }
     }
 
+    let mut was_disconnected = false;
+
     loop {
         info!("Searching for connected AirPods...");
         match bt_manager.find_connected_airpods().await {
@@ -670,17 +590,20 @@ pub async fn start_bluetooth_daemon(
                     pod.name, pod.address, pod.model
                 );
 
+                if was_disconnected {
+                    // AirPods just woke up from the case and BR/EDR came up; give
+                    // link encryption and audio profiles 1.5s to settle before
+                    // opening PSM 0x1001 so the accessory answers the handshake.
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                }
+
                 let mut current_state =
                     AirPodsDeviceState::new(pod.address.to_string(), pod.name.clone(), pod.model);
                 current_state.is_connected = false;
-                // The tray checkmark renders from this field; seed it from the
-                // persisted config instead of the hard-coded true in new().
                 current_state.ear_detection_enabled = config.read().unwrap().ear_detection_enabled;
 
-                // Subscribe to AACP events BEFORE connect so no initial packets (battery, ear status) are missed
                 let mut event_rx = aacp.subscribe();
 
-                // Connect AACP L2CAP socket
                 if let Err(e) = aacp.connect(pod.address).await {
                     error!("AACP connection failed: {}", e);
                     current_state.is_connected = false;
@@ -707,14 +630,6 @@ pub async fn start_bluetooth_daemon(
                 info!("Requesting initial battery and status...");
                 let _ = aacp.request_battery_and_status().await;
 
-                // Head tracking needs its own negotiation: the accessory only
-                // announces its sensor services after the RemoteHID prelude, and
-                // the stream stays off until Feature report 1 is written on
-                // devmotion6. Without this the spatial-audio page has nothing to
-                // draw even though battery and ear detection work fine.
-                //
-                // A spatial-audio claim is required first, matching macOS, which
-                // will not enable tracking until an application asks for it.
                 {
                     let camera = aacp.clone();
                     tokio::spawn(async move {
@@ -726,17 +641,6 @@ pub async fn start_bluetooth_daemon(
                             )
                             .await;
 
-                        // The accessory announces its sensor services
-                        // unreliably: a freshly connected unit often reports
-                        // none, and only a link cycle clears that. Verified on
-                        // hardware - the same unit needed two cycles before it
-                        // listed all eight services. So cycle a few times around
-                        // the in-place retries that start_head_tracking already
-                        // does.
-                        // One attempt only. Reconnecting the link was tried and
-                        // makes things worse: the accessory starts refusing
-                        // paging and only a physical case cycle recovers it.
-                        // macOS keeps a single link open and waits, so do that.
                         match camera.start_head_tracking().await {
                             Ok(()) => {
                                 for _ in 0..15 {
@@ -759,18 +663,11 @@ pub async fn start_bluetooth_daemon(
 
                 let mut last_both_in_ear = false;
 
-                // Head-gesture answering of ZCode questions, fed from the same
-                // watch channel as the compass. Retires any task from a
-                // previous connection itself.
                 {
                     let pose_rx = aacp.head_pose();
                     tokio::spawn(crate::system::zcode_ask::run_question_answers(pose_rx));
                 }
 
-                // The AACP socket can also die silently (device out of range,
-                // grabbed by another host) without sending Disconnected. Poll
-                // the manager alongside the event stream so the UI cannot get
-                // stuck on a stale "connected" state.
                 let mut health = tokio::time::interval(tokio::time::Duration::from_secs(3));
                 health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -789,7 +686,6 @@ pub async fn start_bluetooth_daemon(
                     let event = match event {
                         Ok(event) => event,
                         Err(broadcast::error::RecvError::Closed) => break,
-                        // Lagging only means we skipped samples; keep going.
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             warn!("AACP event stream lagged, skipped {} events", n);
                             continue;
@@ -815,6 +711,22 @@ pub async fn start_bluetooth_daemon(
                             current_state.left_in_ear = ear_evt.left;
                             current_state.right_in_ear = ear_evt.right;
                             let new_wearing = current_state.is_wearing_any();
+
+                            if !old_wearing && new_wearing {
+                                let _ = ui_tx.send(UiEvent::CaseLidClosed);
+                            }
+
+                            if !last_both_in_ear && current_state.is_wearing_both() {
+                                let camera = aacp.clone();
+                                tokio::spawn(async move {
+                                    if camera.head_samples_seen().await == 0 {
+                                        if !camera.has_motion_device().await {
+                                            let _ = camera.subscribe_rtbuddy_motion().await;
+                                        }
+                                        let _ = camera.start_head_tracking().await;
+                                    }
+                                });
+                            }
 
                             let cfg = config.read().unwrap().clone();
                             if cfg.ear_detection_enabled {
@@ -885,10 +797,31 @@ pub async fn start_bluetooth_daemon(
                             let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
                         }
 
+                        AacpEvent::ProximityKeys { irk, enc_key } => {
+                            if let Ok(mut cfg) = config.write() {
+                                let mut changed = false;
+                                if let Some(k) = irk {
+                                    let encoded = hex::encode(k);
+                                    if cfg.proximity_irk.as_deref() != Some(&encoded) {
+                                        cfg.proximity_irk = Some(encoded);
+                                        changed = true;
+                                    }
+                                }
+                                if let Some(k) = enc_key {
+                                    let encoded = hex::encode(k);
+                                    if cfg.proximity_enc_key.as_deref() != Some(&encoded) {
+                                        cfg.proximity_enc_key = Some(encoded);
+                                        changed = true;
+                                    }
+                                }
+                                if changed {
+                                    info!("Saved Apple Proximity keys (IRK/EncKey) for BLE lid detection");
+                                    save_config(&cfg);
+                                }
+                            }
+                        }
+
                         AacpEvent::Disconnected => {
-                            // The broadcast sender lives as long as the manager, so
-                            // recv() never errors on its own. Leaving the loop here
-                            // is what lets the outer loop notice the drop and retry.
                             warn!("AACP reported disconnect; leaving the event loop");
                             break;
                         }
@@ -910,9 +843,11 @@ pub async fn start_bluetooth_daemon(
                 }
                 let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
                 let _ = ui_tx.send(UiEvent::ConnectedChanged(false));
+                was_disconnected = true;
             }
 
             Ok(_) => {
+                was_disconnected = true;
                 debug!("No connected AirPods detected, checking paired devices...");
                 if let Ok(paired) = bt_manager.find_paired_airpods().await {
                     if let Some(first_paired) = paired.first() {
@@ -929,8 +864,6 @@ pub async fn start_bluetooth_daemon(
                         let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state));
                     }
                 }
-                // Also refresh the status pill; without this the hero header keeps
-                // whatever it last showed even though the device is gone.
                 let _ = ui_tx.send(UiEvent::ConnectedChanged(false));
             }
 

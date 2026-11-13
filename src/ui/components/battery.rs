@@ -1,232 +1,232 @@
 use crate::core::aacp::events::EarStatus;
 use crate::core::device::AirPodsDeviceState;
-use gtk4::prelude::*;
-use gtk4::{Align, Box, DrawingArea, Label, Orientation, Overlay};
-use std::cell::RefCell;
-use std::f64::consts::PI;
-use std::rc::Rc;
+use crate::ui::theme::{control_card, ApplePalette};
+use gpui_kit::component::Icon;
+use gpui_kit::{
+    canvas, div, point, px, App, Bounds, FontWeight, Hsla, IntoElement, ParentElement as _,
+    PathBuilder, Pixels, Point, Styled as _, Window,
+};
+use std::f32::consts::{PI, TAU};
 
-pub struct SingleBatteryWidgets {
-    pub container: Box,
-    pub area: DrawingArea,
-    pub center_label: Label,
-    pub status_label: Label,
-    pub state_holder: Rc<RefCell<(Option<u8>, bool)>>,
+pub fn render_battery_card(state: &AirPodsDeviceState, p: &ApplePalette) -> impl IntoElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .gap(px(12.))
+        .child(render_single_battery_column(
+            "左耳 (Left)",
+            state.battery_left,
+            state.battery_left_charging,
+            state.left_in_ear,
+            false,
+            p,
+        ))
+        .child(render_single_battery_column(
+            "右耳 (Right)",
+            state.battery_right,
+            state.battery_right_charging,
+            state.right_in_ear,
+            false,
+            p,
+        ))
+        .child(render_single_battery_column(
+            "充电盒 (Case)",
+            state.battery_case,
+            state.battery_case_charging,
+            EarStatus::InCase,
+            true,
+            p,
+        ))
 }
 
-pub struct BatteryViewWidgets {
-    pub container: Box,
-    pub left: SingleBatteryWidgets,
-    pub right: SingleBatteryWidgets,
-    pub case: SingleBatteryWidgets,
-}
-
-pub fn build_battery_card(state: &AirPodsDeviceState) -> BatteryViewWidgets {
-    let main_box = Box::new(Orientation::Horizontal, 12);
-    main_box.set_homogeneous(true);
-    main_box.set_margin_start(16);
-    main_box.set_margin_end(16);
-    main_box.set_margin_top(8);
-    main_box.set_margin_bottom(8);
-
-    // Left Earbud Card
-    let left = build_single_circular_battery_column(
-        "左耳 (Left)",
-        state.battery_left,
-        state.battery_left_charging,
-        state.left_in_ear,
-        false,
-    );
-
-    // Right Earbud Card
-    let right = build_single_circular_battery_column(
-        "右耳 (Right)",
-        state.battery_right,
-        state.battery_right_charging,
-        state.right_in_ear,
-        false,
-    );
-
-    // Case Card
-    let case = build_single_circular_battery_column(
-        "充电盒 (Case)",
-        state.battery_case,
-        state.battery_case_charging,
-        EarStatus::InCase,
-        true,
-    );
-
-    main_box.append(&left.container);
-    main_box.append(&right.container);
-    main_box.append(&case.container);
-
-    BatteryViewWidgets {
-        container: main_box,
-        left,
-        right,
-        case,
-    }
-}
-
-fn build_single_circular_battery_column(
+fn render_single_battery_column(
     title: &str,
     level_opt: Option<u8>,
     charging: bool,
     ear_status: EarStatus,
     is_case: bool,
-) -> SingleBatteryWidgets {
-    let card = Box::new(Orientation::Vertical, 8);
-    card.add_css_class("card");
-    card.set_margin_top(6);
-    card.set_margin_bottom(6);
-    card.set_margin_start(4);
-    card.set_margin_end(4);
-
-    let inner = Box::new(Orientation::Vertical, 8);
-    inner.set_margin_top(14);
-    inner.set_margin_bottom(14);
-    inner.set_margin_start(14);
-    inner.set_margin_end(14);
-
-    // Title on top
-    let title_label = Label::new(Some(title));
-    title_label.add_css_class("heading");
-    title_label.set_halign(Align::Center);
-    inner.append(&title_label);
-
-    // Circular Battery Ring Gauge (Apple Widget style)
-    let state_holder = Rc::new(RefCell::new((level_opt, charging)));
-
-    let overlay = Overlay::new();
-    overlay.set_halign(Align::Center);
-    overlay.set_valign(Align::Center);
-
-    let drawing_area = DrawingArea::new();
-    drawing_area.set_content_width(84);
-    drawing_area.set_content_height(84);
-    drawing_area.set_halign(Align::Center);
-    drawing_area.set_valign(Align::Center);
-
-    let state_draw = state_holder.clone();
-    drawing_area.set_draw_func(move |_area, cr, width, height| {
-        let cx = (width as f64) / 2.0;
-        let cy = (height as f64) / 2.0;
-        let r = 34.0;
-        let stroke_w = 6.5;
-
-        let (level, is_charging) = *state_draw.borrow();
-        let pct = level.unwrap_or(0) as f64 / 100.0;
-
-        // Background track ring
-        cr.arc(cx, cy, r, 0.0, 2.0 * PI);
-        cr.set_source_rgba(0.5, 0.5, 0.5, 0.16);
-        cr.set_line_width(stroke_w);
-        let _ = cr.stroke();
-
-        // Foreground animated progress arc
-        if level.is_some() && pct > 0.0 {
-            let color = if is_charging {
-                [0.20, 0.78, 0.35, 1.0] // Electric Green
-            } else if pct > 0.40 {
-                [0.19, 0.82, 0.35, 1.0] // Vibrant Green
-            } else if pct > 0.20 {
-                [1.00, 0.84, 0.04, 1.0] // Warning Yellow
-            } else {
-                [1.00, 0.27, 0.23, 1.0] // Low Battery Red
-            };
-
-            let start_angle = -PI / 2.0;
-            let end_angle = start_angle + pct * 2.0 * PI;
-
-            cr.set_line_cap(gtk4::cairo::LineCap::Round);
-            cr.set_source_rgba(color[0], color[1], color[2], color[3]);
-            cr.set_line_width(stroke_w);
-            cr.arc(cx, cy, r, start_angle, end_angle);
-            let _ = cr.stroke();
-        }
-    });
-
-    let pct_str = format_center_text(level_opt, charging);
-    let center_label = Label::new(Some(&pct_str));
-    center_label.add_css_class("title-2");
-    center_label.add_css_class("numeric");
-    center_label.set_halign(Align::Center);
-    center_label.set_valign(Align::Center);
-
-    overlay.set_child(Some(&drawing_area));
-    overlay.add_overlay(&center_label);
-    inner.append(&overlay);
-
-    // Status subtitle below
+    p: &ApplePalette,
+) -> impl IntoElement {
+    let pct_str = format_center_text(level_opt);
     let status_str = format_status_string(level_opt, charging, ear_status, is_case);
-    let status_label = Label::new(Some(&status_str));
-    status_label.add_css_class("caption");
-    status_label.set_halign(Align::Center);
-    if charging {
-        status_label.add_css_class("success");
+    let ring_color = ring_color_for(level_opt, charging, p);
+    let track_color = p.track_bg;
+    let status_color = if charging {
+        p.accent_green
     } else {
-        status_label.add_css_class("dim-label");
-    }
-    inner.append(&status_label);
+        p.text_secondary
+    };
 
-    card.append(&inner);
-    SingleBatteryWidgets {
-        container: card,
-        area: drawing_area,
-        center_label,
-        status_label,
-        state_holder,
+    control_card(p)
+        .flex_1()
+        .min_w_0()
+        .py(px(16.))
+        .px(px(12.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(p.text_primary)
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .relative()
+                .w(px(84.))
+                .h(px(84.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    canvas(
+                        move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| bounds,
+                        move |_bounds, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
+                            paint_battery_ring(
+                                window,
+                                bounds,
+                                level_opt,
+                                track_color,
+                                ring_color,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_size(px(21.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.text_primary)
+                                .child(pct_str),
+                        )
+                        .when(charging, |this| {
+                            this.child(
+                                Icon::new(gpui_kit::assets::IconName::Zap)
+                                    .size(px(11.))
+                                    .text_color(p.accent_green),
+                            )
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(status_color)
+                .child(status_str),
+        )
+}
+
+fn paint_battery_ring(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    level: Option<u8>,
+    track_color: Hsla,
+    ring_color: Hsla,
+) {
+    let cx = bounds.origin.x.as_f32() + bounds.size.width.as_f32() * 0.5;
+    let cy = bounds.origin.y.as_f32() + bounds.size.height.as_f32() * 0.5;
+    let radius = (bounds.size.width.as_f32().min(bounds.size.height.as_f32()) * 0.5 - 8.0).max(12.0);
+    let stroke_w = 6.5_f32;
+
+    // Background track ring
+    let mut track = PathBuilder::stroke(px(stroke_w));
+    const TRACK_SEGMENTS: usize = 64;
+    for i in 0..=TRACK_SEGMENTS {
+        let a = (i as f32 / TRACK_SEGMENTS as f32) * TAU;
+        let pt = point(px(cx + radius * a.cos()), px(cy + radius * a.sin()));
+        if i == 0 {
+            track.move_to(pt);
+        } else {
+            track.line_to(pt);
+        }
+    }
+    if let Ok(path) = track.build() {
+        window.paint_path(path, track_color);
+    }
+
+    let Some(level_val) = level else {
+        return;
+    };
+    let pct = (level_val as f32 / 100.0).clamp(0.0, 1.0);
+    if pct <= 0.0 {
+        return;
+    }
+
+    let start_angle = -PI / 2.0;
+    let sweep = pct * TAU;
+    let segments = ((pct * 72.0).ceil() as usize).max(2);
+    let mut arc = PathBuilder::stroke(px(stroke_w));
+    let mut start_pt = Point::default();
+    let mut end_pt = Point::default();
+
+    for i in 0..=segments {
+        let a = start_angle + (i as f32 / segments as f32) * sweep;
+        let pt = point(px(cx + radius * a.cos()), px(cy + radius * a.sin()));
+        if i == 0 {
+            start_pt = pt;
+            arc.move_to(pt);
+        } else {
+            arc.line_to(pt);
+        }
+        if i == segments {
+            end_pt = pt;
+        }
+    }
+    if let Ok(path) = arc.build() {
+        window.paint_path(path, ring_color);
+    }
+
+    // Rounded endcaps
+    let cap_r = stroke_w * 0.5;
+    paint_disc(window, start_pt, cap_r, ring_color);
+    paint_disc(window, end_pt, cap_r, ring_color);
+}
+
+fn paint_disc(window: &mut Window, center: Point<Pixels>, radius: f32, color: Hsla) {
+    let mut disc = PathBuilder::fill();
+    const STEPS: usize = 16;
+    for i in 0..STEPS {
+        let a = (i as f32 / STEPS as f32) * TAU;
+        let pt = point(
+            px(center.x.as_f32() + radius * a.cos()),
+            px(center.y.as_f32() + radius * a.sin()),
+        );
+        if i == 0 {
+            disc.move_to(pt);
+        } else {
+            disc.line_to(pt);
+        }
+    }
+    disc.close();
+    if let Ok(path) = disc.build() {
+        window.paint_path(path, color);
     }
 }
 
-pub fn update_battery_widgets(widgets: &BatteryViewWidgets, state: &AirPodsDeviceState) {
-    // Left
-    *widgets.left.state_holder.borrow_mut() =
-        (state.battery_left, state.battery_left_charging);
-    widgets.left.area.queue_draw();
-    widgets
-        .left
-        .center_label
-        .set_text(&format_center_text(state.battery_left, state.battery_left_charging));
-    widgets.left.status_label.set_text(&format_status_string(
-        state.battery_left,
-        state.battery_left_charging,
-        state.left_in_ear,
-        false,
-    ));
-
-    // Right
-    *widgets.right.state_holder.borrow_mut() =
-        (state.battery_right, state.battery_right_charging);
-    widgets.right.area.queue_draw();
-    widgets
-        .right
-        .center_label
-        .set_text(&format_center_text(state.battery_right, state.battery_right_charging));
-    widgets.right.status_label.set_text(&format_status_string(
-        state.battery_right,
-        state.battery_right_charging,
-        state.right_in_ear,
-        false,
-    ));
-
-    // Case
-    *widgets.case.state_holder.borrow_mut() =
-        (state.battery_case, state.battery_case_charging);
-    widgets.case.area.queue_draw();
-    widgets
-        .case
-        .center_label
-        .set_text(&format_center_text(state.battery_case, state.battery_case_charging));
-    widgets.case.status_label.set_text(&format_status_string(
-        state.battery_case,
-        state.battery_case_charging,
-        EarStatus::InCase,
-        true,
-    ));
+fn ring_color_for(level: Option<u8>, charging: bool, p: &ApplePalette) -> Hsla {
+    if charging {
+        return p.accent_green;
+    }
+    match level {
+        Some(v) if v > 40 => p.accent_green,
+        Some(v) if v > 20 => p.accent_amber,
+        _ => p.accent_red,
+    }
 }
 
-fn format_center_text(level: Option<u8>, _charging: bool) -> String {
+fn format_center_text(level: Option<u8>) -> String {
     match level {
         Some(l) => l.to_string(),
         None => "--".to_string(),
@@ -259,3 +259,5 @@ fn format_status_string(
         format!("{} • {}", charge_str, ear_str)
     }
 }
+
+use gpui_kit::prelude::FluentBuilder as _;

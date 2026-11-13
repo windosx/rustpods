@@ -138,5 +138,10 @@ pub enum AacpEvent {
     /// frame, so whoever owns the [`HeadTracker`](crate::core::head_tracking::HeadTracker)
     /// needs the bytes exactly as they arrived.
     HeadSensor(Vec<u8>),
+    /// Proximity pairing keys (IRK + encryption key) returned by `PROXIMITY_KEYS_RSP`.
+    ProximityKeys {
+        irk: Option<[u8; 16]>,
+        enc_key: Option<[u8; 16]>,
+    },
     Disconnected,
 }

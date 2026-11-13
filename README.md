@@ -341,23 +341,51 @@ Linux 上没有对应机制：
 
 头追数据到手之后，下面这一步是让声音跟着头动。
 
-### 数据流
+## 🎧 头部追踪空间音频：真立体声舞台 + 三轴旋转
+
+头追数据到手之后，下面这一步是让声音在三维空间中跟着头动。
+
+macOS 空间音频的核心听感在于：声源像一对真实固定在房间前方的音箱，当头部偏航（转头）、俯仰（点头/仰头）、横滚（左右歪头）时，声音舞台始终钉在空间原位。
+
+在 RustPods 中，这一效果由 PipeWire 原生 `sofa` filter-chain 结合三维姿态投影算法完整实现：
 
 ```
-应用 ──播放──> rustpods_hrtf_in (Audio/Sink)
-                      │
-                      ├─ sofa spatializer（HRTF 卷积，Azimuth 由头姿驱动）
-                      │
-                      ▼
-               rustpods_hrtf_out (passive)
-                      │
-                      ▼
-               真实声卡 / 蓝牙耳机
+应用 ──立体声播放──> rustpods_hrtf_in (Audio/Sink)
+                            │
+               ┌────────────┴────────────┐
+               ▼                         ▼
+         左声道 (FL)               右声道 (FR)
+               │                         │
+               ▼                         ▼
+        spatL (左音箱)             spatR (右音箱)
+        基准方位: +30°             基准方位: -30° (330°)
+        [Azimuth, Elevation]      [Azimuth, Elevation]
+               │                         │
+               ├───── 双声道 HRTF 卷积 ────┤
+               ▼                         ▼
+         mixL (左耳混音)           mixR (右耳混音)
+               │                         │
+               └────────────┬────────────┘
+                            ▼
+                    rustpods_hrtf_out (passive)
+                            │
+                            ▼
+                     真实声卡 / 蓝牙耳机
 ```
 
-RustPods 以 100 Hz 读头姿，经节流后把方位角写入 filter-chain 节点的 Props。
-不需要改 PipeWire 配置来"订阅"：写入 `spat:Azimuth` 就会触发 `spatializer_reload()`，
-它在数据线程上用双缓冲换卷积器，播放不会中断。
+### 为什么之前只有单薄感，现在是真立体声？
+
+1. **真实立体声舞台（±30° 音箱对）**：
+   标准立体声监听要求一对音箱位于听者正前方 ±30°（ITU-R BS.775）。
+   旧实现把左右两路 spatializer 赋予了完全相同的方位角，导致听者正对前方时左右声道挤在 0° 正前方同一个点上（单声道声团）。
+   现在：左音箱基准位于 +30°，右音箱基准位于 -30°（330°），恢复了宽阔自然的立体声声场。
+
+2. **三轴姿态完整解算（Yaw + Pitch + Roll）**：
+   AirPods 硬件输出包含偏航、俯仰与横滚。
+   `stage_for_pose()` 将空间中固定的左右音箱三维向量经头部三轴旋转矩阵变换，动态解算出左右耳对应的 `(Azimuth, Elevation)`，并在一个 `SPA_PROP_params` Struct 中原子下发给 `spatL` 与 `spatR`：
+   * **转头 (Yaw)**：左右音箱水平环绕平移；
+   * **仰头/低头 (Pitch)**：前方的音箱在视野中产生反向的俯仰角变化（仰头时音箱在视线下方，低头时在视线上方）；
+   * **歪头 (Roll)**：靠向一侧肩膀时，音箱在双耳间产生反对称的俯仰差（靠向右肩时左音箱相对抬高、右音箱相对下沉）。
 
 ### 依赖
 
@@ -384,41 +412,53 @@ BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/clang/22/include" \
 
 不加 `--features audio-follow` 时完全不链接 PipeWire，其余功能不受影响。
 
-### 方位角的符号约定（实测，不是猜的）
+### 方位角与俯仰角的符号约定（实测验证）
 
-`plugin_sofa.c` 先对 `[Azimuth, Elevation, Radius]` 调 `mysofa_s2c()` 转笛卡尔，
-再交 `mysofa_getfilter_float()`。按这个顺序调用 `libmysofa`，用 MIT KEMAR 数据集测出：
+`plugin_sofa.c` 先对 `[Azimuth, Elevation, Radius]` 调 `mysofa_s2c()` 转笛卡尔（+X 为前，+Y 为左，+Z 为上），再交 `mysofa_getfilter_float()`：
 
-| Azimuth | 笛卡尔 (x, y, z) | 更响的耳 |
+| 角度方向 | 空间坐标 | 物理听感 |
 |---:|---|---|
-| 90 | (0.0, +1.5, 0.0) | 左 |
-| 270 | (0.0, −1.5, 0.0) | 右 |
-| 30 | (+1.3, +0.75, 0.0) | 左 |
-| 330 | (+1.3, −0.75, 0.0) | 右 |
+| Azimuth = 90° | (0.0, +1.5, 0.0) | 正左侧最响 |
+| Azimuth = 270° | (0.0, −1.5, 0.0) | 正右侧最响 |
+| Elevation = +90° | (0.0, 0.0, +1.5) | 正头顶 |
+| Elevation = −90° | (0.0, 0.0, −1.5) | 正下方 |
 
-所以 **Azimuth 逆时针递增：0 在正前，90 在左**。
-0° 和 180° 两耳能量相等（都在中轴线上），这对对称性本身也反证了测量没出错。
-
-RustPods 的 `yaw` 是"向右为正"，因此写入前要取反：转头时声源留在原地，这才是空间音频该有的行为。
+RustPods 的姿态约定：
+* `yaw > 0` 为向右转头，空间声源相对向左转（Azimuth 增加）；
+* `pitch > 0` 为向上抬头，前方声源相对向下沉（Elevation 减小）；
+* `roll > 0` 为向右歪头，左耳抬高、右耳降低，左侧声源相对下沉、右侧声源相对升高。
 
 ### 为什么要节流
 
-`spatializer_reload()` 每次都要重新解析两个 HRIR 并新建两个卷积器，是毫秒级的工作。
+`spatializer_reload()` 每次都要重新解析 HRIR 并新建卷积器，是毫秒级的工作。
 100 Hz 直接写会打满一个核，而且双缓冲换不到位。所以按 **5° 量化 + 50 ms 下限**下发：
 
 ```
-200 个头部样本（2 秒）→ 21 次写入（约 10 Hz）
+200 个头部样本（2 秒）→ 约 20 次写入（约 10 Hz）
 ```
 
 5° 小于正前方约 3.6° 的最小可辨角，步进听不出来。
 
+### 验证工具
+
+```bash
+# 验证 live 节点与 3D 舞台四控制口（spatL/spatR Azimuth + Elevation）端到端写入与回读
+BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/clang/22/include" \
+  cargo run --example verify_hrtf_client --features audio-follow
+
+# 手动读写任意单个控制口
+BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/clang/22/include" \
+  cargo run --example probe_hrtf --features audio-follow -- spatL:Elevation 15.0
+```
+
 ### 一个必须说清楚的取舍
 
-虚拟 sink 是**独立设备**，应用不会自动播放到它。需要在系统音量设置里把输出切到
-"RustPods Head-Tracked Stereo"。这跟 macOS 不同——macOS 是在系统层直接接管输出。
+虚拟 sink 是**独立设备**。当前 `audio-follow` 特性下的链路会在头追运行时改写
+WirePlumber 的 `default.audio.sink` 并在退出时还原。需要在系统音量设置里确认输出设备为
+"RustPods Head-Tracked Stereo"。
 
-要让所有应用自动走 HRTF，需要在 WirePlumber 里写默认路由规则，那是另一件事，
-目前没做。
+这跟 macOS 不同——macOS 是在系统层直接接管输出。按应用流路由（只让选中的应用进链子）
+是更贴近 macOS 的做法，目前没做。
 
 ---
 
@@ -428,6 +468,17 @@ RustPods 的 `yaw` 是"向右为正"，因此写入前要取反：转头时声�
 |---|---|
 | `tools/ht_probe.py` | 扫描 enable 的 `mode` 字节；拿不到广告时明确报错，而不是用猜测的 id 去碰运气 |
 | `tools/parse_btsnoop.py` | 解析 `btmon -w` 抓到的 btsnoop，提取其中所有 RTBuddy 帧 |
+| `examples/verify_hrtf_client.rs` | 端到端验证 3D 立体声舞台四控制口（Azimuth/Elevation）动态写入与回读 |
+| `examples/probe_hrtf.rs` | 探测并测试 PipeWire 节点 Props 中任意命名控制口 |
+
+**Linux 上 `btmon` 直接就能抓 HCI**（适配器挂在 USB 总线上时不需要任何特权绕过）：
+
+```bash
+sudo btmon -w /tmp/capture.btsnoop
+```
+
+这是排查 AACP 问题最快的手段。**早期认为「Linux 抓不到包」是错误判断**，
+为此绕道 macOS 抓包完全是浪费——记在这里，避免再犯。
 
 **Linux 上 `btmon` 直接就能抓 HCI**（适配器挂在 USB 总线上时不需要任何特权绕过）：
 

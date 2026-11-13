@@ -93,6 +93,33 @@ pub enum AskReply {
 /// and tolerates option objects or plain strings. An option object without a
 /// `label` makes the whole payload unusable: silently dropping it would
 /// shift every later nod index onto the wrong answer.
+/// Normalises text from a hook payload for display and matching.
+///
+/// Payloads carry the caller's formatting: some arrive with stray `\r` or
+/// runs of blank lines (seen live - the question card then renders a stack of
+/// empty lines). Each `\r` and `\n` becomes a single line break, so blank
+/// runs collapse and edges trim.
+fn sanitize_payload_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_nl = 0usize;
+    let mut any = false;
+    for ch in s.chars() {
+        match ch {
+            '\r' | '\n' => pending_nl += 1,
+            ' ' | '\t' if pending_nl > 0 => {}
+            _ => {
+                if pending_nl > 0 && any {
+                    out.push('\n');
+                }
+                pending_nl = 0;
+                any = true;
+                out.push(ch);
+            }
+        }
+    }
+    out
+}
+
 pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
     let questions = value
         .get("tool_input")
@@ -107,9 +134,11 @@ pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
                 let mut labels = Vec::new();
                 for o in opts {
                     match o {
-                        serde_json::Value::String(s) => labels.push(s.clone()),
+                        serde_json::Value::String(s) => labels.push(sanitize_payload_text(s)),
                         serde_json::Value::Object(_) => {
-                            labels.push(o.get("label")?.as_str()?.to_string());
+                            labels.push(sanitize_payload_text(
+                                o.get("label")?.as_str()?,
+                            ));
                         }
                         _ => return None,
                     }
@@ -119,16 +148,16 @@ pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
             _ => Vec::new(),
         };
         out.push(HookQuestion {
-            question: q
-                .get("question")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            header: q
-                .get("header")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            question: sanitize_payload_text(
+                q.get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            ),
+            header: sanitize_payload_text(
+                q.get("header")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            ),
             options,
             multi_select: q
                 .get("multiSelect")
@@ -155,35 +184,67 @@ fn decision_for_commit(count: usize, options: &[String]) -> AskReply {
 /// Renders the hook's stdout JSON for a reply.
 ///
 /// The selection is an `allow` whose `updatedInput` injects the choice as the
-/// tool's `answers` field: ZCode's AskUserQuestion refuses to execute until
-/// its input carries answers, and a plain deny leaves them missing - the UI
-/// then reports the tool call as failed (live, 2026-11-09). Allowing with the
-/// answer written into the input is exactly what the native widget does on an
-/// accept, so the question renders as answered and the reason tells the agent
-/// which choice was made. A pass-through is `ask`, which restores the normal
-/// ZCode question UI.
-fn hook_output_for(reply: &AskReply, question: &str) -> String {
+/// tool's `answers` field while preserving the original `tool_input` (`questions`,
+/// etc.): ZCode replaces `tool_input` wholesale with `updatedInput` and
+/// re-validates it against AskUserQuestion's strict `inputSchema` (which requires
+/// `questions`). Sending only `{ "answers": ... }` fails `inputSchema`
+/// validation (live, 2026-11-12). Allowing with the full input + `answers` is
+/// what the native widget produces on an accept, so the question renders as
+/// answered and the reason tells the agent which choice was made. A pass-through
+/// is `ask`, which restores the normal ZCode question UI.
+fn hook_output_for(
+    reply: &AskReply,
+    question: &str,
+    tool_input: Option<&serde_json::Value>,
+) -> String {
     match reply {
         AskReply::Select { index, label } => {
-            // answers is keyed by the question text (M0e: answers =
+            // answers is keyed by the exact question text (M0e: answers =
             // record<string>, validated non-blank; the native accept path
-            // writes {question: label}).
-            let answers = json!({ question: label });
+            // writes {question: label}). Pull the raw strings from tool_input
+            // when available so sanitizing whitespace/newlines never mismatches
+            // the key in `questions[0]`.
+            let raw_q = tool_input
+                .and_then(|t| t.get("questions"))
+                .and_then(|qs| qs.get(0));
+            let answer_key = raw_q
+                .and_then(|q| q.get("question"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(question);
+            let answer_val = raw_q
+                .and_then(|q| q.get("options"))
+                .and_then(|opts| opts.get(*index))
+                .and_then(|opt| {
+                    opt.as_str()
+                        .or_else(|| opt.get("label").and_then(|l| l.as_str()))
+                })
+                .unwrap_or(label.as_str());
+            let answers = json!({ answer_key: answer_val });
+            let updated_input = match tool_input.and_then(|v| v.as_object()) {
+                Some(obj) => {
+                    let mut merged = obj.clone();
+                    merged.insert("answers".into(), answers);
+                    serde_json::Value::Object(merged)
+                }
+                None => json!({ "answers": answers }),
+            };
+            let note = format!(
+                "【头部手势应答】用户点头 {} 次,选择第 {} 项「{}」。(RustPods 通过点头手势代答;\
+                 答案已写入工具输入的 answers 字段,直接继续即可;\
+                 并在下一条回复的第一句向用户复述这个选择,例如「已按你的点头选择:第 {} 项「{}」。」)",
+                index + 1,
+                index + 1,
+                label,
+                index + 1,
+                label
+            );
             json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "allow",
-                    "permissionDecisionReason": format!(
-                        "【头部手势应答】用户点头 {} 次,选择第 {} 项「{}」。(RustPods 通过点头手势代答;\
-                         答案已写入工具输入的 answers 字段,直接继续即可;\
-                         并在下一条回复的第一句向用户复述这个选择,例如「已按你的点头选择:第 {} 项「{}」。」)",
-                        index + 1,
-                        index + 1,
-                        label,
-                        index + 1,
-                        label
-                    ),
-                    "updatedInput": { "answers": answers },
+                    "permissionDecisionReason": note,
+                    "additionalContext": note,
+                    "updatedInput": updated_input,
                 }
             })
             .to_string()
@@ -802,9 +863,12 @@ pub async fn run_hook_mode() -> i32 {
         }
     };
 
+    let tool_input = value
+        .get("tool_input")
+        .or_else(|| value.get("questions").map(|_| &value));
     println!(
         "{}",
-        hook_output_for(&reply, &request.questions[0].question)
+        hook_output_for(&reply, &request.questions[0].question, tool_input)
     );
     0
 }
@@ -1194,21 +1258,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_questions_sanitizes_carriage_returns_and_blank_runs() {
+        // Live: some payloads arrive with stray \r and runs of blank lines;
+        // the question card rendered a stack of empty lines for them.
+        let payload: Value = serde_json::from_str(
+            r#"{"tool_input":{"questions":[{
+                "question":"第一行\r\r\r第二行\n\n\n第三行",
+                "options":["甲\r","乙\n\n"]
+            }]}}"#,
+        )
+        .unwrap();
+        let request = parse_questions(&payload).unwrap();
+        assert_eq!(request.questions[0].question, "第一行\n第二行\n第三行");
+        assert_eq!(request.questions[0].options, vec!["甲", "乙"]);
+    }
+
+    #[test]
     fn hook_output_carries_the_choice_in_updated_answers() {
+        let tool_input: Value = serde_json::json!({
+            "questions": [{
+                "question": "选哪个?",
+                "header": "选择",
+                "options": [
+                    {"label": "第一个", "description": "a"},
+                    {"label": "第二个", "description": "b"},
+                    {"label": "第三个", "description": "c"}
+                ],
+                "multiSelect": false
+            }]
+        });
         let out = hook_output_for(
             &AskReply::Select { index: 2, label: "第三个".into() },
             "选哪个?",
+            Some(&tool_input),
         );
-        assert!(out.contains("\"permissionDecision\":\"allow\""), "{out}");
-        assert!(out.contains("点头 3 次"), "{out}");
-        assert!(out.contains("第三个"), "{out}");
-        // The answer is injected as the tool's answers field, keyed by the
-        // question text - the shape the native accept path writes.
-        assert!(out.contains("updatedInput"), "{out}");
-        assert!(out.contains("\"answers\""), "{out}");
-        assert!(out.contains("\"选哪个?\":\"第三个\""), "{out}");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let hook_out = &parsed["hookSpecificOutput"];
+        assert_eq!(hook_out["permissionDecision"], "allow");
+        assert!(hook_out["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("点头 3 次"));
+        assert!(hook_out["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("点头 3 次"));
+        // updatedInput replaces the tool input wholesale in ZCode, so both
+        // `questions` and `answers` must be present to pass inputSchema
+        // validation.
+        assert_eq!(hook_out["updatedInput"]["questions"], tool_input["questions"]);
+        assert_eq!(hook_out["updatedInput"]["answers"]["选哪个?"], "第三个");
 
-        let out = hook_output_for(&AskReply::Pass, "q");
+        let out = hook_output_for(&AskReply::Pass, "q", Some(&tool_input));
         assert!(out.contains("\"permissionDecision\":\"ask\""), "{out}");
     }
 

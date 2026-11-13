@@ -1,34 +1,36 @@
-//! Head-tracked audio: pans the stereo image to follow the wearer's head.
+//! Head-tracked audio: keeps the sound stage where it is as the wearer turns.
 //!
-//! ## What this does and does not reproduce
+//! ## How the stereo stage is rendered
 //!
-//! macOS spatial audio renders stereo into binaural audio with an HRTF: each
-//! source is placed at a fixed point in space and the mix changes as the head
-//! moves. Reproducing that needs a SOFA dataset and PipeWire's `sofa` filter,
-//! which is not packaged on Fedora.
+//! macOS spatial audio places the left and right channels at fixed positions in
+//! front of the listener - a virtual loudspeaker pair at +/-30 degrees - and
+//! rotates that stage in 3D as the head turns, nods, and tilts.
 //!
-//! What is implemented here is the part that works without any extra plugin: the
-//! two output channels are re-mixed so the image follows the head. Turning left
-//! raises the left channel and lowers the right, which is the audible cue a
-//! listener expects when they turn away from a fixed source. It is a plain
-//! amplitude pan, so it will not convince anyone that the stage is in the room
-//! the way HRTF does - but it responds correctly and immediately.
+//! PipeWire's `sofa` filter-chain plugin (`pipewire-module-filter-chain-sofa`
+//! on Fedora) runs two independent spatializers (`spatL` and `spatR`), one per
+//! input channel, each exposing `Azimuth` and `Elevation` control ports. For
+//! every head pose `(yaw, pitch, roll)`, [`stage_for_pose`] transforms the two
+//! fixed speaker vectors into the head's coordinate frame and [`HrtfClient`]
+//! writes all four angles (`spatL:Azimuth`, `spatL:Elevation`, `spatR:Azimuth`,
+//! `spatR:Elevation`) in a single `SPA_PROP_params` struct.
 //!
-//! ## Why the graph is built in Rust rather than shipped as a config file
+//! [`PanState`] is the older amplitude pan. It is kept as a zero-dependency
+//! fallback and is deliberately not stacked on the HRTF chain: with convolution
+//! in the path, an extra channel gain would apply the head position twice.
 //!
-//! PipeWire can run a filter chain from a config file, and a config-driven chain
-//! was the alternative. It was rejected because the gains have to change at the
-//! sample rate of the sensor (100 Hz); rewriting a config file and reloading the
-//! node would stall the audio and land far outside that budget. Holding the node
-//! and updating its control ports directly keeps the update under a millisecond.
+//! ## Why the graph is shipped as a config file
+//!
+//! The filter graph is declared in `contrib/pipewire/99-rustpods-hrtf.conf`,
+//! not built from Rust. What has to happen at the sensor rate is updating
+//! control values, and that is a Props write on the bound capture node - never
+//! a config reload, which would stall the audio far outside the budget.
 //!
 //! ## Packaging cost, stated plainly
 //!
-//! Linking libpipewire means the build needs `libpipewire-0.3` headers and,
-//! because `pipewire-sys` runs bindgen, `libclang`. That is a real cost for
-//! packagers and it is why this file is the only place in the project that
-//! touches PipeWire: everything else still builds against GTK alone, and this
-//! module is behind a feature flag so a package can be built without it.
+//! Linking libpipewire needs `libpipewire-0.3` headers and, because
+//! `pipewire-sys` runs bindgen, `libclang`. That cost is why this module sits
+//! behind the `audio-follow` feature and is the only place in the project that
+//! touches PipeWire.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -197,6 +199,212 @@ fn angle_between(a: f32, b: f32) -> f32 {
     }
 }
 
+/// Shortest angular distance between two angles, in degrees, in `[0, 180]`.
+///
+/// A plain subtraction would call a one-degree wobble across the +/-180 seam a
+/// 359-degree turn and retune on every sensor sample.
+fn axis_distance(a: f32, b: f32) -> f32 {
+    let diff = (a - b).abs() % 360.0;
+    if diff > 180.0 { 360.0 - diff } else { diff }
+}
+
+/// Rest azimuth of the virtual left speaker, in degrees (`+30`, front-left).
+///
+/// Standard ITU-R BS.775 stereo loudspeaker pair: +/-30 degrees from straight
+/// ahead. Driving both spatializers with the same 0-degree azimuth collapses
+/// the stage into a single point in front of the nose.
+pub const SPEAKER_LEFT_AZIMUTH_DEG: f32 = 30.0;
+
+/// Rest azimuth of the virtual right speaker, in degrees (`330` = `-30`, front-right).
+pub const SPEAKER_RIGHT_AZIMUTH_DEG: f32 = 330.0;
+
+/// Spherical coordinates (in degrees) for the left and right sofa spatializers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StageAngles {
+    /// `spatL:Azimuth` in `[0, 360)`.
+    pub left_azimuth: f32,
+    /// `spatL:Elevation` in `[-90, 90]`.
+    pub left_elevation: f32,
+    /// `spatR:Azimuth` in `[0, 360)`.
+    pub right_azimuth: f32,
+    /// `spatR:Elevation` in `[-90, 90]`.
+    pub right_elevation: f32,
+}
+
+impl StageAngles {
+    /// Rest position of the stereo pair when the head is neutral or untracked.
+    pub const CENTRE: Self = Self {
+        left_azimuth: SPEAKER_LEFT_AZIMUTH_DEG,
+        left_elevation: 0.0,
+        right_azimuth: SPEAKER_RIGHT_AZIMUTH_DEG,
+        right_elevation: 0.0,
+    };
+}
+
+impl Default for StageAngles {
+    fn default() -> Self {
+        Self::CENTRE
+    }
+}
+
+/// Computes `(azimuth, elevation)` in degrees for a room-fixed horizontal
+/// speaker at `speaker_offset_deg` (anti-clockwise from front: `+30` left,
+/// `-30` right) under a 3-axis head pose `(yaw_deg, pitch_deg, roll_deg)`.
+///
+/// ## Coordinate conventions
+///
+/// `plugin_sofa.c` passes `[Azimuth, Elevation, Radius]` to `mysofa_s2c`:
+/// * `+X` is straight ahead (`Azimuth = 0, Elevation = 0`),
+/// * `+Y` is left (`Azimuth = 90, Elevation = 0`),
+/// * `+Z` is up (`Elevation = +90`).
+///
+/// In `HeadPose`:
+/// * `yaw_deg > 0` turns the head right (clockwise from above), so a fixed
+///   source rotates by `-yaw_deg` around `+Z` — matching [`azimuth_for_yaw`]
+///   exactly when `pitch` and `roll` are zero;
+/// * `pitch_deg > 0` tilts the head up, so a source in front (`+X`) moves down
+///   (`-Z`, negative elevation) in the head frame;
+/// * `roll_deg > 0` tilts the head toward the right shoulder, lifting the left
+///   ear (`+Y`) and dropping the right ear (`-Y`), so in head coordinates a
+///   left-side source moves down in elevation and a right-side source moves up.
+pub fn speaker_for_pose(
+    speaker_offset_deg: f32,
+    yaw_deg: f32,
+    pitch_deg: f32,
+    roll_deg: f32,
+) -> (f32, f32) {
+    let yaw = if yaw_deg.is_finite() { yaw_deg } else { 0.0 };
+    let pitch = if pitch_deg.is_finite() {
+        pitch_deg.clamp(-90.0, 90.0)
+    } else {
+        0.0
+    };
+    let roll = if roll_deg.is_finite() {
+        roll_deg.clamp(-90.0, 90.0)
+    } else {
+        0.0
+    };
+
+    // 1. Yaw in the horizontal plane around +Z.
+    let alpha = (speaker_offset_deg - yaw).to_radians();
+    let (y1, x1) = alpha.sin_cos();
+
+    // 2. Pitch around the head's lateral axis (+Y).
+    let (sin_p, cos_p) = pitch.to_radians().sin_cos();
+    let x2 = x1 * cos_p;
+    let y2 = y1;
+    let z2 = -x1 * sin_p;
+
+    // 3. Roll around the head's forward axis (+X).
+    let (sin_r, cos_r) = roll.to_radians().sin_cos();
+    let x3 = x2;
+    let y3 = y2 * cos_r + z2 * sin_r;
+    let z3 = -y2 * sin_r + z2 * cos_r;
+
+    let elevation = z3.clamp(-1.0, 1.0).asin().to_degrees();
+    let azimuth = if x3 * x3 + y3 * y3 < 1e-12 {
+        (speaker_offset_deg - yaw).rem_euclid(360.0)
+    } else {
+        y3.atan2(x3).to_degrees().rem_euclid(360.0)
+    };
+    (azimuth, elevation)
+}
+
+/// Computes the 3D spherical coordinates of both virtual stereo speakers
+/// (`+30` left, `-30` right) for a head pose `(yaw, pitch, roll)` in degrees.
+pub fn stage_for_pose(yaw_deg: f32, pitch_deg: f32, roll_deg: f32) -> StageAngles {
+    let (left_azimuth, left_elevation) =
+        speaker_for_pose(SPEAKER_LEFT_AZIMUTH_DEG, yaw_deg, pitch_deg, roll_deg);
+    let (right_azimuth, right_elevation) =
+        speaker_for_pose(-SPEAKER_LEFT_AZIMUTH_DEG, yaw_deg, pitch_deg, roll_deg);
+    StageAngles {
+        left_azimuth,
+        left_elevation,
+        right_azimuth,
+        right_elevation,
+    }
+}
+
+/// Decides when the 3-axis stereo stage needs retuning in PipeWire.
+///
+/// Every update rebuilds the two sofa convolvers, so this applies the same
+/// [`AZIMUTH_STEP_DEG`] deadband and [`MIN_UPDATE_INTERVAL_MS`] rate floor as
+/// [`AzimuthSchedule`], but tests all three head axes (`yaw`, `pitch`, `roll`)
+/// so nodding or tilting with a steady yaw still updates the stage.
+#[derive(Debug)]
+pub struct StageSchedule {
+    pose: [f32; 3],
+    written: StageAngles,
+    last_write_ms: Option<u64>,
+    forced: bool,
+}
+
+impl Default for StageSchedule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StageSchedule {
+    pub fn new() -> Self {
+        Self {
+            pose: [0.0; 3],
+            written: StageAngles::CENTRE,
+            last_write_ms: None,
+            // Ensure the initial +/-30 degree stereo stage is pushed on the
+            // first sample even when the head starts centred.
+            forced: true,
+        }
+    }
+
+    /// The stage angles most recently committed.
+    pub fn written(&self) -> StageAngles {
+        self.written
+    }
+
+    /// Whether any axis in `pose` (`[yaw, pitch, roll]`) has moved by at least
+    /// [`AZIMUTH_STEP_DEG`] and [`MIN_UPDATE_INTERVAL_MS`] has elapsed.
+    pub fn should_update(&self, pose: [f32; 3], now_ms: u64) -> bool {
+        if pose.iter().any(|v| !v.is_finite()) {
+            return false;
+        }
+        if self.forced {
+            return true;
+        }
+        let moved = pose
+            .iter()
+            .zip(self.pose.iter())
+            .any(|(a, b)| axis_distance(*a, *b) >= AZIMUTH_STEP_DEG);
+        if !moved {
+            return false;
+        }
+        match self.last_write_ms {
+            None => true,
+            Some(last) => now_ms.saturating_sub(last) >= MIN_UPDATE_INTERVAL_MS,
+        }
+    }
+
+    /// Records `pose` (`[yaw, pitch, roll]`) as written and returns the
+    /// resulting [`StageAngles`] for both virtual speakers.
+    pub fn commit(&mut self, pose: [f32; 3], now_ms: u64) -> StageAngles {
+        let stage = stage_for_pose(pose[0], pose[1], pose[2]);
+        self.pose = pose;
+        self.written = stage;
+        self.last_write_ms = Some(now_ms);
+        self.forced = false;
+        stage
+    }
+
+    /// Resets the schedule to the centred +/-30 degree stereo stage and forces
+    /// the next update through.
+    pub fn reset(&mut self) {
+        self.pose = [0.0; 3];
+        self.written = StageAngles::CENTRE;
+        self.last_write_ms = None;
+        self.forced = true;
+    }
+}
+
 /// Shared, lock-free pan value in millibels.
 ///
 /// The audio callback and the sensor loop run on different threads and must not
@@ -287,14 +495,14 @@ impl Default for FilterPlan {
 #[cfg(feature = "audio-follow")]
 pub use pipewire_link::{HrtfClient, HrtfCommand};
 
-/// The PipeWire side: binds the filter-chain node and writes azimuth to it.
+/// The PipeWire side: binds the filter-chain node and writes stage angles to it.
 ///
 /// ## Why a thread and a channel
 ///
 /// PipeWire's `MainLoop` is reference counted and not `Send`, so it cannot be
 /// shared with the sensor loop. The standard arrangement from the crate's own
 /// docs applies: the loop owns a thread, and a [`pw::channel`] carries commands
-/// into it. The sensor loop never blocks on PipeWire; it just sends a float.
+/// into it. The sensor loop never blocks on PipeWire; it just sends a struct.
 ///
 /// ## Why the node is bound, not created
 ///
@@ -316,25 +524,30 @@ mod pipewire_link {
     use pw::spa::param::ParamType;
     use pw::spa::pod::{Pod, Property, Value};
 
-    use super::FilterPlan;
+    use super::{FilterPlan, StageAngles};
 
     /// SPA_PROP_params: SPA_PROP_START_Other (0x80000) + 1.
     const SPA_PROP_PARAMS: u32 = 0x80001;
 
-    /// Control name for the sofa spatializers' azimuth.
-    ///
-    /// filter-graph prefixes a control port with the node name from
-    /// `filter.graph.nodes[].name`. The shipped config now runs two
-    /// spatializers - one per input channel, so the stereo image survives -
-    /// named `spatL` and `spatR`, and both get the same azimuth: the whole
-    /// stage rotates as one, which is what keeps a source pinned in the room.
+    /// Control names for the two sofa spatializers' azimuth.
     const CONTROL_AZIMUTH: [&str; 2] = ["spatL:Azimuth", "spatR:Azimuth"];
+
+    /// Control names for the full 3D stereo stage (azimuth + elevation per ear).
+    const CONTROL_STAGE: [&str; 4] = [
+        "spatL:Azimuth",
+        "spatL:Elevation",
+        "spatR:Azimuth",
+        "spatR:Elevation",
+    ];
 
     /// A message for the PipeWire thread.
     #[derive(Debug, Clone, Copy)]
     pub enum HrtfCommand {
-        /// Write this azimuth, in degrees.
+        /// Write a shared azimuth to both spatializers, in degrees.
         Azimuth(f32),
+        /// Write distinct 3D spherical coordinates to the left and right
+        /// spatializers (`spatL` and `spatR`).
+        Stage(StageAngles),
         /// Stop the loop and end the thread.
         Quit,
     }
@@ -383,14 +596,32 @@ mod pipewire_link {
             self.running.load(Ordering::Relaxed)
         }
 
-        /// Queues an azimuth. Never blocks and never fails loudly: the sensor loop
-        /// calls this at sensor rate and must not care if audio is unavailable.
+        /// Queues a shared azimuth for both spatializers.
         pub fn set_azimuth(&self, azimuth_deg: f32) {
             if !azimuth_deg.is_finite() {
                 return;
             }
             if let Some(sender) = &self.sender {
                 let _ = sender.send(HrtfCommand::Azimuth(azimuth_deg));
+            }
+        }
+
+        /// Queues 3D spherical coordinates for the left and right virtual
+        /// speakers (`spatL` and `spatR`). Never blocks.
+        pub fn set_stage(&self, stage: StageAngles) {
+            if ![
+                stage.left_azimuth,
+                stage.left_elevation,
+                stage.right_azimuth,
+                stage.right_elevation,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+            {
+                return;
+            }
+            if let Some(sender) = &self.sender {
+                let _ = sender.send(HrtfCommand::Stage(stage));
             }
         }
 
@@ -484,7 +715,6 @@ mod pipewire_link {
             let current = Rc::clone(&current_sink);
             let saved = Rc::clone(&saved_sink);
             let done = Rc::clone(&routed);
-            let name = expected_node.clone();
             let ensure = ensure_route.clone();
             move |m: &pw::metadata::Metadata| -> pw::metadata::MetadataListener {
                 let done = Rc::clone(&done);
@@ -600,7 +830,8 @@ mod pipewire_link {
                     Err(_) => return,
                 };
                 let Some(node) = slot.as_ref() else { return };
-                match props_pod(&CONTROL_AZIMUTH, deg) {
+                let pairs = [(CONTROL_AZIMUTH[0], deg), (CONTROL_AZIMUTH[1], deg)];
+                match props_pod(&pairs) {
                     Ok(bytes) => {
                         if let Some(pod) = Pod::from_bytes(&bytes) {
                             node.set_param(ParamType::Props, 0, pod);
@@ -608,6 +839,40 @@ mod pipewire_link {
                         }
                     }
                     Err(e) => warn!("Could not serialise azimuth: {}", e),
+                }
+            }
+            HrtfCommand::Stage(stage) => {
+                if let Some(m) = default_meta.borrow().as_ref() {
+                    if meta_listener_cb.borrow().is_none() {
+                        *meta_listener_cb.borrow_mut() = Some(attach_fn_cb(m));
+                    }
+                    ensure_route();
+                }
+                let slot = match node_slot.try_borrow() {
+                    Ok(slot) => slot,
+                    Err(_) => return,
+                };
+                let Some(node) = slot.as_ref() else { return };
+                let pairs = [
+                    (CONTROL_STAGE[0], stage.left_azimuth),
+                    (CONTROL_STAGE[1], stage.left_elevation),
+                    (CONTROL_STAGE[2], stage.right_azimuth),
+                    (CONTROL_STAGE[3], stage.right_elevation),
+                ];
+                match props_pod(&pairs) {
+                    Ok(bytes) => {
+                        if let Some(pod) = Pod::from_bytes(&bytes) {
+                            node.set_param(ParamType::Props, 0, pod);
+                            debug!(
+                                "Stage -> L({:.1}, {:.1}) R({:.1}, {:.1})",
+                                stage.left_azimuth,
+                                stage.left_elevation,
+                                stage.right_azimuth,
+                                stage.right_elevation
+                            );
+                        }
+                    }
+                    Err(e) => warn!("Could not serialise stage angles: {}", e),
                 }
             }
             HrtfCommand::Quit => {
@@ -647,9 +912,9 @@ mod pipewire_link {
         Ok(())
     }
 
-    /// Serialises `SPA_TYPE_OBJECT_Props { SPA_PROP_params: Struct(name, value) }`
-    /// for every control in `names`, all set to `value`.
-    fn props_pod(names: &[&str; 2], value: f32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    /// Serialises `SPA_TYPE_OBJECT_Props { SPA_PROP_params: Struct(name, value, ...) }`
+    /// for every `(name, value)` pair in `pairs`.
+    fn props_pod(pairs: &[(&str, f32)]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         use pw::spa::pod::Object;
 
         let object = Object {
@@ -658,13 +923,10 @@ mod pipewire_link {
             properties: vec![Property::new(
                 SPA_PROP_PARAMS,
                 Value::Struct(
-                    names
+                    pairs
                         .iter()
-                        .flat_map(|name| {
-                            [
-                                Value::String((*name).to_string()),
-                                Value::Float(value),
-                            ]
+                        .flat_map(|(name, value)| {
+                            [Value::String((*name).to_string()), Value::Float(*value)]
                         })
                         .collect(),
                 ),
@@ -907,5 +1169,161 @@ mod tests {
         // The amplitude pan is a fallback with its own, coarser full-scale angle;
         // the HRTF path is accurate and must not inherit it.
         assert!(FULL_PAN_DEG > AZIMUTH_STEP_DEG * 2.0);
+    }
+
+    // --- 3D stereo stage (L/R +/-30° + yaw/pitch/roll) ---------------------
+
+    #[test]
+    fn neutral_pose_places_speakers_at_plus_and_minus_30_degrees() {
+        let stage = stage_for_pose(0.0, 0.0, 0.0);
+        assert!(
+            (stage.left_azimuth - 30.0).abs() < 1e-4,
+            "left speaker should sit at +30 deg, got {}",
+            stage.left_azimuth
+        );
+        assert!(
+            (stage.right_azimuth - 330.0).abs() < 1e-4,
+            "right speaker should sit at 330 (-30) deg, got {}",
+            stage.right_azimuth
+        );
+        assert!(stage.left_elevation.abs() < 1e-4);
+        assert!(stage.right_elevation.abs() < 1e-4);
+    }
+
+    #[test]
+    fn pure_yaw_matches_the_verified_azimuth_convention() {
+        // With pitch and roll at zero, a 0-degree centre speaker must match
+        // `azimuth_for_yaw` bit-for-bit, and the +/-30 speakers must shift by
+        // the exact same -yaw offset.
+        for yaw in [-90.0, -30.0, 0.0, 30.0, 90.0, 180.0] {
+            let (centre_az, centre_el) = speaker_for_pose(0.0, yaw, 0.0, 0.0);
+            assert!(
+                angle_between(centre_az, azimuth_for_yaw(yaw)) < 1e-3,
+                "yaw {}: speaker_for_pose(0) gave {}, azimuth_for_yaw gave {}",
+                yaw,
+                centre_az,
+                azimuth_for_yaw(yaw)
+            );
+            assert!(centre_el.abs() < 1e-4);
+
+            let stage = stage_for_pose(yaw, 0.0, 0.0);
+            assert!(
+                angle_between(stage.left_azimuth, (30.0 - yaw).rem_euclid(360.0)) < 1e-3
+            );
+            assert!(
+                angle_between(stage.right_azimuth, (-30.0 - yaw).rem_euclid(360.0)) < 1e-3
+            );
+        }
+    }
+
+    #[test]
+    fn looking_up_moves_the_front_stage_down_in_elevation() {
+        // Positive pitch is looking up; a fixed speaker pair in front of the
+        // listener must move to negative elevation in the head frame.
+        let stage = stage_for_pose(0.0, 20.0, 0.0);
+        assert!(
+            stage.left_elevation < -15.0 && stage.right_elevation < -15.0,
+            "expected negative elevation when looking up, got L={} R={}",
+            stage.left_elevation,
+            stage.right_elevation
+        );
+        assert!(
+            (stage.left_elevation - stage.right_elevation).abs() < 1e-4,
+            "symmetric pitch must move both speakers equally"
+        );
+    }
+
+    #[test]
+    fn tilting_head_right_splits_speaker_elevations_antisymmetrically() {
+        // Positive roll tilts the head toward the right shoulder (left ear up,
+        // right ear down), so in head coordinates the left speaker drops and
+        // the right speaker rises by the same magnitude.
+        let stage = stage_for_pose(0.0, 0.0, 20.0);
+        assert!(
+            stage.left_elevation < -5.0 && stage.right_elevation > 5.0,
+            "expected L<0 and R>0 on right roll, got L={} R={}",
+            stage.left_elevation,
+            stage.right_elevation
+        );
+        assert!((stage.left_elevation + stage.right_elevation).abs() < 1e-4);
+    }
+
+    #[test]
+    fn non_finite_pose_inputs_fall_back_to_neutral_axis() {
+        let stage = stage_for_pose(f32::NAN, f32::INFINITY, f32::NEG_INFINITY);
+        assert!((stage.left_azimuth - 30.0).abs() < 1e-4);
+        assert!((stage.right_azimuth - 330.0).abs() < 1e-4);
+        assert!(stage.left_elevation.abs() < 1e-4);
+        assert!(stage.right_elevation.abs() < 1e-4);
+    }
+
+    // --- three-axis scheduling ----------------------------------------------
+
+    #[test]
+    fn stage_schedule_starts_forced_so_initial_stereo_pair_is_pushed() {
+        let sched = StageSchedule::new();
+        assert!(sched.should_update([0.0, 0.0, 0.0], 1_000));
+    }
+
+    #[test]
+    fn nodding_or_tilting_alone_triggers_a_stage_update() {
+        let mut sched = StageSchedule::new();
+        sched.commit([0.0, 0.0, 0.0], 1_000);
+        assert!(sched.should_update([0.0, 15.0, 0.0], 1_100));
+        assert!(sched.should_update([0.0, 0.0, 15.0], 1_100));
+    }
+
+    #[test]
+    fn sub_step_jitter_on_every_axis_is_ignored() {
+        let mut sched = StageSchedule::new();
+        sched.commit([10.0, 10.0, 10.0], 1_000);
+        assert!(!sched.should_update([12.0, 12.0, 12.0], 1_100));
+    }
+
+    #[test]
+    fn stage_schedule_respects_the_rebuild_rate_floor() {
+        let mut sched = StageSchedule::new();
+        sched.commit([0.0, 0.0, 0.0], 1_000);
+        assert!(!sched.should_update(
+            [45.0, 0.0, 0.0],
+            1_000 + MIN_UPDATE_INTERVAL_MS - 1
+        ));
+        assert!(sched.should_update(
+            [45.0, 0.0, 0.0],
+            1_000 + MIN_UPDATE_INTERVAL_MS
+        ));
+    }
+
+    #[test]
+    fn stage_schedule_wraps_cleanly_across_plus_minus_180() {
+        let mut sched = StageSchedule::new();
+        sched.commit([179.0, 0.0, 0.0], 1_000);
+        // 2 degrees across the +/-180 seam is inside the 5-degree step.
+        assert!(!sched.should_update([-179.0, 0.0, 0.0], 1_100));
+        // A 15-degree turn across the seam must trigger an update.
+        assert!(sched.should_update([-166.0, 0.0, 0.0], 1_100));
+    }
+
+    #[test]
+    fn axis_distance_takes_the_short_way_round() {
+        assert!(axis_distance(179.8, -179.8) < 0.5);
+        assert!((axis_distance(0.0, 90.0) - 90.0).abs() < 1e-4);
+        assert!((axis_distance(-90.0, 90.0) - 180.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn stage_reset_restores_centre_and_forces_next_write() {
+        let mut sched = StageSchedule::new();
+        sched.commit([40.0, 15.0, -10.0], 1_000);
+        sched.reset();
+        assert_eq!(sched.written(), StageAngles::CENTRE);
+        assert!(sched.should_update([0.0, 0.0, 0.0], 1_010));
+    }
+
+    #[test]
+    fn non_finite_pose_is_never_scheduled() {
+        let sched = StageSchedule::new();
+        assert!(!sched.should_update([f32::NAN, 0.0, 0.0], 1_000));
+        assert!(!sched.should_update([0.0, f32::INFINITY, 0.0], 1_000));
     }
 }

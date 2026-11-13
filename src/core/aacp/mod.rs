@@ -13,6 +13,7 @@ use packets::*;
 use crate::core::aacp::events::EarStatus;
 use crate::core::head_tracking::{HeadGesture, HeadPose, HeadTracker};
 use crate::core::spatial::{SpatialClaim, SpatialMode, SpatialSession};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
@@ -20,6 +21,10 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Before the first reply arrives from the accessory, a silent L2CAP socket
+/// usually means we connected mid-BR/EDR bring-up and the accessory ignored
+/// the handshake. Fail fast in 3s instead of sitting silent for 12s.
+const INITIAL_RESPONSE_WATCHDOG: Duration = Duration::from_secs(3);
 /// A dead L2CAP link does not necessarily close the socket, so the receive
 /// loop's read carries this watchdog: past it, the link is treated as gone
 /// and the normal disconnect cleanup runs. Must comfortably exceed the
@@ -76,6 +81,7 @@ pub struct AacpManager {
     /// macOS only sends the enable once an app has claimed spatial audio in
     /// head-tracked mode, so the enable path is gated on this the same way.
     spatial: Arc<Mutex<SpatialSession>>,
+    head_tracking_starting: Arc<AtomicBool>,
 }
 
 
@@ -84,6 +90,32 @@ const SOL_BLUETOOTH: libc::c_int = 274;
 const BT_SECURITY: libc::c_int = 4;
 /// `BT_SECURITY_MEDIUM`: request an encrypted (or higher) link.
 const BT_SECURITY_MEDIUM: libc::c_int = 2;
+
+/// `BT_POWER` / `force_active` socket option, from the kernel's `bluetooth.h`.
+const BT_POWER: libc::c_int = 9;
+const BT_POWER_FORCE_ACTIVE_ON: u8 = 1;
+
+/// Requests the kernel to keep the Bluetooth ACL link in Active Mode, preventing
+/// the controller from placing it into power-saving Sniff Mode which throttles
+/// the L2CAP polling rate down to ~30 Hz.
+fn request_force_active(fd_owner: &impl std::os::unix::io::AsRawFd) {
+    let active: u8 = BT_POWER_FORCE_ACTIVE_ON;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd_owner.as_raw_fd(),
+            SOL_BLUETOOTH,
+            BT_POWER,
+            (&active as *const u8).cast(),
+            std::mem::size_of_val(&active) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        debug!("Requested BT_POWER_FORCE_ACTIVE_ON on the AACP socket");
+    } else {
+        let err = std::io::Error::last_os_error();
+        debug!("Could not set BT_POWER force_active (continuing): {}", err);
+    }
+}
 
 /// Raises the requested link security on a Bluetooth L2CAP socket.
 ///
@@ -211,7 +243,12 @@ impl AacpManager {
             head_status: Arc::new(Mutex::new("head tracking not started".to_string())),
             remotes: Arc::new(Mutex::new(remotehid::DeviceRegistry::new())),
             spatial: Arc::new(Mutex::new(SpatialSession::new())),
+            head_tracking_starting: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub async fn has_motion_device(&self) -> bool {
+        self.remotes.lock().await.motion_device().is_some()
     }
 
     /// Latest head pose, or `None` while no stream is running.
@@ -304,6 +341,7 @@ impl AacpManager {
         // with EACCES, or the accessory silently ignores sensor commands on the
         // resulting link.
         raise_link_security(&socket);
+        request_force_active(&socket);
         // The MTU has to be in place before the L2CAP configuration exchange:
         // with the default 672 the accessory omits devmotion6 entirely.
         raise_receive_mtu(&socket);
@@ -330,6 +368,8 @@ impl AacpManager {
             }
             sleep(POLL_INTERVAL).await;
         }
+
+        request_force_active(&*seq_packet);
 
         info!("L2CAP AACP connected to {}", addr);
 
@@ -375,6 +415,12 @@ impl AacpManager {
             // Log the first sensor frame, then only the occasional one: the
             // stream runs at ~50 Hz and would otherwise bury everything else.
             let mut sensor_frames: u64 = 0;
+            // Rate limit for the ear-status re-query while the cache is empty.
+            let mut last_ear_query = None::<tokio::time::Instant>;
+            // Throttle for the "gate dropped a sample" log, so an unworn unit
+            // does not flood the log at wire rate.
+            let mut gate_logged_at = None::<std::time::Instant>;
+            let mut received_any_packet = false;
             loop {
                 // A dead L2CAP link does not necessarily close the socket:
                 // buds out of range or grabbed by another host leave this
@@ -383,19 +429,26 @@ impl AacpManager {
                 // battery, ear detection, telemetry - froze exactly like
                 // this. A read watchdog turns the silent death into the
                 // normal disconnect path, where reconnect logic takes over.
-                let read = tokio::time::timeout(RECV_WATCHDOG, seq_packet_recv.recv(&mut buf));
+                let watchdog = if received_any_packet {
+                    RECV_WATCHDOG
+                } else {
+                    INITIAL_RESPONSE_WATCHDOG
+                };
+                let read = tokio::time::timeout(watchdog, seq_packet_recv.recv(&mut buf));
                 let reply = match read.await {
                     Ok(reply) => reply,
                     Err(_) => {
                         warn!(
-                            "AACP link silent for {}s; treating it as disconnected",
-                            RECV_WATCHDOG.as_secs()
+                            "AACP link silent for {}s (received_any={}); treating it as disconnected",
+                            watchdog.as_secs(),
+                            received_any_packet
                         );
                         break;
                     }
                 };
                 match reply {
                     Ok(len) if len > 0 => {
+                        received_any_packet = true;
                         let packet = &buf[..len];
                         if len > 4 && packet[4] == 0x17 {
                             if routes_to_xml(packet) {
@@ -482,28 +535,54 @@ impl AacpManager {
                             } else if sensor_frames % 500 == 0 {
                                 debug!("Head tracking: {} samples received", sensor_frames);
                             }
-                            // Attitude only means something while at least one
-                            // bud is in an ear. Off-ear the buds tumble in a
-                            // pocket or on the desk, and feeding that garbage
-                            // to the integrator wrecks both the pose and the
-                            // gravity anchor's captured neutral - the user
-                            // watched the compass jump wildly after every
-                            // re-seat. Gate on the ear cache; while nobody is
-                            // wearing, report the disconnect sentinel and skip
-                            // parsing entirely (the integrator keeps its state
-                            // for the moment they put them back on).
-                            let worn = ear_cache
-                                .lock()
-                                .await
-                                .map(|(l, r)| {
-                                    l == EarStatus::InEar || r == EarStatus::InEar
-                                })
-                                .unwrap_or(false);
-                            if !worn {
+                            // Attitude only means something while the buds are
+                            // actually worn. Off-ear they tumble in a pocket or
+                            // on a desk, and feeding that to the integrator
+                            // wrecks both the pose and the gravity anchor's
+                            // captured neutral.
+                            //
+                            // Two rules, both paid for with a live failure:
+                            // * Fail OPEN while the status is unknown. Ear
+                            //   detection is change-driven; dropping samples
+                            //   before the first notification froze the compass
+                            //   on a healthy stream.
+                            // * Require BOTH buds in ear once the status is
+                            //   known. The motion stream comes from whichever
+                            //   bud the accessory elected, and a single out-ear
+                            //   notification says nothing about that one - a
+                            //   wearer who took both buds out still saw the
+                            //   compass run because the other bud kept
+                            //   reporting InEar.
+                            let ear_now = *ear_cache.lock().await;
+                            let blocked = ear_now.is_some_and(|(l, r)| {
+                                l != EarStatus::InEar || r != EarStatus::InEar
+                            });
+                            if blocked {
                                 let mut tracker = tracker.lock().await;
                                 tracker.active = false;
                                 let _ = head_feed.send(None);
+                                if gate_logged_at
+                                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+                                {
+                                    gate_logged_at = Some(std::time::Instant::now());
+                                    info!(
+                                        "Head-tracking gate: buds not worn ({:?}); samples paused",
+                                        ear_now
+                                    );
+                                }
                                 continue;
+                            }
+                            if ear_now.is_none()
+                                && last_ear_query
+                                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5))
+                            {
+                                // The status notification may have landed before
+                                // anything was listening, or never come at all.
+                                // Re-ask periodically instead of guessing forever.
+                                last_ear_query = Some(tokio::time::Instant::now());
+                                let _ = seq_packet_recv
+                                    .send(&make_notification_request_packet())
+                                    .await;
                             }
                             // Feed the tracker at wire rate; consumers pull the
                             // latest pose instead of every sample.
@@ -585,6 +664,12 @@ impl AacpManager {
         // Initialize handshake sequence
         if handshake {
             self.init_handshake().await?;
+            // Ask for the current status once the handshake is done. The
+            // accessory pushes battery/ear state early - sometimes before
+            // this side is ready to cache it - and ear detection is
+            // change-driven, so without this re-request the ear cache can
+            // stay empty for the whole session.
+            let _ = self.request_battery_and_status().await;
         }
 
         Ok(())
@@ -857,8 +942,22 @@ impl AacpManager {
         let status = Arc::clone(&self.head_status);
         let remotes = Arc::clone(&self.remotes);
         let address = self.state.read().await.airpods_address;
+        let starting = Arc::clone(&self.head_tracking_starting);
+
+        if starting.swap(true, Ordering::SeqCst) {
+            debug!("Head tracking negotiation already in progress");
+            return Ok(());
+        }
 
         tokio::spawn(async move {
+            struct Guard(Arc<AtomicBool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _guard = Guard(starting);
+
             if tracker.lock().await.samples_seen() > 0 {
                 debug!("Head tracking already streaming");
                 return;

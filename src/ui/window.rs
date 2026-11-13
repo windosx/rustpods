@@ -1,458 +1,567 @@
-use super::components::agents::build_agents_page;
-use super::components::battery::{build_battery_card, update_battery_widgets, BatteryViewWidgets};
-use super::components::headtracking::{build_head_tracking_page, HeadTrackingWidgets};
-use super::components::hero::build_hero_card;
-use super::components::noise::build_noise_control_card;
-use super::components::preferences::build_preferences_page;
-use super::components::settings::build_smart_settings_group;
-use super::components::zcode_ask::{build_zcode_ask_card, ZcodeAskWidgets};
-use crate::core::aacp::commands::{MicrophoneMode, NoiseControlMode};
-use crate::core::device::AirPodsDeviceState;
-use crate::core::models::AirPodsModel;
-use crate::system::config::{AppConfig, PauseBehavior};
-use gtk4::prelude::*;
-use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow, Stack};
-use libadwaita::prelude::*;
-use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView};
-use std::cell::Cell;
-use std::sync::Arc;
+use crate::core::aacp::commands::MicrophoneMode;
+use crate::system::config::PauseBehavior;
+use crate::ui::components::{
+    agents::render_agents_page, battery::render_battery_card, headtracking::render_head_tracking_card,
+    hero::render_hero_card, noise::render_noise_control_card,
+    preferences::render_preferences_page, settings::render_settings_page,
+    zcode_ask::render_zcode_ask_card,
+};
+use crate::ui::state::{NavPage, RustPodsState};
+use crate::ui::theme::{apply_apple_theme, palette};
+use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants as _};
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::select::{SelectEvent, SelectState};
+use gpui_kit::component::slider::{SliderEvent, SliderState, SliderValue};
+use gpui_kit::component::{Icon, IndexPath, ThemeMode, TitleBar};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    div, px, size, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
+    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions,
+};
+use std::time::Duration;
 
-/// A card that is rebuilt wholesale when the connected device's model changes.
-///
-/// The noise card and the settings group branch on the device model at build
-/// time (ANC segmented control vs the half-in-ear banner, case-chime row vs
-/// nothing), and those branches cannot be flipped on an existing widget tree.
-/// The slot holds exactly one child; [`sync`](Self::sync) swaps in a fresh
-/// card whenever the model differs from the one the current child was built
-/// for. A real device replacing the build-time placeholder is the case that
-/// matters: without this, a Pro/Max unit inherits whatever the placeholder
-/// was built with, and the noise controls never appear.
-pub struct RebuildableCard {
-    slot: Box,
-    model: Cell<Option<AirPodsModel>>,
-    rebuild: std::boxed::Box<dyn Fn(&AirPodsDeviceState)>,
+pub fn window_options(cx: &App) -> WindowOptions {
+    let mut opts = WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(820.), px(730.)), cx)),
+        window_min_size: Some(size(px(680.), px(560.))),
+        app_id: Some("io.github.rustpods.RustPods".to_string()),
+        ..TitleBar::window_options()
+    };
+    opts.titlebar = Some(TitlebarOptions {
+        title: Some("RustPods".into()),
+        ..TitleBar::title_bar_options()
+    });
+    opts
 }
 
-impl RebuildableCard {
-    fn new(
-        slot: Box,
-        initial: &AirPodsDeviceState,
-        build: impl Fn(&AirPodsDeviceState) -> gtk4::Widget + 'static,
+pub struct MainWindow {
+    app_state: Entity<RustPodsState>,
+    rename_input: Entity<InputState>,
+    adaptive_slider: Entity<SliderState>,
+    pause_select: Entity<SelectState<Vec<&'static str>>>,
+    mic_select: Entity<SelectState<Vec<&'static str>>>,
+    sensitivity_select: Entity<SelectState<Vec<&'static str>>>,
+    last_synced_adaptive: u8,
+    adaptive_debounce_gen: u64,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl MainWindow {
+    pub fn new(
+        app_state: Entity<RustPodsState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Self {
-        slot.append(&build(initial));
-        let rebuild_slot = slot.clone();
-        Self {
-            slot,
-            model: Cell::new(Some(initial.capabilities.model)),
-            rebuild: std::boxed::Box::new(move |state| {
-                while let Some(child) = rebuild_slot.first_child() {
-                    rebuild_slot.remove(&child);
-                }
-                rebuild_slot.append(&build(state));
-            }),
-        }
-    }
-
-    /// Rebuilds the card if `state`'s model differs from the current one.
-    pub fn sync(&self, state: &AirPodsDeviceState) {
-        let model = state.capabilities.model;
-        if self.model.get() != Some(model) {
-            self.model.set(Some(model));
-            (self.rebuild)(state);
-        }
-    }
-}
-
-pub struct MainWindowHandles {
-    pub window: ApplicationWindow,
-    pub hero_title: Label,
-    pub hero_subtitle: Label,
-    pub hero_status: Label,
-    pub connect_btn: Button,
-    pub battery_widgets: BatteryViewWidgets,
-    pub noise_card: RebuildableCard,
-    pub controls_card: RebuildableCard,
-    pub head_tracking: HeadTrackingWidgets,
-    pub zcode_ask: ZcodeAskWidgets,
-}
-
-pub fn create_main_window<R, W, N, A, E, P, C, M, K, Y>(
-    app: &Application,
-    initial_state: &AirPodsDeviceState,
-    config: &Arc<std::sync::RwLock<AppConfig>>,
-    on_rename: R,
-    on_connect: W,
-    on_set_noise_mode: N,
-    on_set_adaptive: A,
-    on_toggle_ear: E,
-    on_change_pause: P,
-    on_toggle_conv: C,
-    on_change_mic: M,
-    on_toggle_case_chime: K,
-    on_toggle_close_to_tray: Y,
-) -> MainWindowHandles
-where
-    R: Fn(String) + Send + Sync + 'static,
-    W: Fn() + Send + Sync + 'static,
-    N: Fn(NoiseControlMode) + Send + Sync + 'static,
-    A: Fn(u8) + Send + Sync + 'static,
-    E: Fn(bool) + Send + Sync + 'static,
-    P: Fn(PauseBehavior) + Send + Sync + 'static,
-    C: Fn(bool) + Send + Sync + 'static,
-    M: Fn(MicrophoneMode) + Send + Sync + 'static,
-    K: Fn(bool) + Send + Sync + 'static,
-    Y: Fn(bool) + Send + Sync + 'static,
-{
-    let window = ApplicationWindow::new(app);
-    window.set_title(Some("RustPods"));
-    window.set_default_size(780, 720);
-    window.set_resizable(true);
-
-    let toolbar_view = ToolbarView::new();
-    let header_bar = HeaderBar::new();
-    toolbar_view.add_top_bar(&header_bar);
-
-    // Root horizontal split: Sidebar (Left) + Stack Pages (Right)
-    let root_box = Box::new(Orientation::Horizontal, 0);
-    root_box.set_vexpand(true);
-    root_box.set_hexpand(true);
-
-    // Left Navigation Sidebar
-    let sidebar_box = Box::new(Orientation::Vertical, 4);
-    sidebar_box.set_width_request(210);
-    sidebar_box.add_css_class("sidebar");
-    sidebar_box.set_margin_top(16);
-    sidebar_box.set_margin_bottom(16);
-    sidebar_box.set_margin_start(12);
-    sidebar_box.set_margin_end(8);
-
-    // Right Content Stack
-    let stack = Stack::new();
-    stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
-    stack.set_transition_duration(160);
-    stack.set_hexpand(true);
-    stack.set_vexpand(true);
-
-    // -------------------------------------------------------------
-    // Page 1: 概览首页 (Overview)
-    // -------------------------------------------------------------
-    let (hero_container, hero_title, hero_subtitle, hero_status, connect_btn) =
-        build_hero_card(initial_state, on_rename, on_connect);
-
-    let battery_widgets = build_battery_card(initial_state);
-
-    // The noise card and the settings group depend on the device model, and
-    // the build-time state is a placeholder. Keep them in rebuildable slots so
-    // a real device with different capabilities gets its own card instead of
-    // inheriting the placeholder's.
-    let on_noise_mode: Arc<dyn Fn(NoiseControlMode) + Send + Sync> = Arc::new(on_set_noise_mode);
-    let on_adaptive: Arc<dyn Fn(u8) + Send + Sync> = Arc::new(on_set_adaptive);
-
-    let noise_slot = Box::new(Orientation::Vertical, 0);
-    let noise_card = RebuildableCard::new(noise_slot.clone(), initial_state, {
-        let n = on_noise_mode.clone();
-        let a = on_adaptive.clone();
-        move |state| {
-            let n = n.clone();
-            let a = a.clone();
-            build_noise_control_card(state, move |m| n(m), move |v| a(v)).upcast()
-        }
-    });
-
-    let overview_box = Box::new(Orientation::Vertical, 14);
-    overview_box.set_margin_top(14);
-    overview_box.set_margin_bottom(24);
-    overview_box.set_margin_start(20);
-    overview_box.set_margin_end(20);
-
-    overview_box.append(&hero_container);
-    overview_box.append(&battery_widgets.container);
-    overview_box.append(&noise_slot);
-
-    let overview_scrolled = ScrolledWindow::new();
-    overview_scrolled.set_vexpand(true);
-    overview_scrolled.set_hexpand(true);
-    overview_scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-    overview_scrolled.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
-    overview_scrolled.set_child(Some(&overview_box));
-
-    stack.add_named(&overview_scrolled, Some("overview"));
-
-    // -------------------------------------------------------------
-    // Page 2: 空间音频与头部追踪 (Spatial Audio & Head Tracking)
-    // -------------------------------------------------------------
-    let head_tracking = build_head_tracking_page();
-
-    // The ZCode question card lives on this page too: answering by nodding is
-    // a head-tracking activity, and the compass beside it doubles as live
-    // feedback for the gesture.
-    let zcode_ask = build_zcode_ask_card();
-    head_tracking.container.append(&zcode_ask.container);
-
-    let tracking_scrolled = ScrolledWindow::new();
-    tracking_scrolled.set_vexpand(true);
-    tracking_scrolled.set_hexpand(true);
-    tracking_scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-    tracking_scrolled.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
-    tracking_scrolled.set_child(Some(&head_tracking.container));
-
-    stack.add_named(&tracking_scrolled, Some("spatial"));
-
-    // -------------------------------------------------------------
-    // Page 3: 耳机控制与交互 (Controls & Gestures)
-    // -------------------------------------------------------------
-    let on_toggle_ear: Arc<dyn Fn(bool) + Send + Sync> = Arc::new(on_toggle_ear);
-    let on_change_pause: Arc<dyn Fn(PauseBehavior) + Send + Sync> = Arc::new(on_change_pause);
-    let on_toggle_conv: Arc<dyn Fn(bool) + Send + Sync> = Arc::new(on_toggle_conv);
-    let on_change_mic: Arc<dyn Fn(MicrophoneMode) + Send + Sync> = Arc::new(on_change_mic);
-    let on_toggle_chime: Arc<dyn Fn(bool) + Send + Sync> = Arc::new(on_toggle_case_chime);
-
-    let controls_slot = Box::new(Orientation::Vertical, 0);
-    let controls_card = RebuildableCard::new(controls_slot.clone(), initial_state, {
-        let config = config.clone();
-        let e = on_toggle_ear.clone();
-        let p = on_change_pause.clone();
-        let c = on_toggle_conv.clone();
-        let m = on_change_mic.clone();
-        let k = on_toggle_chime.clone();
-        move |state| {
-            // Re-read the config at rebuild time: the switches must show the
-            // values that are actually in force, not the ones from launch.
-            let cfg = config.read().unwrap().clone();
-            let (e, p, c, m, k) =
-                (e.clone(), p.clone(), c.clone(), m.clone(), k.clone());
-            build_smart_settings_group(
-                cfg.ear_detection_enabled,
-                cfg.pause_behavior,
-                cfg.conversational_awareness_enabled,
-                state.mic_mode,
-                state.case_chime_enabled,
-                state.capabilities.has_case_speaker,
-                move |b| e(b),
-                move |b| p(b),
-                move |b| c(b),
-                move |b| m(b),
-                move |b| k(b),
+        let (initial_name, initial_adaptive, initial_mic, cfg) = {
+            let s = app_state.read(cx);
+            (
+                s.device.name.clone(),
+                s.device.adaptive_strength,
+                s.device.mic_mode,
+                s.config_snapshot(),
             )
-            .upcast()
-        }
-    });
-
-    let controls_box = Box::new(Orientation::Vertical, 14);
-    controls_box.set_margin_top(16);
-    controls_box.set_margin_bottom(24);
-    controls_box.set_margin_start(20);
-    controls_box.set_margin_end(20);
-    controls_box.append(&controls_slot);
-
-    let controls_scrolled = ScrolledWindow::new();
-    controls_scrolled.set_vexpand(true);
-    controls_scrolled.set_hexpand(true);
-    controls_scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-    controls_scrolled.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
-    controls_scrolled.set_child(Some(&controls_box));
-
-    stack.add_named(&controls_scrolled, Some("controls"));
-
-    // -------------------------------------------------------------
-    // Page 4: 智能体接入 (Agent hooks) — its own page, per the management
-    // surface the nod-answer feature needs: master switch, sensitivity, and
-    // per-agent install/uninstall/test in one place.
-    // -------------------------------------------------------------
-    let agents_page = build_agents_page(config);
-
-    let agents_scrolled = ScrolledWindow::new();
-    agents_scrolled.set_vexpand(true);
-    agents_scrolled.set_hexpand(true);
-    agents_scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-    agents_scrolled.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
-    agents_scrolled.set_child(Some(&agents_page));
-
-    stack.add_named(&agents_scrolled, Some("agents"));
-
-    // -------------------------------------------------------------
-    // Page 5: 偏好设置与硬件 (Preferences)
-    // -------------------------------------------------------------
-    let preferences_page = build_preferences_page(initial_state, config, on_toggle_close_to_tray);
-
-    let pref_scrolled = ScrolledWindow::new();
-    pref_scrolled.set_vexpand(true);
-    pref_scrolled.set_hexpand(true);
-    pref_scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-    pref_scrolled.set_vscrollbar_policy(gtk4::PolicyType::Automatic);
-    pref_scrolled.set_child(Some(&preferences_page));
-
-    stack.add_named(&pref_scrolled, Some("preferences"));
-
-    // -------------------------------------------------------------
-    // Sidebar Navigation Buttons
-    // -------------------------------------------------------------
-    let nav_items = [
-        ("overview", "audio-headphones-symbolic", "概览首页"),
-        ("spatial", "emblem-music-symbolic", "空间音频"),
-        ("controls", "preferences-other-symbolic", "控制与交互"),
-        ("agents", "applications-engineering-symbolic", "智能体接入"),
-        ("preferences", "emblem-system-symbolic", "偏好设置"),
-    ];
-
-    // Apply custom styling for pixel-perfect macOS sidebar
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(
-        r#"
-        .macos-sidebar {
-            background-color: alpha(@window_bg_color, 0.6);
-        }
-        .sidebar-nav-btn {
-            border-radius: 9px;
-            padding: 8px 12px;
-            margin: 2px 6px;
-            background-color: transparent;
-            border: none;
-            box-shadow: none;
-            transition: background-color 150ms ease, color 150ms ease;
-        }
-        .sidebar-nav-btn:hover {
-            background-color: alpha(@theme_fg_color, 0.08);
-        }
-        .sidebar-nav-btn.active {
-            background-color: @accent_bg_color;
-            color: @accent_fg_color;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
-        }
-        .sidebar-nav-btn.active label {
-            font-weight: 700;
-            color: @accent_fg_color;
-        }
-        .sidebar-nav-btn.active image {
-            color: @accent_fg_color;
-        }
-        .sidebar-nav-btn label {
-            font-weight: 500;
-        }
-        "#,
-    );
-    if let Some(display) = gtk4::gdk::Display::default() {
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
-
-    let mut buttons = Vec::new();
-
-    for (page_id, icon_name, label_text) in nav_items {
-        let btn = Button::new();
-        btn.add_css_class("sidebar-nav-btn");
-        btn.set_halign(Align::Fill);
-
-        let row = Box::new(Orientation::Horizontal, 10);
-        row.set_margin_top(6);
-        row.set_margin_bottom(6);
-        row.set_margin_start(8);
-        row.set_margin_end(8);
-
-        let icon = Image::from_icon_name(icon_name);
-        icon.set_pixel_size(18);
-        let label = Label::new(Some(label_text));
-        label.set_halign(Align::Start);
-        label.add_css_class("heading");
-
-        row.append(&icon);
-        row.append(&label);
-        btn.set_child(Some(&row));
-
-        if page_id == "overview" {
-            btn.add_css_class("active");
-        }
-
-        buttons.push((page_id, btn));
-    }
-
-    let buttons_rc = Arc::new(buttons);
-    for (page_id, btn) in buttons_rc.iter() {
-        let stack_clone = stack.clone();
-        let target_page = page_id.to_string();
-        let buttons_list = buttons_rc.clone();
-
-        btn.connect_clicked(move |_| {
-            stack_clone.set_visible_child_name(&target_page);
-            for (p, b) in buttons_list.iter() {
-                if *p == target_page {
-                    b.add_css_class("active");
-                } else {
-                    b.remove_css_class("active");
-                }
-            }
-        });
-        sidebar_box.append(btn);
-    }
-
-    root_box.append(&sidebar_box);
-    root_box.append(&stack);
-
-    toolbar_view.set_content(Some(&root_box));
-    window.set_content(Some(&toolbar_view));
-
-    // Handle Window Close Request (Intercept and minimize to tray if configured)
-    let cfg_close = config.clone();
-    window.connect_close_request(move |win| {
-        let close_to_tray = {
-            let guard = cfg_close.read().unwrap();
-            guard.close_to_tray
         };
-        if close_to_tray {
-            win.set_visible(false);
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
 
-    MainWindowHandles {
-        window,
-        hero_title,
-        hero_subtitle,
-        hero_status,
-        connect_btn,
-        battery_widgets,
-        noise_card,
-        controls_card,
-        head_tracking,
-        zcode_ask,
+        // Intercept compositor close (Mod+Q / Alt+F4): quit only when close_to_tray is off.
+        {
+            let state_close = app_state.clone();
+            window.on_window_should_close(cx, move |_window, cx| {
+                let close_to_tray = state_close.read(cx).config_snapshot().close_to_tray;
+                if !close_to_tray {
+                    cx.quit();
+                }
+                true
+            });
+        }
+
+        let rename_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("输入 AirPods 名称");
+            input.set_value(&initial_name, window, cx);
+            input
+        });
+
+        let adaptive_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(100.)
+                .step(5.)
+                .default_value(initial_adaptive as f32)
+        });
+
+        let pause_items = vec![
+            "单耳摘下即暂停 (推荐)",
+            "双耳均摘下才暂停",
+            "从不暂停",
+        ];
+        let pause_idx = match cfg.pause_behavior {
+            PauseBehavior::OneRemoved => 0,
+            PauseBehavior::BothRemoved => 1,
+            PauseBehavior::Never => 2,
+        };
+        let pause_select = cx.new(|cx| {
+            SelectState::new(pause_items, Some(IndexPath::default().row(pause_idx)), window, cx)
+        });
+
+        let mic_items = vec!["自动切换 (默认)", "始终左耳", "始终右耳"];
+        let mic_idx = match initial_mic {
+            MicrophoneMode::Automatic => 0,
+            MicrophoneMode::AlwaysLeft => 1,
+            MicrophoneMode::AlwaysRight => 2,
+        };
+        let mic_select = cx.new(|cx| {
+            SelectState::new(mic_items, Some(IndexPath::default().row(mic_idx)), window, cx)
+        });
+
+        let sens_items = vec![
+            "1 · 很不灵敏",
+            "2 · 较不灵敏",
+            "3 · 标准",
+            "4 · 较灵敏",
+            "5 · 很灵敏",
+        ];
+        let sens_idx = (cfg.gesture_sensitivity.clamp(1, 5) - 1) as usize;
+        let sensitivity_select = cx.new(|cx| {
+            SelectState::new(sens_items, Some(IndexPath::default().row(sens_idx)), window, cx)
+        });
+
+        let mut subscriptions = Vec::new();
+
+        // Re-render window when background state changes, and keep slider synced.
+        subscriptions.push(cx.observe_in(&app_state, window, |this, state, window, cx| {
+            let ext_adaptive = state.read(cx).device.adaptive_strength;
+            if ext_adaptive != this.last_synced_adaptive {
+                this.last_synced_adaptive = ext_adaptive;
+                this.adaptive_slider.update(cx, |s, cx| {
+                    s.set_value(ext_adaptive as f32, window, cx);
+                });
+            }
+            cx.notify();
+        }));
+
+        // Rename submit on Enter key.
+        {
+            let app_enter = app_state.clone();
+            subscriptions.push(cx.subscribe(
+                &rename_input,
+                move |_this, input, event: &InputEvent, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        let new_name = input.read(cx).value().trim().to_string();
+                        if !new_name.is_empty() {
+                            app_enter.update(cx, |s, cx| {
+                                s.device.name = new_name.clone();
+                                s.controller.rename(new_name);
+                                cx.notify();
+                            });
+                        }
+                    }
+                },
+            ));
+        }
+
+        // Adaptive noise slider: update display immediately, coalesce AACP writes by 150 ms.
+        {
+            let app_slider = app_state.clone();
+            subscriptions.push(cx.subscribe(
+                &adaptive_slider,
+                move |this, _slider, event: &SliderEvent, cx| {
+                    let raw = match event {
+                        SliderEvent::Change(SliderValue::Single(v))
+                        | SliderEvent::Release(SliderValue::Single(v)) => *v,
+                        _ => return,
+                    };
+                    let snapped = ((raw / 5.0).round() as u8).min(20) * 5;
+                    this.last_synced_adaptive = snapped;
+                    app_slider.update(cx, |s, cx| {
+                        s.device.adaptive_strength = snapped;
+                        cx.notify();
+                    });
+
+                    this.adaptive_debounce_gen = this.adaptive_debounce_gen.wrapping_add(1);
+                    let expected_gen = this.adaptive_debounce_gen;
+                    let app_send = app_slider.clone();
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(150))
+                            .await;
+                        let should_send = this
+                            .read_with(cx, |view, _| view.adaptive_debounce_gen == expected_gen)
+                            .unwrap_or(false);
+                        if should_send {
+                            let _ = app_send.read_with(cx, |s, _| {
+                                s.controller.set_adaptive_strength(snapped);
+                            });
+                        }
+                    })
+                    .detach();
+                },
+            ));
+        }
+
+        // Pause behavior selector.
+        {
+            let app_pause = app_state.clone();
+            subscriptions.push(cx.subscribe(
+                &pause_select,
+                move |_this, select, event: &SelectEvent<Vec<&'static str>>, cx| {
+                    let SelectEvent::Confirm(_) = event;
+                    let row = select.read(cx).selected_index(cx).map(|p| p.row).unwrap_or(0);
+                    let behavior = match row {
+                        1 => PauseBehavior::BothRemoved,
+                        2 => PauseBehavior::Never,
+                        _ => PauseBehavior::OneRemoved,
+                    };
+                    app_pause.update(cx, |s, cx| {
+                        s.controller.change_pause_behavior(behavior);
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+
+        // Microphone mode selector.
+        {
+            let app_mic = app_state.clone();
+            subscriptions.push(cx.subscribe(
+                &mic_select,
+                move |_this, select, event: &SelectEvent<Vec<&'static str>>, cx| {
+                    let SelectEvent::Confirm(_) = event;
+                    let row = select.read(cx).selected_index(cx).map(|p| p.row).unwrap_or(0);
+                    let mode = match row {
+                        1 => MicrophoneMode::AlwaysLeft,
+                        2 => MicrophoneMode::AlwaysRight,
+                        _ => MicrophoneMode::Automatic,
+                    };
+                    app_mic.update(cx, |s, cx| {
+                        s.device.mic_mode = mode;
+                        s.controller.change_mic_mode(mode);
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+
+        // Gesture sensitivity selector.
+        {
+            let app_sens = app_state.clone();
+            subscriptions.push(cx.subscribe(
+                &sensitivity_select,
+                move |_this, select, event: &SelectEvent<Vec<&'static str>>, cx| {
+                    let SelectEvent::Confirm(_) = event;
+                    let row = select.read(cx).selected_index(cx).map(|p| p.row).unwrap_or(2);
+                    let level = (row as u8) + 1;
+                    app_sens.update(cx, |s, cx| {
+                        s.controller.set_gesture_sensitivity(level);
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+
+        Self {
+            app_state,
+            rename_input,
+            adaptive_slider,
+            pause_select,
+            mic_select,
+            sensitivity_select,
+            last_synced_adaptive: initial_adaptive,
+            adaptive_debounce_gen: 0,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn nav_icon(page: NavPage) -> gpui_kit::assets::IconName {
+        match page {
+            NavPage::Overview => gpui_kit::assets::IconName::Headphones,
+            NavPage::Spatial => gpui_kit::assets::IconName::Compass,
+            NavPage::Controls => gpui_kit::assets::IconName::SlidersHorizontal,
+            NavPage::Agents => gpui_kit::assets::IconName::Bot,
+            NavPage::Preferences => gpui_kit::assets::IconName::Settings,
+        }
     }
 }
 
-pub fn update_ui_state(handles: &MainWindowHandles, state: &AirPodsDeviceState) {
-    handles.hero_title.set_text(&state.name);
-    let subtitle_text = format!("{} • {}", state.capabilities.name, state.mac_address);
-    handles.hero_subtitle.set_text(&subtitle_text);
+impl Render for MainWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let state = self.app_state.read(cx);
+        let active_page = state.active_page;
+        let is_connected = state.device.is_connected;
+        let is_dark = state.theme_mode.is_dark();
 
-    let both_in_case = !state.is_wearing_any()
-        && (state.left_in_ear == crate::core::aacp::events::EarStatus::InCase
-            || state.right_in_ear == crate::core::aacp::events::EarStatus::InCase);
+        let app_for_close = self.app_state.clone();
+        let app_for_theme = self.app_state.clone();
 
-    if !state.is_connected {
-        handles.hero_status.set_text("○ 未连接");
-        handles.hero_status.remove_css_class("success");
-        handles.hero_status.remove_css_class("accent");
-        handles.hero_status.add_css_class("dim-label");
-        handles.connect_btn.set_visible(true);
-    } else if both_in_case {
-        handles.hero_status.set_text("● 充电盒中");
-        handles.hero_status.remove_css_class("success");
-        handles.hero_status.remove_css_class("dim-label");
-        handles.hero_status.add_css_class("accent");
-        handles.connect_btn.set_visible(false);
-    } else {
-        handles.hero_status.set_text("● 已连接");
-        handles.hero_status.remove_css_class("dim-label");
-        handles.hero_status.remove_css_class("accent");
-        handles.hero_status.add_css_class("success");
-        handles.connect_btn.set_visible(false);
+        let sidebar = div()
+            .w(px(210.))
+            .h_full()
+            .flex_shrink_0()
+            .bg(p.sidebar_bg)
+            .border_r_1()
+            .border_color(p.sidebar_border)
+            .px(px(10.))
+            .py(px(14.))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .children(NavPage::ALL.into_iter().map(|page| {
+                        let active = active_page == page;
+                        let app_nav = self.app_state.clone();
+                        div()
+                            .id(("nav-item", page as usize))
+                            .cursor_pointer()
+                            .px(px(12.))
+                            .py(px(9.))
+                            .rounded(px(10.))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .bg(if active {
+                                p.sidebar_item_active
+                            } else {
+                                gpui_kit::transparent_black()
+                            })
+                            .text_color(if active {
+                                p.sidebar_item_active_fg
+                            } else {
+                                p.text_primary
+                            })
+                            .hover(|this| {
+                                if active {
+                                    this
+                                } else {
+                                    this.bg(p.sidebar_item_hover)
+                                }
+                            })
+                            .on_click(move |_, _, cx| {
+                                app_nav.update(cx, |s, cx| {
+                                    s.active_page = page;
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                Icon::new(Self::nav_icon(page))
+                                    .size(px(17.))
+                                    .text_color(if active {
+                                        p.sidebar_item_active_fg
+                                    } else {
+                                        p.text_secondary
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(if active {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::MEDIUM
+                                    })
+                                    .child(page.label()),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .pt(px(10.))
+                    .border_t_1()
+                    .border_color(p.separator)
+                    .child(
+                        div()
+                            .px(px(8.))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .w(px(7.))
+                                            .h(px(7.))
+                                            .rounded(px(999.))
+                                            .bg(if is_connected {
+                                                p.accent_green
+                                            } else {
+                                                p.text_muted
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(p.text_secondary)
+                                            .child(if is_connected {
+                                                "AACP 已连接"
+                                            } else {
+                                                "等待连接"
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                Button::new("sidebar-theme-toggle")
+                                    .ghost()
+                                    .compact()
+                                    .rounded(ButtonRounded::Size(px(999.)))
+                                    .tooltip(if is_dark {
+                                        "切换到浅色模式"
+                                    } else {
+                                        "切换到深色模式"
+                                    })
+                                    .icon(Icon::new(if is_dark {
+                                        gpui_kit::component::IconName::Sun
+                                    } else {
+                                        gpui_kit::component::IconName::Moon
+                                    }))
+                                    .on_click(move |_, _, cx| {
+                                        let next = if is_dark {
+                                            ThemeMode::Light
+                                        } else {
+                                            ThemeMode::Dark
+                                        };
+                                        apply_apple_theme(next, cx);
+                                        app_for_theme.update(cx, |s, cx| {
+                                            s.theme_mode = next;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    ),
+            );
+
+        let page_content = match active_page {
+            NavPage::Overview => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .child(render_hero_card(
+                    state,
+                    &self.app_state,
+                    &self.rename_input,
+                    &p,
+                ))
+                .child(render_battery_card(&state.device, &p))
+                .child(render_noise_control_card(
+                    state,
+                    &self.app_state,
+                    &self.adaptive_slider,
+                    &p,
+                    cx,
+                ))
+                .into_any_element(),
+
+            NavPage::Spatial => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .child(render_head_tracking_card(&state.head_tracking, &p))
+                .when_some(
+                    render_zcode_ask_card(
+                        state.zcode_progress.as_ref(),
+                        state.zcode_resolved.as_deref(),
+                        &p,
+                    ),
+                    |this, card| this.child(card),
+                )
+                .into_any_element(),
+
+            NavPage::Controls => render_settings_page(
+                state,
+                &self.app_state,
+                &self.pause_select,
+                &self.mic_select,
+                &p,
+            )
+            .into_any_element(),
+
+            NavPage::Agents => render_agents_page(
+                state,
+                &self.app_state,
+                &self.sensitivity_select,
+                &p,
+            )
+            .into_any_element(),
+
+            NavPage::Preferences => render_preferences_page(state, &self.app_state, &p)
+                .into_any_element(),
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(p.window_bg)
+            .text_color(p.text_primary)
+            .child(
+                TitleBar::new()
+                    .on_close_window(move |_, window, cx| {
+                        let close_to_tray =
+                            app_for_close.read(cx).config_snapshot().close_to_tray;
+                        if close_to_tray {
+                            window.remove_window();
+                        } else {
+                            cx.quit();
+                        }
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::Headphones)
+                                    .size(px(14.))
+                                    .text_color(p.accent_blue),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.text_primary)
+                                    .child("RustPods"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .child(sidebar)
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .overflow_y_scrollbar()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(680.))
+                                    .mx_auto()
+                                    .p(px(20.))
+                                    .pb(px(28.))
+                                    .child(page_content),
+                            ),
+                    ),
+            )
     }
-
-    update_battery_widgets(&handles.battery_widgets, state);
-    handles.noise_card.sync(state);
-    handles.controls_card.sync(state);
 }

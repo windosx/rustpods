@@ -362,8 +362,18 @@ pub fn parse_aacp_packet(packet: &[u8]) -> Option<AacpEvent> {
             None
         }
         opcodes::PROXIMITY_KEYS_RSP => {
-            trace!("Proximity keys response ({} bytes)", payload.len());
-            None
+            let (irk, enc_key) = parse_proximity_keys_payload(payload);
+            if irk.is_some() || enc_key.is_some() {
+                debug!(
+                    "Parsed ProximityKeys (irk={}, enc_key={})",
+                    irk.is_some(),
+                    enc_key.is_some()
+                );
+                Some(AacpEvent::ProximityKeys { irk, enc_key })
+            } else {
+                trace!("Proximity keys response ({} bytes, empty)", payload.len());
+                None
+            }
         }
         0x08 => {
             trace!("Secondary-setting frame ({} bytes)", payload.len());
@@ -384,6 +394,42 @@ pub fn parse_aacp_packet(packet: &[u8]) -> Option<AacpEvent> {
             None
         }
     }
+}
+
+/// Parses `PROXIMITY_KEYS_RSP` (0x31) payload (starting at byte 6 of the AACP packet):
+/// `[key_count, (key_type, reserved, key_len, reserved, key_bytes[key_len]) * key_count]`.
+fn parse_proximity_keys_payload(payload: &[u8]) -> (Option<[u8; 16]>, Option<[u8; 16]>) {
+    if payload.is_empty() {
+        return (None, None);
+    }
+    let key_count = payload[0] as usize;
+    let mut offset = 1usize;
+    let mut irk = None;
+    let mut enc_key = None;
+
+    for _ in 0..key_count {
+        if offset + 4 > payload.len() {
+            break;
+        }
+        let key_type = payload[offset];
+        let key_len = payload[offset + 2] as usize;
+        offset += 4;
+        if offset + key_len > payload.len() {
+            break;
+        }
+        if key_len == 16 {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&payload[offset..offset + 16]);
+            match key_type {
+                0x01 => irk = Some(key),
+                0x04 => enc_key = Some(key),
+                _ => {}
+            }
+        }
+        offset += key_len;
+    }
+
+    (irk, enc_key)
 }
 
 #[cfg(test)]
@@ -421,6 +467,23 @@ mod tests {
                 let ack = neg.acknowledgement();
                 assert_eq!(ack[..6], [0x04, 0x00, 0x04, 0x00, 0x02, 0x00]);
                 assert_eq!(&ack[6..], &neg.body[..]);
+            }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_proximity_keys_rsp() {
+        let mut pkt = vec![0x04, 0x00, 0x04, 0x00, 0x31, 0x00, 0x02];
+        pkt.extend_from_slice(&[0x01, 0x00, 0x10, 0x00]);
+        pkt.extend_from_slice(&[0x11; 16]);
+        pkt.extend_from_slice(&[0x04, 0x00, 0x10, 0x00]);
+        pkt.extend_from_slice(&[0x22; 16]);
+
+        match parse_aacp_packet(&pkt) {
+            Some(AacpEvent::ProximityKeys { irk, enc_key }) => {
+                assert_eq!(irk, Some([0x11; 16]));
+                assert_eq!(enc_key, Some([0x22; 16]));
             }
             other => panic!("Unexpected event: {:?}", other),
         }

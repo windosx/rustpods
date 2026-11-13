@@ -1,177 +1,196 @@
 use crate::core::aacp::commands::NoiseControlMode;
-use crate::core::device::AirPodsDeviceState;
-use gtk4::prelude::*;
-use gtk4::{Align, Box, Label, Orientation, Scale, ToggleButton};
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
-use std::sync::Arc;
+use crate::ui::state::RustPodsState;
+use crate::ui::theme::{control_card, ApplePalette};
+use gpui_kit::component::slider::{Slider, SliderState};
+use gpui_kit::component::tag::Tag;
+use gpui_kit::component::Icon;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    div, px, App, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _,
+};
 
-pub fn build_noise_control_card<F, S>(
-    state: &AirPodsDeviceState,
-    on_set_mode: F,
-    on_set_adaptive: S,
-) -> Box
-where
-    F: Fn(NoiseControlMode) + Send + Sync + 'static,
-    S: Fn(u8) + Send + Sync + 'static,
-{
-    let container = Box::new(Orientation::Vertical, 8);
-    container.add_css_class("card");
-    container.set_margin_start(16);
-    container.set_margin_end(16);
-    container.set_margin_top(8);
-    container.set_margin_bottom(8);
+pub fn render_noise_control_card(
+    state: &RustPodsState,
+    app_state: &Entity<RustPodsState>,
+    adaptive_slider: &Entity<SliderState>,
+    p: &ApplePalette,
+    _cx: &App,
+) -> impl IntoElement {
+    let dev = &state.device;
 
-    let inner = Box::new(Orientation::Vertical, 10);
-    inner.set_margin_top(16);
-    inner.set_margin_bottom(16);
-    inner.set_margin_start(16);
-    inner.set_margin_end(16);
+    if dev.capabilities.has_anc {
+        let current_mode = dev.noise_mode;
+        let adaptive_strength = dev.adaptive_strength;
 
-    if state.capabilities.has_anc {
-        let title_label = Label::new(Some("噪声控制"));
-        title_label.add_css_class("heading");
-        title_label.set_halign(Align::Start);
-        inner.append(&title_label);
+        let modes = [
+            (NoiseControlMode::NoiseCancellation, "降噪", "anc-btn"),
+            (NoiseControlMode::Off, "关闭", "off-btn"),
+            (NoiseControlMode::Transparency, "通透模式", "trans-btn"),
+        ];
 
-        // Segmented Control
-        let seg_box = Box::new(Orientation::Horizontal, 0);
-        seg_box.add_css_class("linked");
-        seg_box.set_halign(Align::Center);
-        seg_box.set_margin_top(6);
-        seg_box.set_margin_bottom(6);
-
-        let btn_anc = ToggleButton::with_label("降噪");
-        let btn_off = ToggleButton::with_label("关闭");
-        let btn_trans = ToggleButton::with_label("通透模式");
-
-        // Radio-group semantics: without a shared group the three buttons
-        // toggle independently - two could highlight at once, and clicking
-        // the active one deactivated it, leaving no selection and (because
-        // the handlers fire on is_active) no command sent.
-        btn_off.set_group(Some(&btn_anc));
-        btn_trans.set_group(Some(&btn_anc));
-
-        let current_mode = state.noise_mode;
-        btn_anc.set_active(current_mode == NoiseControlMode::NoiseCancellation);
-        btn_off.set_active(current_mode == NoiseControlMode::Off);
-        btn_trans.set_active(current_mode == NoiseControlMode::Transparency);
-
-        seg_box.append(&btn_anc);
-        seg_box.append(&btn_off);
-        seg_box.append(&btn_trans);
-
-        let on_mode_arc = Arc::new(on_set_mode);
-
-        let m_anc = on_mode_arc.clone();
-        btn_anc.connect_toggled(move |btn| {
-            if btn.is_active() {
-                m_anc(NoiseControlMode::NoiseCancellation);
-            }
-        });
-
-        let m_off = on_mode_arc.clone();
-        btn_off.connect_toggled(move |btn| {
-            if btn.is_active() {
-                m_off(NoiseControlMode::Off);
-            }
-        });
-
-        let m_trans = on_mode_arc.clone();
-        btn_trans.connect_toggled(move |btn| {
-            if btn.is_active() {
-                m_trans(NoiseControlMode::Transparency);
-            }
-        });
-
-        inner.append(&seg_box);
-
-        if state.capabilities.has_adaptive_audio {
-            let slider_box = Box::new(Orientation::Vertical, 4);
-            let slider_label = Label::new(Some("自适应噪声消除强度"));
-            slider_label.add_css_class("caption");
-            slider_label.set_halign(Align::Start);
-            slider_box.append(&slider_label);
-
-            let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 5.0);
-            scale.set_value(state.adaptive_strength as f64);
-            scale.set_draw_value(true);
-
-            // Dragging fires value_changed continuously - one drag emitted
-            // dozens of AACP commands, with off-step values from the truncation.
-            // Coalesce to a single send 150 ms after the last movement, snapped
-            // to a 5-point step.
-            let on_adapt_arc = Arc::new(on_set_adaptive);
-            let pending: Rc<RefCell<Option<u8>>> = Rc::new(RefCell::new(None));
-            let flush_scheduled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-            scale.connect_value_changed({
-                let pending = pending.clone();
-                let flush_scheduled = flush_scheduled.clone();
-                let on_adapt = on_adapt_arc.clone();
-                move |s| {
-                    *pending.borrow_mut() = Some(((s.value() / 5.0).round() as u8).min(100) * 5);
-                    if flush_scheduled.replace(true) {
-                        return; // a flush is already queued; it reads the latest value
-                    }
-                    let pending = pending.clone();
-                    let flush_scheduled = flush_scheduled.clone();
-                    let on_adapt = on_adapt.clone();
-                    gtk4::glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(150),
-                        move || {
-                            flush_scheduled.set(false);
-                            if let Some(v) = pending.borrow_mut().take() {
-                                on_adapt(v);
-                            }
-                        },
-                    );
-                }
-            });
-
-            slider_box.append(&scale);
-            inner.append(&slider_box);
-        }
+        control_card(p)
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.text_primary)
+                            .child("噪声控制"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(p.text_secondary)
+                            .child(match current_mode {
+                                NoiseControlMode::NoiseCancellation => "降噪已开启",
+                                NoiseControlMode::Transparency => "通透模式已开启",
+                                NoiseControlMode::Adaptive => "自适应",
+                                NoiseControlMode::Off => "已关闭",
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .p(px(4.))
+                            .rounded(px(12.))
+                            .bg(p.pill_bg)
+                            .border_1()
+                            .border_color(p.card_border)
+                            .gap(px(4.))
+                            .children(modes.into_iter().map(|(mode, label, id)| {
+                                let selected = current_mode == mode;
+                                let app_click = app_state.clone();
+                                div()
+                                    .id(id)
+                                    .cursor_pointer()
+                                    .px(px(18.))
+                                    .py(px(7.))
+                                    .rounded(px(9.))
+                                    .text_size(px(13.))
+                                    .font_weight(if selected {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::MEDIUM
+                                    })
+                                    .bg(if selected {
+                                        p.pill_active_bg
+                                    } else {
+                                        gpui_kit::transparent_black()
+                                    })
+                                    .text_color(if selected {
+                                        p.sidebar_item_active_fg
+                                    } else {
+                                        p.text_primary
+                                    })
+                                    .hover(|this| {
+                                        if selected {
+                                            this
+                                        } else {
+                                            this.bg(p.sidebar_item_hover)
+                                        }
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        app_click.update(cx, |s, cx| {
+                                            s.device.noise_mode = mode;
+                                            s.controller.set_noise_mode(mode);
+                                            cx.notify();
+                                        });
+                                    })
+                                    .child(label)
+                            })),
+                    ),
+            )
+            .when(dev.capabilities.has_adaptive_audio, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .pt(px(4.))
+                        .border_t_1()
+                        .border_color(p.separator)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(p.text_secondary)
+                                        .child("自适应噪声消除强度"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(p.text_primary)
+                                        .child(format!("{}%", adaptive_strength)),
+                                ),
+                        )
+                        .child(Slider::new(adaptive_slider).horizontal()),
+                )
+            })
+            .into_any_element()
     } else {
-        // Half-in-ear / Non-ANC info banner (e.g. AirPods 3)
-        let header_row = Box::new(Orientation::Horizontal, 8);
-        let icon = gtk4::Image::from_icon_name("audio-volume-high-symbolic");
-        header_row.append(&icon);
-
-        let title_label = Label::new(Some("声学特性与能力"));
-        title_label.add_css_class("heading");
-        header_row.append(&title_label);
-        inner.append(&header_row);
-
-        let desc_label = Label::new(Some(
-            "当前设备为半入耳式经典声学架构，支持高品质计算音频与自适应均衡调节。",
-        ));
-        desc_label.add_css_class("caption");
-        desc_label.add_css_class("dim-label");
-        desc_label.set_wrap(true);
-        desc_label.set_halign(Align::Start);
-        inner.append(&desc_label);
-
-        let tags_box = Box::new(Orientation::Horizontal, 8);
-        tags_box.set_margin_top(6);
-
-        let tag1 = Label::new(Some("自适应均衡"));
-        tag1.add_css_class("card");
-        tag1.add_css_class("caption");
-        tags_box.append(&tag1);
-
-        let tag2 = Label::new(Some("入耳检测"));
-        tag2.add_css_class("card");
-        tag2.add_css_class("caption");
-        tags_box.append(&tag2);
-
-        let tag3 = Label::new(Some("高清立体声"));
-        tag3.add_css_class("card");
-        tag3.add_css_class("caption");
-        tags_box.append(&tag3);
-
-        inner.append(&tags_box);
+        control_card(p)
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        Icon::new(gpui_kit::assets::IconName::Volume2)
+                            .size(px(18.))
+                            .text_color(p.accent_blue),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.text_primary)
+                            .child("声学特性与能力"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(p.text_secondary)
+                    .child("当前设备为半入耳式经典声学架构，支持高品质计算音频与自适应均衡调节。"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .pt(px(2.))
+                    .child(Tag::secondary().child("自适应均衡"))
+                    .child(Tag::secondary().child("入耳检测"))
+                    .child(Tag::secondary().child("高清立体声")),
+            )
+            .into_any_element()
     }
-
-    container.append(&inner);
-    container
 }

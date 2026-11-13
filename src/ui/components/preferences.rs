@@ -1,108 +1,231 @@
-use crate::core::device::AirPodsDeviceState;
-use crate::system::config::{save_config, AppConfig};
-use gtk4::prelude::*;
-use gtk4::{Box, Label, Orientation};
-use libadwaita::prelude::*;
-use libadwaita::{ActionRow, PreferencesGroup, SwitchRow};
-use std::sync::Arc;
+use crate::ui::state::RustPodsState;
+use crate::ui::theme::{apply_apple_theme, grouped_card, section_header, setting_row, ApplePalette};
+use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants as _};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tag::Tag;
+use gpui_kit::component::{Icon, ThemeMode};
+use gpui_kit::{
+    div, px, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _,
+};
 
-pub fn build_preferences_page<C>(
-    state: &AirPodsDeviceState,
-    config: &Arc<std::sync::RwLock<AppConfig>>,
-    on_toggle_close_to_tray: C,
-) -> Box
-where
-    C: Fn(bool) + Send + Sync + 'static,
-{
-    let container = Box::new(Orientation::Vertical, 12);
-    container.set_margin_top(16);
-    container.set_margin_bottom(24);
-    container.set_margin_start(20);
-    container.set_margin_end(20);
+pub fn render_preferences_page(
+    state: &RustPodsState,
+    app_state: &Entity<RustPodsState>,
+    p: &ApplePalette,
+) -> impl IntoElement {
+    let cfg = state.config_snapshot();
+    let dev = &state.device;
+    let app_tray = app_state.clone();
+    let app_popup = app_state.clone();
+    let app_preview = app_state.clone();
+    let app_theme_light = app_state.clone();
+    let app_theme_dark = app_state.clone();
+    let is_dark = state.theme_mode.is_dark();
 
-    // Group 1: Desktop & Tray Behavior
-    let tray_group = PreferencesGroup::new();
-    tray_group.set_title("桌面与任务栏");
-    tray_group.set_description(Some("配置应用常驻与系统托盘显示行为"));
+    let theme_switcher = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .p(px(3.))
+        .rounded(px(10.))
+        .bg(p.pill_bg)
+        .border_1()
+        .border_color(p.card_border)
+        .gap(px(3.))
+        .child(
+            div()
+                .id("pref-theme-light")
+                .cursor_pointer()
+                .px(px(12.))
+                .py(px(5.))
+                .rounded(px(7.))
+                .text_size(px(12.))
+                .font_weight(if !is_dark {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .bg(if !is_dark {
+                    p.pill_active_bg
+                } else {
+                    gpui_kit::transparent_black()
+                })
+                .text_color(if !is_dark {
+                    p.sidebar_item_active_fg
+                } else {
+                    p.text_primary
+                })
+                .on_click(move |_, _, cx| {
+                    apply_apple_theme(ThemeMode::Light, cx);
+                    app_theme_light.update(cx, |s, cx| {
+                        s.theme_mode = ThemeMode::Light;
+                        cx.notify();
+                    });
+                })
+                .child("浅色"),
+        )
+        .child(
+            div()
+                .id("pref-theme-dark")
+                .cursor_pointer()
+                .px(px(12.))
+                .py(px(5.))
+                .rounded(px(7.))
+                .text_size(px(12.))
+                .font_weight(if is_dark {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .bg(if is_dark {
+                    p.pill_active_bg
+                } else {
+                    gpui_kit::transparent_black()
+                })
+                .text_color(if is_dark {
+                    p.sidebar_item_active_fg
+                } else {
+                    p.text_primary
+                })
+                .on_click(move |_, _, cx| {
+                    apply_apple_theme(ThemeMode::Dark, cx);
+                    app_theme_dark.update(cx, |s, cx| {
+                        s.theme_mode = ThemeMode::Dark;
+                        cx.notify();
+                    });
+                })
+                .child("深色"),
+        );
 
-    let close_tray_row = SwitchRow::new();
-    close_tray_row.set_title("关闭主窗口时最小化到任务栏");
-    close_tray_row.set_subtitle("点击窗口关闭按钮时隐藏界面并在后台常驻，不退出程序");
-    let init_close_val = config.read().unwrap().close_to_tray;
-    close_tray_row.set_active(init_close_val);
-
-    let on_toggle_arc = Arc::new(on_toggle_close_to_tray);
-    let cfg_clone = config.clone();
-    close_tray_row.connect_active_notify(move |sw| {
-        let active = sw.is_active();
-        if let Ok(mut c) = cfg_clone.write() {
-            c.close_to_tray = active;
-            save_config(&c);
-        }
-        on_toggle_arc(active);
-    });
-    tray_group.add(&close_tray_row);
-
-    let icon_info_row = ActionRow::new();
-    icon_info_row.set_title("圆形电量动态托盘");
-    icon_info_row.set_subtitle("任务栏托盘图标以环形进度条显示当前电量，充电时显示闪电标");
-    let check_icon = gtk4::Image::from_icon_name("emblem-ok-symbolic");
-    icon_info_row.add_suffix(&check_icon);
-    tray_group.add(&icon_info_row);
-
-    container.append(&tray_group);
-
-    // Group 3: Hardware & Firmware Info
-    let hw_group = PreferencesGroup::new();
-    hw_group.set_title("硬件与固件详细信息");
-    hw_group.set_description(Some("AirPods 私有固件出厂信息"));
-
-    let model_row = ActionRow::new();
-    model_row.set_title("设备代号与型号");
-    model_row.set_subtitle(&format!("{} (Apple Inc.)", state.capabilities.name));
-    hw_group.add(&model_row);
-
-    let mac_row = ActionRow::new();
-    mac_row.set_title("蓝牙物理地址 (MAC)");
-    mac_row.set_subtitle(&state.mac_address);
-    hw_group.add(&mac_row);
-
-    let fw_row = ActionRow::new();
-    fw_row.set_title("硬件固件架构");
-    fw_row.set_subtitle("A2564 • 65.1868046005000000.52 (官方 6A321 固件)");
-    hw_group.add(&fw_row);
-
-    let serial_row = ActionRow::new();
-    serial_row.set_title("硬件序列号");
-    serial_row.set_subtitle("主盒: CDGJFXHF63 | 左: GX6MGE30035Y | 右: GX6MGMWS0360");
-    hw_group.add(&serial_row);
-
-    container.append(&hw_group);
-
-    // Group 4: Linux Integration
-    let linux_group = PreferencesGroup::new();
-    linux_group.set_title("Linux 系统服务集成");
-
-    let mpris_row = ActionRow::new();
-    mpris_row.set_title("D-Bus MPRIS 媒体联动");
-    mpris_row.set_subtitle("已激活自动入耳暂停、戴上自动续播与耳机按柄交互");
-    let mpris_badge = Label::new(Some("运行中"));
-    mpris_badge.add_css_class("success");
-    mpris_badge.add_css_class("caption");
-    mpris_row.add_suffix(&mpris_badge);
-    linux_group.add(&mpris_row);
-
-    let audio_row = ActionRow::new();
-    audio_row.set_title("PipeWire / PulseAudio 原生音频");
-    audio_row.set_subtitle("支持 A2DP 高清立体声音频流与无缝切换");
-    let pw_badge = Label::new(Some("正常"));
-    pw_badge.add_css_class("success");
-    pw_badge.add_css_class("caption");
-    audio_row.add_suffix(&pw_badge);
-    linux_group.add(&audio_row);
-
-    container.append(&linux_group);
-
-
-    container
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .child(section_header(
+            p,
+            "桌面与任务栏",
+            Some("配置应用常驻、外观主题与系统托盘显示行为"),
+        ))
+        .child(
+            grouped_card(p)
+                .child(setting_row(
+                    p,
+                    "界面外观主题",
+                    Some("在 Apple 控制中心浅色与深色模式间切换"),
+                    theme_switcher,
+                    false,
+                ))
+                .child(setting_row(
+                    p,
+                    "关闭主窗口时最小化到任务栏",
+                    Some("点击窗口关闭按钮时隐藏界面并在后台常驻，不退出程序"),
+                    Switch::new("close-to-tray-switch")
+                        .checked(cfg.close_to_tray)
+                        .on_change(move |checked, _, cx| {
+                            let val = *checked;
+                            app_tray.update(cx, |s, cx| {
+                                s.controller.toggle_close_to_tray(val);
+                                cx.notify();
+                            });
+                        }),
+                    true,
+                ))
+                .child(setting_row(
+                    p,
+                    "开盖时显示 iOS 风格弹窗",
+                    Some("在附近打开 AirPods 充电盒盖时弹出带 3D 旋转动画与电量的卡片"),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(
+                            Button::new("preview-case-popup-btn")
+                                .ghost()
+                                .compact()
+                                .rounded(ButtonRounded::Size(px(999.)))
+                                .label("预览弹窗")
+                                .on_click(move |_, _, cx| {
+                                    app_preview.read(cx).controller.preview_case_popup();
+                                }),
+                        )
+                        .child(
+                            Switch::new("case-popup-switch")
+                                .checked(cfg.case_popup_enabled)
+                                .on_change(move |checked, _, cx| {
+                                    let val = *checked;
+                                    app_popup.update(cx, |s, cx| {
+                                        s.controller.toggle_case_popup(val);
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                    true,
+                ))
+                .child(setting_row(
+                    p,
+                    "圆形电量动态托盘",
+                    Some("任务栏托盘图标以环形进度条显示当前电量，充电时显示闪电标"),
+                    Icon::new(gpui_kit::component::IconName::Check)
+                        .size(px(16.))
+                        .text_color(p.accent_green),
+                    true,
+                )),
+        )
+        .child(section_header(
+            p,
+            "硬件与固件详细信息",
+            Some("AirPods 私有固件出厂信息"),
+        ))
+        .child(
+            grouped_card(p)
+                .child(setting_row(
+                    p,
+                    "设备代号与型号",
+                    Some(&format!("{} (Apple Inc.)", dev.capabilities.name)),
+                    div(),
+                    false,
+                ))
+                .child(setting_row(
+                    p,
+                    "蓝牙物理地址 (MAC)",
+                    Some(&dev.mac_address),
+                    div(),
+                    true,
+                ))
+                .child(setting_row(
+                    p,
+                    "硬件固件架构",
+                    Some("A2564 • 65.1868046005000000.52 (官方 6A321 固件)"),
+                    div(),
+                    true,
+                ))
+                .child(setting_row(
+                    p,
+                    "硬件序列号",
+                    Some("主盒: CDGJFXHF63 | 左: GX6MGE30035Y | 右: GX6MGMWS0360"),
+                    div(),
+                    true,
+                )),
+        )
+        .child(section_header(p, "Linux 系统服务集成", None))
+        .child(
+            grouped_card(p)
+                .child(setting_row(
+                    p,
+                    "D-Bus MPRIS 媒体联动",
+                    Some("已激活自动入耳暂停、戴上自动续播与耳机按柄交互"),
+                    Tag::success().outline().child("运行中"),
+                    false,
+                ))
+                .child(setting_row(
+                    p,
+                    "PipeWire / PulseAudio 原生音频",
+                    Some("支持 A2DP 高清立体声音频流与无缝切换"),
+                    Tag::success().outline().child("正常"),
+                    true,
+                )),
+        )
 }

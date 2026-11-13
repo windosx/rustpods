@@ -174,6 +174,24 @@ fn gui_already_running() -> bool {
         .unwrap_or(false)
 }
 
+/// Asks an already-running RustPods GUI instance to bring its window forward.
+fn activate_running_gui() -> bool {
+    use zbus::blocking::Proxy;
+
+    let Ok(conn) = zbus::blocking::Connection::session() else {
+        return false;
+    };
+    let Ok(proxy) = Proxy::new(
+        &conn,
+        "io.github.rustpods.RustPods",
+        "/io/github/rustpods/RustPods",
+        "io.github.rustpods.RustPods",
+    ) else {
+        return false;
+    };
+    proxy.call::<_, _, ()>("Activate", &()).is_ok()
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -395,19 +413,26 @@ fn main() {
     } else {
         // The GUI is an AACP engine just like the daemon, so it takes the
         // same exclusive lock. A second GUI launch is still fine: when the
-        // GApplication bus name is already owned, that instance is simply
-        // activated and this one exits through the usual path.
+        // single-instance D-Bus name is already owned, we ask that instance to
+        // present its window and exit cleanly.
         let _instance_lock = match InstanceLock::acquire() {
-            Ok(lock) => Some(lock),
-            Err(_) if gui_already_running() => None,
+            Ok(lock) => lock,
+            Err(_) if gui_already_running() => {
+                if activate_running_gui() {
+                    info!("Activated existing RustPods GUI instance");
+                    return;
+                }
+                error!("Existing RustPods GUI instance did not respond to Activate");
+                std::process::exit(1);
+            }
             Err(reason) => {
                 error!("{}", reason);
                 std::process::exit(1);
             }
         };
 
-        // Run Libadwaita / GTK4 application
-        ui::run_app();
+        // Run GPUI application
+        ui::run_app(rt.handle().clone());
     }
 }
 

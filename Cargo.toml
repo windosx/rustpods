@@ -29,13 +29,10 @@ pipewire = { version = "0.10", optional = true }
 libspa = { version = "0.10", optional = true }
 
 # GUI dependencies
-gtk4 = { version = "0.9", features = ["v4_12"] }
-libadwaita = { version = "0.7", features = ["v1_5"] }
-glib = "0.20"
-gio = "0.20"
+gpui-kit = "0.9.1"
 
 [features]
-default = []
+default = ["audio-follow"]
 # Pan the stereo image to follow the wearer's head. Requires libpipewire-0.3
 # headers and libclang at build time.
 audio-follow = ["dep:pipewire", "dep:libspa"]

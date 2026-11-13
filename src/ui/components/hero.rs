@@ -1,138 +1,163 @@
-use crate::core::device::AirPodsDeviceState;
-use gtk4::prelude::*;
-use gtk4::{Align, Box, Button, Entry, Image, Label, Orientation, Popover};
-use std::sync::Arc;
+use crate::core::aacp::events::EarStatus;
+use crate::ui::state::RustPodsState;
+use crate::ui::theme::{control_card, ApplePalette};
+use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::Icon;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    div, px, Anchor, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _,
+};
 
-pub fn build_hero_card<F, C>(
-    state: &AirPodsDeviceState,
-    on_rename: F,
-    on_connect: C,
-) -> (Box, Label, Label, Label, Button)
-where
-    F: Fn(String) + Send + Sync + 'static,
-    C: Fn() + Send + Sync + 'static,
-{
-    let container = Box::new(Orientation::Vertical, 12);
-    container.add_css_class("card");
-    container.set_margin_start(16);
-    container.set_margin_end(16);
-    container.set_margin_top(16);
-    container.set_margin_bottom(8);
-    container.set_halign(Align::Fill);
+pub fn render_hero_card(
+    state: &RustPodsState,
+    app_state: &Entity<RustPodsState>,
+    rename_input: &Entity<InputState>,
+    p: &ApplePalette,
+) -> impl IntoElement {
+    let dev = &state.device;
+    let both_in_case = !dev.is_wearing_any()
+        && (dev.left_in_ear == EarStatus::InCase || dev.right_in_ear == EarStatus::InCase);
 
-    // Padding inside the card
-    let inner_box = Box::new(Orientation::Vertical, 8);
-    inner_box.set_margin_top(20);
-    inner_box.set_margin_bottom(20);
-    inner_box.set_margin_start(20);
-    inner_box.set_margin_end(20);
-
-    // AirPods Icon
-    let icon_image = Image::from_icon_name("audio-headphones-symbolic");
-    icon_image.set_pixel_size(72);
-    icon_image.add_css_class("accent");
-    inner_box.append(&icon_image);
-
-    // Title Row with Name & Edit Button
-    let title_row = Box::new(Orientation::Horizontal, 8);
-    title_row.set_halign(Align::Center);
-
-    let title_label = Label::new(Some(&state.name));
-    title_label.add_css_class("title-1");
-    title_row.append(&title_label);
-
-    let edit_btn = Button::from_icon_name("document-edit-symbolic");
-    edit_btn.add_css_class("flat");
-    edit_btn.add_css_class("circular");
-    edit_btn.set_tooltip_text(Some("重命名 AirPods"));
-
-    // Popover for rename
-    let popover = Popover::new();
-    let pop_box = Box::new(Orientation::Horizontal, 6);
-    pop_box.set_margin_top(8);
-    pop_box.set_margin_bottom(8);
-    pop_box.set_margin_start(8);
-    pop_box.set_margin_end(8);
-
-    let entry = Entry::new();
-    entry.set_text(&state.name);
-    entry.set_width_chars(20);
-
-    let confirm_btn = Button::with_label("保存");
-    confirm_btn.add_css_class("suggested-action");
-
-    let popover_clone = popover.clone();
-    let title_label_clone = title_label.clone();
-    let on_rename_arc = Arc::new(on_rename);
-    let on_rename_entry = on_rename_arc.clone();
-
-    let save_action = {
-        let entry = entry.clone();
-        let popover = popover_clone.clone();
-        let title_label = title_label_clone.clone();
-        move || {
-            let new_name = entry.text().trim().to_string();
-            if !new_name.is_empty() {
-                title_label.set_text(&new_name);
-                on_rename_entry(new_name);
-                popover.popdown();
-            }
-        }
+    let (status_text, status_color, status_bg) = if !dev.is_connected {
+        ("○ 未连接", p.text_secondary, p.pill_bg)
+    } else if both_in_case {
+        ("● 充电盒中", p.accent_blue, p.accent_blue.opacity(0.16))
+    } else {
+        ("● 已连接", p.accent_green, p.accent_green.opacity(0.16))
     };
 
-    let save_clone = save_action.clone();
-    confirm_btn.connect_clicked(move |_| save_clone());
-    entry.connect_activate(move |_| save_action());
+    let subtitle_text = format!("{} • {}", dev.capabilities.name, dev.mac_address);
 
-    pop_box.append(&entry);
-    pop_box.append(&confirm_btn);
-    popover.set_child(Some(&pop_box));
-    popover.set_parent(&edit_btn);
+    let app_for_rename = app_state.clone();
+    let input_for_rename = rename_input.clone();
+    let app_for_connect = app_state.clone();
+    let input_for_open = rename_input.clone();
+    let current_name = dev.name.clone();
 
-    edit_btn.connect_clicked(move |_| {
-        popover.popup();
-    });
-
-    title_row.append(&edit_btn);
-    inner_box.append(&title_row);
-
-    // Subtitle: Model name & MAC address
-    let subtitle_text = format!("{} • {}", state.capabilities.name, state.mac_address);
-    let subtitle_label = Label::new(Some(&subtitle_text));
-    subtitle_label.add_css_class("dim-label");
-    subtitle_label.add_css_class("caption");
-    inner_box.append(&subtitle_label);
-
-    // Status Pill & Connect Button Row
-    let status_row = Box::new(Orientation::Horizontal, 10);
-    status_row.set_halign(Align::Center);
-    status_row.set_margin_top(4);
-
-    let status_pill = Label::new(if state.is_connected {
-        Some("● 已连接")
-    } else {
-        Some("○ 未连接")
-    });
-    status_pill.add_css_class(if state.is_connected {
-        "success"
-    } else {
-        "dim-label"
-    });
-    status_pill.add_css_class("heading");
-    status_row.append(&status_pill);
-
-    let connect_btn = Button::with_label("点击连接");
-    connect_btn.add_css_class("suggested-action");
-    connect_btn.add_css_class("pill");
-    connect_btn.set_visible(!state.is_connected);
-    let on_connect_arc = Arc::new(on_connect);
-    connect_btn.connect_clicked(move |_| {
-        on_connect_arc();
-    });
-    status_row.append(&connect_btn);
-
-    inner_box.append(&status_row);
-
-    container.append(&inner_box);
-    (container, title_label, subtitle_label, status_pill, connect_btn)
+    control_card(p)
+        .py(px(22.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .w(px(76.))
+                .h(px(76.))
+                .rounded(px(999.))
+                .bg(p.accent_blue.opacity(if p.is_dark { 0.16 } else { 0.12 }))
+                .border_1()
+                .border_color(p.accent_blue.opacity(0.28))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(gpui_kit::assets::IconName::Headphones)
+                        .size(px(38.))
+                        .text_color(p.accent_blue),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(22.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.text_primary)
+                        .child(dev.name.clone()),
+                )
+                .child(
+                    Popover::new("hero-rename-popover")
+                        .anchor(Anchor::TopCenter)
+                        .on_open_change(move |open, window, cx| {
+                            if *open {
+                                input_for_open.update(cx, |input, cx| {
+                                    input.set_value(&current_name, window, cx);
+                                });
+                            }
+                        })
+                        .trigger(
+                            Button::new("hero-rename-btn")
+                                .ghost()
+                                .compact()
+                                .rounded(ButtonRounded::Size(px(999.)))
+                                .tooltip("重命名 AirPods")
+                                .icon(Icon::new(gpui_kit::assets::IconName::Pencil).size(px(14.))),
+                        )
+                        .content(move |_popover_state, _window, cx| {
+                            let popover_entity = cx.entity().clone();
+                            let input_save = input_for_rename.clone();
+                            let app_save = app_for_rename.clone();
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(Input::new(&input_for_rename).w(px(190.)))
+                                .child(
+                                    Button::new("hero-rename-save")
+                                        .primary()
+                                        .label("保存")
+                                        .on_click(move |_, window, cx| {
+                                            let new_name =
+                                                input_save.read(cx).value().trim().to_string();
+                                            if !new_name.is_empty() {
+                                                app_save.update(cx, |s, cx| {
+                                                    s.device.name = new_name.clone();
+                                                    s.controller.rename(new_name);
+                                                    cx.notify();
+                                                });
+                                                popover_entity.update(cx, |ps, cx| {
+                                                    ps.dismiss(window, cx);
+                                                });
+                                            }
+                                        }),
+                                )
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(12.5))
+                .text_color(p.text_secondary)
+                .child(subtitle_text),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .pt(px(2.))
+                .child(
+                    div()
+                        .px(px(12.))
+                        .py(px(4.))
+                        .rounded(px(999.))
+                        .bg(status_bg)
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(status_color)
+                        .child(status_text),
+                )
+                .when(!dev.is_connected, |this| {
+                    this.child(
+                        Button::new("hero-connect-btn")
+                            .primary()
+                            .rounded(ButtonRounded::Size(px(999.)))
+                            .label("点击连接")
+                            .on_click(move |_, _, cx| {
+                                app_for_connect.read(cx).controller.connect();
+                            }),
+                    )
+                }),
+        )
 }

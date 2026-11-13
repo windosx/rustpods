@@ -1,322 +1,343 @@
-use crate::core::head_tracking::{HeadGesture, HeadPose};
-use gtk4::prelude::*;
-use gtk4::{Align, Box, DrawingArea, Label, Orientation};
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::core::head_tracking::HeadGesture;
+use crate::ui::state::HeadTrackingViewState;
+use crate::ui::theme::{control_card, ApplePalette};
+use gpui_kit::component::Icon;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    canvas, div, hsla, point, px, App, Bounds, FontWeight, Hsla, IntoElement, ParentElement as _,
+    PathBuilder, Pixels, Point, Styled as _, Window,
+};
+use std::f32::consts::{PI, TAU};
 
-/// Widgets that the UI update loop needs to refresh at stream rate.
-pub struct HeadTrackingWidgets {
-    pub container: Box,
-    pub area: DrawingArea,
-    pub pitch_value: Label,
-    pub yaw_value: Label,
-    pub roll_value: Label,
-    pub status_label: Label,
-    pub gesture_label: Label,
-    pub state: Rc<RefCell<HeadTrackingViewState>>,
-}
+pub fn render_head_tracking_card(ht: &HeadTrackingViewState, p: &ApplePalette) -> impl IntoElement {
+    let ht_snapshot = ht.clone();
+    let dial_color = p.text_muted.opacity(0.45);
+    let inner_dial_color = p.text_muted.opacity(0.24);
+    let tick_color = p.text_muted.opacity(0.38);
+    let needle_color = p.accent_blue;
 
-#[derive(Debug, Clone)]
-pub struct HeadTrackingViewState {
-    pub pose: Option<HeadPose>,
-    pub status: String,
-    pub gesture: Option<HeadGesture>,
-    pub rate_hz: Option<f32>,
-    pub calibrated: bool,
-}
-
-impl Default for HeadTrackingViewState {
-    fn default() -> Self {
-        Self {
-            pose: None,
-            status: "等待数据流…".to_string(),
-            gesture: None,
-            rate_hz: None,
-            calibrated: false,
-        }
-    }
-}
-
-/// Builds the "空间音频与头部追踪" page.
-///
-/// The compass is drawn with Cairo rather than a stack of widgets: at ~50
-/// samples per second the pose changes too fast for layout, and the arrow needs
-/// continuous angles rather than snapped ones.
-pub fn build_head_tracking_page() -> HeadTrackingWidgets {
-    let container = Box::new(Orientation::Vertical, 14);
-    container.set_margin_top(16);
-    container.set_margin_bottom(24);
-    container.set_margin_start(20);
-    container.set_margin_end(20);
-
-    let card = Box::new(Orientation::Vertical, 10);
-    card.add_css_class("card");
-    card.set_margin_start(16);
-    card.set_margin_end(16);
-    card.set_margin_top(8);
-    card.set_margin_bottom(8);
-
-    let inner = Box::new(Orientation::Vertical, 10);
-    inner.set_margin_top(16);
-    inner.set_margin_bottom(16);
-    inner.set_margin_start(16);
-    inner.set_margin_end(16);
-
-    let header_row = Box::new(Orientation::Horizontal, 8);
-    let icon = gtk4::Image::from_icon_name("audio-headphones-symbolic");
-    header_row.append(&icon);
-    let title = Label::new(Some("空间音频与头部追踪"));
-    title.add_css_class("heading");
-    title.set_halign(Align::Start);
-    header_row.append(&title);
-    inner.append(&header_row);
-
-    let status_label = Label::new(Some("等待数据流…"));
-    status_label.add_css_class("caption");
-    status_label.add_css_class("dim-label");
-    status_label.set_halign(Align::Start);
-    status_label.set_wrap(true);
-    inner.append(&status_label);
-
-    // Live compass
-    let area = DrawingArea::new();
-    area.set_content_width(300);
-    area.set_content_height(300);
-    area.set_halign(Align::Center);
-    area.set_margin_top(8);
-    area.set_margin_bottom(8);
-
-    let state = Rc::new(RefCell::new(HeadTrackingViewState::default()));
-
-    {
-        let state = state.clone();
-        area.set_draw_func(move |_, cr, width, height| {
-            draw_compass(cr, width, height, &state.borrow());
-        });
-    }
-
-    inner.append(&area);
-
-    // Numeric readout
-    let readout = Box::new(Orientation::Horizontal, 24);
-    readout.set_halign(Align::Center);
-    readout.set_margin_top(4);
-
-    let mk_readout = |label: &str| {
-        let column = Box::new(Orientation::Vertical, 2);
-        column.set_halign(Align::Center);
-        let caption = Label::new(Some(label));
-        caption.add_css_class("caption");
-        caption.add_css_class("dim-label");
-        let value = Label::new(Some("—"));
-        value.add_css_class("title-3");
-        column.append(&caption);
-        column.append(&value);
-        (column, value)
+    let (pitch_str, yaw_str, roll_str) = match ht.pose {
+        Some(pose) if ht.calibrated => (
+            format!("{:.1}°", pose.pitch),
+            format!("{:.1}°", pose.yaw),
+            format!("{:.1}°", pose.roll),
+        ),
+        _ => ("—".to_string(), "—".to_string(), "—".to_string()),
     };
 
-    let (pitch_col, pitch_value) = mk_readout("俯仰 pitch");
-    let (yaw_col, yaw_value) = mk_readout("偏航 yaw");
-    let (roll_col, roll_value) = mk_readout("横滚 roll");
-    readout.append(&pitch_col);
-    readout.append(&yaw_col);
-    readout.append(&roll_col);
-    inner.append(&readout);
+    let (gesture_text, gesture_color, gesture_bg) = match ht.gesture {
+        Some(HeadGesture::NodYes) => (
+            "✓ 检测到点头（是）".to_string(),
+            p.accent_green,
+            p.accent_green.opacity(0.14),
+        ),
+        Some(HeadGesture::ShakeNo) => (
+            "✗ 检测到摇头（否）".to_string(),
+            p.accent_blue,
+            p.accent_blue.opacity(0.14),
+        ),
+        None => {
+            let hint = match ht.rate_hz {
+                Some(rate) => format!("点头 / 摇头可触发手势 · {:.0} Hz", rate),
+                None => "点头 / 摇头可触发手势".to_string(),
+            };
+            (hint, p.text_secondary, p.pill_bg)
+        }
+    };
 
-    // Gesture feedback
-    let gesture_label = Label::new(Some("点头 / 摇头可触发手势"));
-    gesture_label.add_css_class("caption");
-    gesture_label.add_css_class("dim-label");
-    gesture_label.set_halign(Align::Center);
-    gesture_label.set_margin_top(6);
-    inner.append(&gesture_label);
-
-    card.append(&inner);
-    container.append(&card);
-
-    HeadTrackingWidgets {
-        container,
-        area,
-        pitch_value,
-        yaw_value,
-        roll_value,
-        status_label,
-        gesture_label,
-        state,
-    }
+    control_card(p)
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            Icon::new(gpui_kit::assets::IconName::Compass)
+                                .size(px(18.))
+                                .text_color(p.accent_blue),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(15.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(p.text_primary)
+                                .child("空间音频与头部追踪"),
+                        ),
+                )
+                .when_some(ht.rate_hz.filter(|_| ht.calibrated), |this, hz| {
+                    this.child(
+                        div()
+                            .px(px(10.))
+                            .py(px(3.))
+                            .rounded(px(999.))
+                            .bg(p.accent_blue.opacity(0.16))
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.accent_blue)
+                            .child(format!("{:.0} Hz", hz)),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_size(px(12.5))
+                .text_color(p.text_secondary)
+                .child(ht.status.clone()),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .py(px(4.))
+                .child(
+                    div()
+                        .relative()
+                        .w(px(300.))
+                        .h(px(300.))
+                        .child(
+                            canvas(
+                                move |bounds: Bounds<Pixels>, _w: &mut Window, _cx: &mut App| {
+                                    bounds
+                                },
+                                move |_bounds,
+                                      bounds: Bounds<Pixels>,
+                                      window: &mut Window,
+                                      _cx: &mut App| {
+                                    paint_compass(
+                                        window,
+                                        bounds,
+                                        &ht_snapshot,
+                                        dial_color,
+                                        inner_dial_color,
+                                        tick_color,
+                                        needle_color,
+                                    );
+                                },
+                            )
+                            .size_full(),
+                        )
+                        // Cardinal labels around the dial
+                        .child(cardinal_label("前", p).top(px(2.)).left(px(142.)))
+                        .child(cardinal_label("后", p).bottom(px(2.)).left(px(142.)))
+                        .child(cardinal_label("左", p).left(px(4.)).top(px(141.)))
+                        .child(cardinal_label("右", p).right(px(4.)).top(px(141.))),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .gap(px(16.))
+                .child(readout_chip("俯仰 pitch", &pitch_str, p))
+                .child(readout_chip("偏航 yaw", &yaw_str, p))
+                .child(readout_chip("横滚 roll", &roll_str, p)),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .pt(px(2.))
+                .child(
+                    div()
+                        .px(px(14.))
+                        .py(px(6.))
+                        .rounded(px(999.))
+                        .bg(gesture_bg)
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(gesture_color)
+                        .child(gesture_text),
+                ),
+        )
 }
 
-fn draw_compass(cr: &gtk4::cairo::Context, width: i32, height: i32, state: &HeadTrackingViewState) {
-    let w = width as f64;
-    let h = height as f64;
-    let cx = w / 2.0;
-    let cy = h / 2.0;
-    let radius = w.min(h) / 2.0 - 28.0;
+fn cardinal_label(text: &str, p: &ApplePalette) -> gpui_kit::Div {
+    div()
+        .absolute()
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(p.text_secondary)
+        .child(text.to_string())
+}
 
-    // Dial
-    cr.set_line_width(2.0);
-    cr.set_source_rgba(0.55, 0.55, 0.60, 0.45);
-    cr.arc(cx, cy, radius, 0.0, std::f64::consts::TAU);
-    cr.stroke().ok();
+fn readout_chip(label: &str, value: &str, p: &ApplePalette) -> impl IntoElement {
+    div()
+        .flex_1()
+        .max_w(px(140.))
+        .rounded(px(12.))
+        .bg(p.card_elevated_bg)
+        .border_1()
+        .border_color(p.card_border)
+        .py(px(10.))
+        .px(px(12.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(3.))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(p.text_secondary)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(16.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_primary)
+                .child(value.to_string()),
+        )
+}
 
-    // Inner ring
-    cr.set_line_width(1.0);
-    cr.set_source_rgba(0.55, 0.55, 0.60, 0.22);
-    cr.arc(cx, cy, radius * 0.62, 0.0, std::f64::consts::TAU);
-    cr.stroke().ok();
+fn paint_compass(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    state: &HeadTrackingViewState,
+    dial_color: Hsla,
+    inner_dial_color: Hsla,
+    tick_color: Hsla,
+    needle_color: Hsla,
+) {
+    let w = bounds.size.width.as_f32();
+    let h = bounds.size.height.as_f32();
+    let cx = bounds.origin.x.as_f32() + w * 0.5;
+    let cy = bounds.origin.y.as_f32() + h * 0.5;
+    let radius = (w.min(h) * 0.5 - 28.0).max(20.0);
 
-    // Tick marks every 30 degrees, labelled on the primary axes
+    // Outer dial
+    paint_circle_stroke(window, cx, cy, radius, 2.0, dial_color);
+    // Inner dial
+    paint_circle_stroke(window, cx, cy, radius * 0.62, 1.0, inner_dial_color);
+
+    // 12 radial ticks (every 30 degrees)
     for i in 0..12 {
-        let angle = i as f64 * std::f64::consts::PI / 6.0;
+        let angle = i as f32 * PI / 6.0;
         let inner = radius * 0.88;
         let outer = radius;
-        cr.set_source_rgba(0.55, 0.55, 0.60, 0.35);
-        cr.move_to(cx + inner * angle.cos(), cy + inner * angle.sin());
-        cr.line_to(cx + outer * angle.cos(), cy + outer * angle.sin());
-        cr.stroke().ok();
-    }
-
-    // Axis labels
-    cr.set_source_rgba(0.6, 0.6, 0.65, 0.75);
-    cr.set_font_size(13.0);
-    let labels = [
-        ("前", 0.0, -1.0),
-        ("后", 0.0, 1.0),
-        ("左", -1.0, 0.0),
-        ("右", 1.0, 0.0),
-    ];
-    for (text, dx, dy) in labels {
-        let extent = cr.text_extents(text).map(|e| (e.width(), e.height())).unwrap_or((0.0, 0.0));
-        cr.move_to(
-            cx + dx * (radius + 14.0) - extent.0 / 2.0,
-            cy + dy * (radius + 14.0) + extent.1 / 2.0,
-        );
-        cr.show_text(text).ok();
+        let mut tick = PathBuilder::stroke(px(1.5));
+        tick.move_to(point(px(cx + inner * angle.cos()), px(cy + inner * angle.sin())));
+        tick.line_to(point(px(cx + outer * angle.cos()), px(cy + outer * angle.sin())));
+        if let Ok(path) = tick.build() {
+            window.paint_path(path, tick_color);
+        }
     }
 
     let Some(pose) = state.pose else {
         // Idle crosshair
-        cr.set_source_rgba(0.55, 0.55, 0.60, 0.30);
-        cr.set_line_width(1.5);
-        cr.move_to(cx - 12.0, cy);
-        cr.line_to(cx + 12.0, cy);
-        cr.move_to(cx, cy - 12.0);
-        cr.line_to(cx, cy + 12.0);
-        cr.stroke().ok();
+        let cross_color = hsla(220. / 360., 0.1, 0.58, 0.35);
+        let mut cross = PathBuilder::stroke(px(1.5));
+        cross.move_to(point(px(cx - 12.0), px(cy)));
+        cross.line_to(point(px(cx + 12.0), px(cy)));
+        cross.move_to(point(px(cx), px(cy - 12.0)));
+        cross.line_to(point(px(cx), px(cy + 12.0)));
+        if let Ok(path) = cross.build() {
+            window.paint_path(path, cross_color);
+        }
         return;
     };
 
-    // The gyro scale in the protocol document is marked approximate ("~0.122
-    // deg/s per LSB"), and the integrated angles come out on the small side, so
-    // the dial is drawn with a visible gain. Motion amplification is a rendering
-    // choice; it does not change what the sensor reported.
-    const DISPLAY_GAIN: f64 = 2.2;
-
-    // Yaw: clockwise from "front", matching how a wearer turns their head.
-    let yaw_rad = (pose.yaw as f64 * DISPLAY_GAIN).to_radians().clamp(-3.0, 3.0);
-    // Pitch shortens the arrow: looking up pulls the tip toward the centre.
-    // The cube-root-ish easing keeps small movements visible instead of
-    // flattening everything below 30 degrees.
-    let pitch_norm = (pose.pitch as f64 * DISPLAY_GAIN / 90.0).clamp(-1.0, 1.0);
+    // Drawn at 1:1 with the reported angles (matching headtracking.rs behavior).
+    let yaw_rad = pose.yaw.to_radians();
+    let pitch_norm = (pose.pitch / 90.0).clamp(-1.0, 1.0);
     let pitch_factor = 1.0 - pitch_norm.abs().powf(0.6) * 0.45;
-    // Roll tips the whole dial, which is what leaning toward a shoulder does.
-    // Without this the compass ignored roll entirely, so that motion looked like
-    // nothing was happening.
-    let roll_rad = (pose.roll as f64 * DISPLAY_GAIN)
-        .to_radians()
-        .clamp(-1.4, 1.4);
+    let roll_rad = pose.roll.to_radians().clamp(-1.4, 1.4);
 
-    cr.save().ok();
-    cr.translate(cx, cy);
-    cr.rotate(roll_rad * 0.5);
-    cr.translate(-cx, -cy);
-
-    cr.set_source_rgba(0.36, 0.66, 1.0, 0.95);
-    cr.set_line_width(3.0);
-    cr.set_line_cap(gtk4::cairo::LineCap::Round);
-
-    let tip_len = radius * 0.78 * pitch_factor;
-    let tip_x = cx + tip_len * yaw_rad.sin();
-    let tip_y = cy - tip_len * yaw_rad.cos();
-
-    cr.move_to(cx, cy);
-    cr.line_to(tip_x, tip_y);
-    cr.stroke().ok();
-
-    // Arrowhead
-    let head = 12.0;
-    let back = yaw_rad + std::f64::consts::PI;
-    let left = back - 0.45;
-    let right = back + 0.45;
-    cr.set_source_rgba(0.36, 0.66, 1.0, 0.95);
-    cr.move_to(tip_x, tip_y);
-    cr.line_to(tip_x + head * left.sin(), tip_y - head * left.cos());
-    cr.line_to(tip_x + head * right.sin(), tip_y - head * right.cos());
-    cr.close_path();
-    cr.fill().ok();
-
-    cr.restore().ok();
-
-    // Centre dot
-    cr.set_source_rgba(0.36, 0.66, 1.0, 0.9);
-    cr.arc(cx, cy, 4.0, 0.0, std::f64::consts::TAU);
-    cr.fill().ok();
-}
-
-/// Refreshes labels and redraws the compass from the latest pose.
-pub fn update_head_tracking_widgets(widgets: &HeadTrackingWidgets) {
-    let (pose, status, gesture, rate, calibrated) = {
-        let state = widgets.state.borrow();
-        (
-            state.pose,
-            state.status.clone(),
-            state.gesture,
-            state.rate_hz,
-            state.calibrated,
-        )
+    // Rotate relative vector by roll * 0.5 around center (cx, cy).
+    let rot = roll_rad * 0.5;
+    let rotate_pt = |dx: f32, dy: f32| -> Point<Pixels> {
+        let rx = dx * rot.cos() - dy * rot.sin();
+        let ry = dx * rot.sin() + dy * rot.cos();
+        point(px(cx + rx), px(cy + ry))
     };
 
-    widgets.status_label.set_text(&status);
+    let tip_len = radius * 0.78 * pitch_factor;
+    let tip_dx = tip_len * yaw_rad.sin();
+    let tip_dy = -tip_len * yaw_rad.cos();
 
-    match pose {
-        Some(pose) if calibrated => {
-            widgets
-                .pitch_value
-                .set_text(&format!("{:.1}°", pose.pitch));
-            widgets.yaw_value.set_text(&format!("{:.1}°", pose.yaw));
-            widgets
-                .roll_value
-                .set_text(&format!("{:.1}°", pose.roll));
-        }
-        _ => {
-            widgets.pitch_value.set_text("—");
-            widgets.yaw_value.set_text("—");
-            widgets.roll_value.set_text("—");
-        }
+    let mut shaft = PathBuilder::stroke(px(3.2));
+    shaft.move_to(point(px(cx), px(cy)));
+    shaft.line_to(rotate_pt(tip_dx, tip_dy));
+    if let Ok(path) = shaft.build() {
+        window.paint_path(path, needle_color);
     }
 
-    match gesture {
-        Some(HeadGesture::NodYes) => {
-            widgets.gesture_label.set_text("✓ 检测到点头（是）");
-            widgets.gesture_label.remove_css_class("dim-label");
-            widgets.gesture_label.add_css_class("success");
-        }
-        Some(HeadGesture::ShakeNo) => {
-            widgets.gesture_label.set_text("✗ 检测到摇头（否）");
-            widgets.gesture_label.remove_css_class("dim-label");
-            widgets.gesture_label.add_css_class("accent");
-        }
-        None => {
-            let hint = match rate {
-                Some(rate) => format!("点头 / 摇头可触发手势 · {:.0} Hz", rate),
-                None => "点头 / 摇头可触发手势".to_string(),
-            };
-            widgets.gesture_label.set_text(&hint);
-            widgets.gesture_label.remove_css_class("success");
-            widgets.gesture_label.remove_css_class("accent");
-            widgets.gesture_label.add_css_class("dim-label");
-        }
+    // Arrowhead
+    let head = 12.0_f32;
+    let back = yaw_rad + PI;
+    let left_a = back - 0.45;
+    let right_a = back + 0.45;
+
+    let mut arrow = PathBuilder::fill();
+    arrow.move_to(rotate_pt(tip_dx, tip_dy));
+    arrow.line_to(rotate_pt(
+        tip_dx + head * left_a.sin(),
+        tip_dy - head * left_a.cos(),
+    ));
+    arrow.line_to(rotate_pt(
+        tip_dx + head * right_a.sin(),
+        tip_dy - head * right_a.cos(),
+    ));
+    arrow.close();
+    if let Ok(path) = arrow.build() {
+        window.paint_path(path, needle_color);
     }
 
-    widgets.area.queue_draw();
+    // Center dot
+    paint_circle_fill(window, cx, cy, 4.2, needle_color);
+}
+
+fn paint_circle_stroke(
+    window: &mut Window,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    width: f32,
+    color: Hsla,
+) {
+    let mut pb = PathBuilder::stroke(px(width));
+    const SEGMENTS: usize = 72;
+    for i in 0..=SEGMENTS {
+        let a = (i as f32 / SEGMENTS as f32) * TAU;
+        let pt = point(px(cx + radius * a.cos()), px(cy + radius * a.sin()));
+        if i == 0 {
+            pb.move_to(pt);
+        } else {
+            pb.line_to(pt);
+        }
+    }
+    if let Ok(path) = pb.build() {
+        window.paint_path(path, color);
+    }
+}
+
+fn paint_circle_fill(window: &mut Window, cx: f32, cy: f32, radius: f32, color: Hsla) {
+    let mut pb = PathBuilder::fill();
+    const SEGMENTS: usize = 20;
+    for i in 0..SEGMENTS {
+        let a = (i as f32 / SEGMENTS as f32) * TAU;
+        let pt = point(px(cx + radius * a.cos()), px(cy + radius * a.sin()));
+        if i == 0 {
+            pb.move_to(pt);
+        } else {
+            pb.line_to(pt);
+        }
+    }
+    pb.close();
+    if let Ok(path) = pb.build() {
+        window.paint_path(path, color);
+    }
 }

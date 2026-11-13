@@ -1,122 +1,116 @@
-use crate::core::aacp::commands::MicrophoneMode;
-use crate::system::config::PauseBehavior;
-use gtk4::StringList;
-use libadwaita::prelude::*;
-use libadwaita::{ActionRow, ComboRow, PreferencesGroup, SwitchRow};
-use std::sync::Arc;
+use crate::ui::state::RustPodsState;
+use crate::ui::theme::{grouped_card, section_header, setting_row, ApplePalette};
+use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tag::Tag;
+use gpui_kit::component::Icon;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{div, px, Entity, IntoElement, ParentElement as _, Styled as _};
 
-pub fn build_smart_settings_group<E, P, C, M, K>(
-    ear_detection_enabled: bool,
-    pause_behavior: PauseBehavior,
-    conv_awareness_enabled: bool,
-    mic_mode: MicrophoneMode,
-    case_chime_enabled: bool,
-    has_case_speaker: bool,
-    on_toggle_ear_detection: E,
-    on_change_pause_behavior: P,
-    on_toggle_conv_awareness: C,
-    on_change_mic_mode: M,
-    on_toggle_case_chime: K,
-) -> PreferencesGroup
-where
-    E: Fn(bool) + Send + Sync + 'static,
-    P: Fn(PauseBehavior) + Send + Sync + 'static,
-    C: Fn(bool) + Send + Sync + 'static,
-    M: Fn(MicrophoneMode) + Send + Sync + 'static,
-    K: Fn(bool) + Send + Sync + 'static,
-{
-    let group = PreferencesGroup::new();
-    group.set_title("智能交互与音频控制");
-    group.set_description(Some("联动 Linux MPRIS 播放器与 PipeWire 音频系统"));
+pub fn render_settings_page(
+    state: &RustPodsState,
+    app_state: &Entity<RustPodsState>,
+    pause_select: &Entity<SelectState<Vec<&'static str>>>,
+    mic_select: &Entity<SelectState<Vec<&'static str>>>,
+    p: &ApplePalette,
+) -> impl IntoElement {
+    let cfg = state.config_snapshot();
+    let dev = &state.device;
 
-    // Ear detection switch
-    let ear_row = SwitchRow::new();
-    ear_row.set_title("自动入耳检测");
-    ear_row.set_subtitle("摘下耳机自动暂停媒体播放，重新戴上后自动恢复");
-    ear_row.set_active(ear_detection_enabled);
-    let on_ear_arc = Arc::new(on_toggle_ear_detection);
-    ear_row.connect_active_notify(move |sw| {
-        on_ear_arc(sw.is_active());
-    });
-    group.add(&ear_row);
+    let app_ear = app_state.clone();
+    let app_conv = app_state.clone();
+    let app_chime = app_state.clone();
 
-    // Pause behavior combo row
-    let pause_items = StringList::new(&["单耳摘下即暂停 (推荐)", "双耳均摘下才暂停", "从不暂停"]);
-    let pause_combo = ComboRow::new();
-    pause_combo.set_title("暂停媒体行为");
-    pause_combo.set_subtitle("检测到摘下耳塞时的响应模式");
-    pause_combo.set_model(Some(&pause_items));
-    let initial_selected = match pause_behavior {
-        PauseBehavior::OneRemoved => 0,
-        PauseBehavior::BothRemoved => 1,
-        PauseBehavior::Never => 2,
-    };
-    pause_combo.set_selected(initial_selected);
-    let on_pause_arc = Arc::new(on_change_pause_behavior);
-    pause_combo.connect_selected_notify(move |combo| {
-        let behavior = match combo.selected() {
-            1 => PauseBehavior::BothRemoved,
-            2 => PauseBehavior::Never,
-            _ => PauseBehavior::OneRemoved,
-        };
-        on_pause_arc(behavior);
-    });
-    group.add(&pause_combo);
-
-    // Conversational awareness
-    let conv_row = SwitchRow::new();
-    conv_row.set_title("对话感知 (Conversational Awareness)");
-    conv_row.set_subtitle("开口说话时自动压低媒体播放音量，并降低背景环境噪声");
-    conv_row.set_active(conv_awareness_enabled);
-    let on_conv_arc = Arc::new(on_toggle_conv_awareness);
-    conv_row.connect_active_notify(move |sw| {
-        on_conv_arc(sw.is_active());
-    });
-    group.add(&conv_row);
-
-    // Microphone Mode
-    let mic_items = StringList::new(&["自动切换 (默认)", "始终左耳", "始终右耳"]);
-    let mic_combo = ComboRow::new();
-    mic_combo.set_title("麦克风选择");
-    mic_combo.set_subtitle("指定通话及录音优先使用的耳塞麦克风");
-    mic_combo.set_model(Some(&mic_items));
-    let initial_mic_idx = match mic_mode {
-        MicrophoneMode::Automatic => 0,
-        MicrophoneMode::AlwaysLeft => 1,
-        MicrophoneMode::AlwaysRight => 2,
-    };
-    mic_combo.set_selected(initial_mic_idx);
-    let on_mic_arc = Arc::new(on_change_mic_mode);
-    mic_combo.connect_selected_notify(move |combo| {
-        let mode = match combo.selected() {
-            1 => MicrophoneMode::AlwaysLeft,
-            2 => MicrophoneMode::AlwaysRight,
-            _ => MicrophoneMode::Automatic,
-        };
-        on_mic_arc(mode);
-    });
-    group.add(&mic_combo);
-
-    // Case Tone
-    if has_case_speaker {
-        let chime_row = SwitchRow::new();
-        chime_row.set_title("充电盒提示音");
-        chime_row.set_subtitle("充电开始与寻找定位时通过充电盒外放提示音");
-        chime_row.set_active(case_chime_enabled);
-        let on_chime_arc = Arc::new(on_toggle_case_chime);
-        chime_row.connect_active_notify(move |sw| {
-            on_chime_arc(sw.is_active());
-        });
-        group.add(&chime_row);
-    }
-
-    // MPRIS integration info row
-    let info_row = ActionRow::new();
-    info_row.set_title("Linux MPRIS 播放器集成");
-    info_row.set_subtitle("入耳自动暂停/续播适用于任何实现 MPRIS 接口的正在播放的播放器");
-    let check_icon = gtk4::Image::from_icon_name("emblem-ok-symbolic");
-    info_row.add_suffix(&check_icon);
-    group.add(&info_row);
-
-    group
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(14.))
+        .child(section_header(
+            p,
+            "智能交互与音频控制",
+            Some("联动 Linux MPRIS 播放器与 PipeWire 音频系统"),
+        ))
+        .child(
+            grouped_card(p)
+                .child(setting_row(
+                    p,
+                    "自动入耳检测",
+                    Some("摘下耳机自动暂停媒体播放，重新戴上后自动恢复"),
+                    Switch::new("ear-detection-switch")
+                        .checked(cfg.ear_detection_enabled)
+                        .on_change(move |checked, _, cx| {
+                            let val = *checked;
+                            app_ear.update(cx, |s, cx| {
+                                s.device.ear_detection_enabled = val;
+                                s.controller.toggle_ear_detection(val);
+                                cx.notify();
+                            });
+                        }),
+                    false,
+                ))
+                .child(setting_row(
+                    p,
+                    "暂停媒体行为",
+                    Some("检测到摘下耳塞时的响应模式"),
+                    Select::new(pause_select).w(px(210.)),
+                    true,
+                ))
+                .child(setting_row(
+                    p,
+                    "对话感知 (Conversational Awareness)",
+                    Some("开口说话时自动压低媒体播放音量，并降低背景环境噪声"),
+                    Switch::new("conv-awareness-switch")
+                        .checked(cfg.conversational_awareness_enabled)
+                        .on_change(move |checked, _, cx| {
+                            let val = *checked;
+                            app_conv.update(cx, |s, cx| {
+                                s.device.conversational_awareness = val;
+                                s.controller.toggle_conversational_awareness(val);
+                                cx.notify();
+                            });
+                        }),
+                    true,
+                ))
+                .child(setting_row(
+                    p,
+                    "麦克风选择",
+                    Some("指定通话及录音优先使用的耳塞麦克风"),
+                    Select::new(mic_select).w(px(170.)),
+                    true,
+                ))
+                .when(dev.capabilities.has_case_speaker, |this| {
+                    this.child(setting_row(
+                        p,
+                        "充电盒提示音",
+                        Some("充电开始与寻找定位时通过充电盒外放提示音"),
+                        Switch::new("case-chime-switch")
+                            .checked(dev.case_chime_enabled)
+                            .on_change(move |checked, _, cx| {
+                                let val = *checked;
+                                app_chime.update(cx, |s, cx| {
+                                    s.device.case_chime_enabled = val;
+                                    s.controller.toggle_case_chime(val);
+                                    cx.notify();
+                                });
+                            }),
+                        true,
+                    ))
+                })
+                .child(setting_row(
+                    p,
+                    "Linux MPRIS 播放器集成",
+                    Some("入耳自动暂停/续播适用于任何实现 MPRIS 接口的正在播放的播放器"),
+                    Tag::success().outline().child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(Icon::new(gpui_kit::component::IconName::Check).size(px(12.)))
+                            .child("已启用"),
+                    ),
+                    true,
+                )),
+        )
 }
