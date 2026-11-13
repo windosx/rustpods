@@ -4,7 +4,6 @@ use crate::ui::components::{
     agents::render_agents_page, battery::render_battery_card, headtracking::render_head_tracking_card,
     hero::render_hero_card, noise::render_noise_control_card,
     preferences::render_preferences_page, settings::render_settings_page,
-    zcode_ask::render_zcode_ask_card,
 };
 use crate::ui::state::{NavPage, RustPodsState};
 use crate::ui::theme::{apply_apple_theme, palette};
@@ -14,7 +13,6 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{SelectEvent, SelectState};
 use gpui_kit::component::slider::{SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::{Icon, IndexPath, ThemeMode, TitleBar};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, size, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
@@ -470,14 +468,6 @@ impl Render for MainWindow {
                 .flex_col()
                 .gap(px(14.))
                 .child(render_head_tracking_card(&state.head_tracking, &p))
-                .when_some(
-                    render_zcode_ask_card(
-                        state.zcode_progress.as_ref(),
-                        state.zcode_resolved.as_deref(),
-                        &p,
-                    ),
-                    |this, card| this.child(card),
-                )
                 .into_any_element(),
 
             NavPage::Controls => render_settings_page(

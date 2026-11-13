@@ -21,16 +21,12 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
-/// Before the first reply arrives from the accessory, a silent L2CAP socket
-/// usually means we connected mid-BR/EDR bring-up and the accessory ignored
-/// the handshake. Fail fast in 3s instead of sitting silent for 12s.
-const INITIAL_RESPONSE_WATCHDOG: Duration = Duration::from_secs(3);
 /// A dead L2CAP link does not necessarily close the socket, so the receive
 /// loop's read carries this watchdog: past it, the link is treated as gone
 /// and the normal disconnect cleanup runs. Must comfortably exceed the
 /// longest quiet stretch of a live link (head tracking streams at ~50 Hz and
-/// battery/ear notifications arrive every few seconds).
-const RECV_WATCHDOG: Duration = Duration::from_secs(12);
+/// battery/ear notifications arrive every few seconds or via 8s status polling).
+const RECV_WATCHDOG: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone)]
@@ -420,35 +416,25 @@ impl AacpManager {
             // Throttle for the "gate dropped a sample" log, so an unworn unit
             // does not flood the log at wire rate.
             let mut gate_logged_at = None::<std::time::Instant>;
-            let mut received_any_packet = false;
             loop {
                 // A dead L2CAP link does not necessarily close the socket:
                 // buds out of range or grabbed by another host leave this
-                // recv parked forever while the process looks alive. Twice
-                // live (2026-11-09 09:43 and 11:08) the whole event loop -
-                // battery, ear detection, telemetry - froze exactly like
-                // this. A read watchdog turns the silent death into the
-                // normal disconnect path, where reconnect logic takes over.
-                let watchdog = if received_any_packet {
-                    RECV_WATCHDOG
-                } else {
-                    INITIAL_RESPONSE_WATCHDOG
-                };
-                let read = tokio::time::timeout(watchdog, seq_packet_recv.recv(&mut buf));
+                // recv parked forever while the process looks alive. A read
+                // watchdog turns the silent death into the normal disconnect
+                // path, where reconnect logic takes over.
+                let read = tokio::time::timeout(RECV_WATCHDOG, seq_packet_recv.recv(&mut buf));
                 let reply = match read.await {
                     Ok(reply) => reply,
                     Err(_) => {
                         warn!(
-                            "AACP link silent for {}s (received_any={}); treating it as disconnected",
-                            watchdog.as_secs(),
-                            received_any_packet
+                            "AACP link silent for {}s; treating it as disconnected",
+                            RECV_WATCHDOG.as_secs()
                         );
                         break;
                     }
                 };
                 match reply {
                     Ok(len) if len > 0 => {
-                        received_any_packet = true;
                         let packet = &buf[..len];
                         if len > 4 && packet[4] == 0x17 {
                             if routes_to_xml(packet) {

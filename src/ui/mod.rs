@@ -1,3 +1,4 @@
+pub mod ask_popup;
 pub mod components;
 pub mod popup;
 pub mod state;
@@ -166,6 +167,8 @@ fn bootstrap_gui(
     let active_window: Arc<std::sync::Mutex<Option<AnyWindowHandle>>> =
         Arc::new(std::sync::Mutex::new(None));
     let popup_window: Arc<std::sync::Mutex<Option<gpui_kit::WindowHandle<popup::CasePopupWindow>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let ask_popup_window: Arc<std::sync::Mutex<Option<gpui_kit::WindowHandle<ask_popup::AskPopupWindow>>>> =
         Arc::new(std::sync::Mutex::new(None));
     open_or_activate_window(&app_state, &active_window, cx);
 
@@ -416,22 +419,46 @@ fn bootstrap_gui(
         .detach();
     }
 
-    // 5 Hz poll for ZCode question card.
+    // Poll and event-driven manager for ZCode question popup.
     {
         let state_ask = app_state.clone();
+        let ask_popup_slot = ask_popup_window.clone();
+        let mut active_qid: Option<u64> = None;
+
         cx.spawn(async move |cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(200))
-                .await;
+            tokio::select! {
+                _ = crate::system::zcode_ask::ASK_HUB.notified() => {},
+                _ = cx.background_executor().timer(Duration::from_millis(100)) => {},
+            }
             let progress = crate::system::zcode_ask::ASK_HUB.progress_snapshot();
             let resolved = crate::system::zcode_ask::ASK_HUB.resolved_note();
-            state_ask.update(cx, |s, cx| {
+
+            let _ = state_ask.update(cx, |s, cx| {
                 if s.zcode_progress != progress || s.zcode_resolved != resolved {
-                    s.zcode_progress = progress;
-                    s.zcode_resolved = resolved;
+                    s.zcode_progress = progress.clone();
+                    s.zcode_resolved = resolved.clone();
                     cx.notify();
                 }
             });
+
+            if let Some(ref q) = progress {
+                if active_qid != Some(q.id) {
+                    active_qid = Some(q.id);
+                    let st = state_ask.clone();
+                    let slot = ask_popup_slot.clone();
+                    let _ = cx.update(|cx| {
+                        ask_popup::open_or_refresh_ask_popup(&st, &slot, cx);
+                    });
+                }
+            } else {
+                active_qid = None;
+                if resolved.is_none() {
+                    let slot = ask_popup_slot.clone();
+                    let _ = cx.update(|cx| {
+                        ask_popup::close_ask_popup(&slot, cx);
+                    });
+                }
+            }
         })
         .detach();
     }
@@ -578,7 +605,22 @@ pub async fn start_bluetooth_daemon(
         }
     }
 
-    let mut was_disconnected = false;
+    // Pre-populate device state with paired AirPods so BLE proximity monitor
+    // can immediately associate beacons on startup without waiting for a connect event.
+    if let Ok(paired) = bt_manager.find_paired_airpods().await {
+        if let Some(first_paired) = paired.first() {
+            let mut lock = dev_state.write().await;
+            if lock.is_none() {
+                let state = AirPodsDeviceState::new(
+                    first_paired.address.to_string(),
+                    first_paired.name.clone(),
+                    first_paired.model,
+                );
+                *lock = Some(state.clone());
+                let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state));
+            }
+        }
+    }
 
     loop {
         info!("Searching for connected AirPods...");
@@ -590,42 +632,56 @@ pub async fn start_bluetooth_daemon(
                     pod.name, pod.address, pod.model
                 );
 
-                if was_disconnected {
-                    // AirPods just woke up from the case and BR/EDR came up; give
-                    // link encryption and audio profiles 1.5s to settle before
-                    // opening PSM 0x1001 so the accessory answers the handshake.
+                if !aacp.is_connected().await {
+                    // AirPods just woke up or connected; give link encryption and
+                    // audio profiles 1.5s to settle before opening PSM 0x1001
+                    // so the accessory answers the handshake.
                     tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
                 }
 
-                let mut current_state =
-                    AirPodsDeviceState::new(pod.address.to_string(), pod.name.clone(), pod.model);
-                current_state.is_connected = false;
-                current_state.ear_detection_enabled = config.read().unwrap().ear_detection_enabled;
-
-                let mut event_rx = aacp.subscribe();
-
-                if let Err(e) = aacp.connect(pod.address).await {
-                    error!("AACP connection failed: {}", e);
-                    current_state.is_connected = false;
-                    current_state.battery_left = None;
-                    current_state.battery_right = None;
-                    current_state.battery_case = None;
-                    {
-                        let mut lock = dev_state.write().await;
-                        *lock = Some(current_state.clone());
+                let mut current_state = {
+                    let guard = dev_state.read().await;
+                    match guard.as_ref() {
+                        Some(existing) if existing.mac_address == pod.address.to_string() => {
+                            let mut s = existing.clone();
+                            s.name = pod.name.clone();
+                            s.model = pod.model;
+                            s.capabilities = pod.model.capabilities();
+                            s.is_connected = true;
+                            s.ear_detection_enabled = config.read().unwrap().ear_detection_enabled;
+                            s
+                        }
+                        _ => {
+                            let mut s = AirPodsDeviceState::new(
+                                pod.address.to_string(),
+                                pod.name.clone(),
+                                pod.model,
+                            );
+                            s.is_connected = true;
+                            s.ear_detection_enabled = config.read().unwrap().ear_detection_enabled;
+                            s
+                        }
                     }
-                    let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
-                    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                    continue;
-                }
+                };
 
-                info!("AACP event stream active and connected");
-                current_state.is_connected = true;
                 {
                     let mut lock = dev_state.write().await;
                     *lock = Some(current_state.clone());
                 }
                 let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
+                let _ = ui_tx.send(UiEvent::ConnectedChanged(true));
+
+                let mut event_rx = aacp.subscribe();
+
+                if let Err(e) = aacp.connect(pod.address).await {
+                    warn!("AACP connection failed (BlueZ is still connected): {}", e);
+                    // BlueZ is still connected: keep device state connected and retain
+                    // battery info, retrying AACP in the background after a delay.
+                    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                    continue;
+                }
+
+                info!("AACP event stream active and connected");
 
                 info!("Requesting initial battery and status...");
                 let _ = aacp.request_battery_and_status().await;
@@ -675,6 +731,12 @@ pub async fn start_bluetooth_daemon(
                     let event = tokio::select! {
                         event = event_rx.recv() => event,
                         _ = health.tick() => {
+                            if let Ok(connected_pods) = bt_manager.find_connected_airpods().await {
+                                if !connected_pods.iter().any(|p| p.address == pod.address) {
+                                    info!("BlueZ reported AirPods disconnected; leaving the event loop");
+                                    break;
+                                }
+                            }
                             if !aacp.is_connected().await {
                                 warn!("AACP socket is gone; leaving the event loop");
                                 break;
@@ -830,38 +892,61 @@ pub async fn start_bluetooth_daemon(
                     }
                 }
 
-                warn!("AirPods AACP disconnected, will retry...");
-                current_state.is_connected = false;
-                current_state.battery_left = None;
-                current_state.battery_right = None;
-                current_state.battery_case = None;
-                current_state.left_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
-                current_state.right_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
-                {
-                    let mut lock = dev_state.write().await;
-                    *lock = Some(current_state.clone());
+                warn!("AirPods event loop exited, verifying connection status...");
+                let still_connected = match bt_manager.find_connected_airpods().await {
+                    Ok(list) => list.iter().any(|p| p.address == pod.address),
+                    Err(_) => false,
+                };
+                if !still_connected {
+                    current_state.is_connected = false;
+                    current_state.left_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
+                    current_state.right_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
+                    {
+                        let mut lock = dev_state.write().await;
+                        if let Some(ref mut state) = *lock {
+                            state.is_connected = false;
+                            state.left_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
+                            state.right_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
+                        }
+                    }
+                    let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
+                    let _ = ui_tx.send(UiEvent::ConnectedChanged(false));
                 }
-                let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
-                let _ = ui_tx.send(UiEvent::ConnectedChanged(false));
-                was_disconnected = true;
             }
 
             Ok(_) => {
-                was_disconnected = true;
                 debug!("No connected AirPods detected, checking paired devices...");
                 if let Ok(paired) = bt_manager.find_paired_airpods().await {
                     if let Some(first_paired) = paired.first() {
-                        let mut state = AirPodsDeviceState::new(
-                            first_paired.address.to_string(),
-                            first_paired.name.clone(),
-                            first_paired.model,
-                        );
-                        state.is_connected = false;
-                        {
-                            let mut lock = dev_state.write().await;
-                            *lock = Some(state.clone());
+                        let addr_str = first_paired.address.to_string();
+                        let mut lock = dev_state.write().await;
+                        let state = match lock.as_mut() {
+                            Some(existing) if existing.mac_address == addr_str => {
+                                if existing.is_connected {
+                                    existing.is_connected = false;
+                                    existing.left_in_ear =
+                                        crate::core::aacp::events::EarStatus::Disconnected;
+                                    existing.right_in_ear =
+                                        crate::core::aacp::events::EarStatus::Disconnected;
+                                    Some(existing.clone())
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => {
+                                let mut s = AirPodsDeviceState::new(
+                                    addr_str,
+                                    first_paired.name.clone(),
+                                    first_paired.model,
+                                );
+                                s.is_connected = false;
+                                *lock = Some(s.clone());
+                                Some(s)
+                            }
+                        };
+                        if let Some(updated) = state {
+                            let _ = ui_tx.send(UiEvent::DeviceStateUpdated(updated));
                         }
-                        let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state));
                     }
                 }
                 let _ = ui_tx.send(UiEvent::ConnectedChanged(false));

@@ -90,7 +90,21 @@ impl RustPodsController {
                 let guard = dev_state.read().await;
                 guard.as_ref().map(|s| s.mac_address.clone())
             };
-            if let Some(mac_addr) = mac {
+            let mac_addr = match mac {
+                Some(m) => Some(m),
+                None => {
+                    if let Ok(bm) = crate::system::bluetooth::BluetoothManager::new().await {
+                        if let Ok(paired) = bm.find_paired_airpods().await {
+                            paired.first().map(|p| p.address.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(mac_addr) = mac_addr {
                 info!("Triggering connect to {}", mac_addr);
                 let _ = tokio::process::Command::new("bluetoothctl")
                     .arg("connect")

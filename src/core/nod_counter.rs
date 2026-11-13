@@ -45,7 +45,7 @@ pub fn sensitivity() -> u8 {
 
 /// How deep a nod must dip below the resting pitch, in degrees, per level.
 fn nod_depth_for(sensitivity: u8) -> f32 {
-    [10.0, 8.0, 6.0, 4.5, 3.5][(sensitivity - SENSITIVITY_MIN) as usize]
+    [9.0, 7.0, 4.8, 3.6, 2.6][(sensitivity - SENSITIVITY_MIN) as usize]
 }
 
 /// How large a yaw swing, in degrees, reads as a head shake per level:
@@ -60,16 +60,14 @@ pub fn badge_amplitude_scale() -> f32 {
     [2.0, 1.4, 1.0, 0.7, 0.5][(sensitivity() - SENSITIVITY_MIN) as usize]
 }
 
-/// Minimum spacing between counted nods, in seconds; filters single-sample bounce.
-const MIN_NOD_INTERVAL: f32 = 0.15;
+/// Minimum spacing between counted nods, in seconds; filters the return-stroke
+/// overshoot and settling of the preceding nod so one nod cannot count twice.
+const MIN_NOD_INTERVAL: f32 = 0.30;
 /// Silence after the last nod that commits the count, in seconds.
 ///
 /// This must outlast the natural pause between two deliberate nods: a wearer
 /// counting out "option two" regularly holds still between nods while they
-/// check the count on the card. Committed live at 1.4 s, that pause
-/// truncated every such answer to "option one" (seen on hardware,
-/// 2026-11-09: two questions answered with a single nod each). The cost is
-/// answer latency: the commit lands this long after the final nod.
+/// check the count on the card.
 const QUIET_COMMIT_SECS: f32 = 2.5;
 /// Resting pitch is tracked with an EMA; this is its convergence rate in 1/s.
 const BASELINE_RATE: f32 = 1.5;
@@ -80,20 +78,14 @@ const SWING_TAU: f32 = 0.8;
 /// Largest integration step accepted, in seconds; bigger gaps reset hysteresis.
 const MAX_DT: f32 = 0.25;
 /// Peak-to-peak pitch motion within [`Self::BASELINE_WINDOW`] above which the
-/// baseline is forbidden to move. This replaces the old swing-decay gate:
-/// `pitch_swing` is a decaying memory, and live it read 0.2-0.5° *during*
-/// the nod (the nod is short; the decay outruns it), so the gate never
-/// closed and the baseline followed the dip down - dragging the return
-/// band below the return stroke, which then never counted (live telemetry
-/// 02:38:17: baseline +2.0 → -5.0 within one nod, nod not counted).
+/// baseline is forbidden to move.
 const BASELINE_WINDOW_SWING: f32 = 2.0;
 /// Length of that recent-motion window, in seconds.
 const BASELINE_WINDOW: f32 = 0.5;
 /// A return stroke counts once the head has climbed this far back from the
 /// dip's lowest point, as a fraction of the dip depth below baseline.
-/// Anchoring the return on the *dip itself* instead of the baseline matches
-/// how people actually nod: the head rarely returns above the rest pose.
-const RETURN_FROM_DIP: f32 = 0.5;
+/// 0.35 allows crisp, prompt detection as soon as the upward rebound starts.
+const RETURN_FROM_DIP: f32 = 0.35;
 /// Rate of the always-on reference EMA, in 1/s. Unlike the gated baseline it
 /// never freezes, so over a nod oscillation it settles on the cycle midline
 /// (a 1 s-period wave is attenuated ~7x) - that midline is where a

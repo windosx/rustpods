@@ -290,6 +290,7 @@ pub struct AskHub {
     progress: Mutex<Option<AskProgress>>,
     resolved: Mutex<Option<(String, Instant)>>,
     last_pose: Mutex<Option<Instant>>,
+    notify: tokio::sync::Notify,
 }
 
 pub static ASK_HUB: LazyLock<AskHub> = LazyLock::new(AskHub::new);
@@ -301,6 +302,7 @@ impl AskHub {
             progress: Mutex::new(None),
             resolved: Mutex::new(None),
             last_pose: Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -315,6 +317,7 @@ impl AskHub {
         let id = progress.id;
         *self.progress.lock().unwrap() = Some(progress);
         *pending = Some(PendingAsk { id, reply });
+        self.notify.notify_waiters();
         true
     }
 
@@ -333,6 +336,7 @@ impl AskHub {
     fn abandon(&self, id: u64) {
         drop(self.take_pending(id));
         self.clear_progress(id);
+        self.notify.notify_waiters();
     }
 
     /// Records a nod count for the UI.
@@ -341,6 +345,7 @@ impl AskHub {
         if let Some(p) = progress.as_mut() {
             if p.id == id {
                 p.count = count;
+                self.notify.notify_waiters();
             }
         }
     }
@@ -349,6 +354,42 @@ impl AskHub {
         let mut progress = self.progress.lock().unwrap();
         if progress.as_ref().is_some_and(|p| p.id == id) {
             *progress = None;
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Waits for an update event on the hub (question arrival, count change, resolution).
+    pub async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    /// Programmatically select an option by index (e.g. from popup click).
+    pub fn resolve_by_index(&self, index: usize) {
+        let (id, label) = {
+            let progress = self.progress.lock().unwrap();
+            let Some(p) = progress.as_ref() else { return };
+            if index >= p.options.len() { return };
+            (p.id, p.options[index].clone())
+        };
+        if let Some(pending) = self.take_pending(id) {
+            let note = format!("已选择第 {} 项「{}」", index + 1, label);
+            let _ = pending.reply.send(AskReply::Select { index, label });
+            self.mark_resolved(note);
+            self.clear_progress(id);
+        }
+    }
+
+    /// Cancels the current question.
+    pub fn cancel(&self) {
+        let id = {
+            let progress = self.progress.lock().unwrap();
+            progress.as_ref().map(|p| p.id)
+        };
+        if let Some(id) = id {
+            if let Some(pending) = self.take_pending(id) {
+                let _ = pending.reply.send(AskReply::Pass);
+                self.clear_progress(id);
+            }
         }
     }
 
@@ -360,6 +401,7 @@ impl AskHub {
     /// Marks a choice as made, so the UI can confirm it briefly.
     pub fn mark_resolved(&self, text: String) {
         *self.resolved.lock().unwrap() = Some((text, Instant::now()));
+        self.notify.notify_waiters();
     }
 
     /// The confirmation text, if one was made recently enough to still show.
@@ -563,7 +605,6 @@ async fn ask_core(request: HookRequest) -> AskReply {
         id,
         crate::core::nod_counter::sensitivity()
     );
-    notify_question(&q.question, &q.header, &q.options);
 
     match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
         Ok(Ok(reply)) => {
@@ -604,40 +645,6 @@ fn sample_question_request() -> HookRequest {
 /// question passes through (not worn, not installed, timed out).
 pub async fn run_test_question() -> Result<AskReply, String> {
     Ok(ask_core(sample_question_request()).await)
-}
-
-/// Shows a desktop notification describing the question and the gestures.
-///
-/// This is what makes the feature usable in daemon mode, where there is no
-/// window to look at. Failures are logged and ignored: a missing notification
-/// daemon must not break answering.
-fn notify_question(question: &str, header: &str, options: &[String]) {
-    let mut body = String::new();
-    if !question.is_empty() {
-        body.push_str(question);
-        body.push('\n');
-    }
-    for (i, label) in options.iter().enumerate() {
-        body.push_str(&format!("{}. {}\n", i + 1, label));
-    }
-    body.push_str("— 点头 N 次选择第 N 项 · 摇头取消");
-
-    let summary = if header.is_empty() {
-        "RustPods · ZCode 提问".to_string()
-    } else {
-        format!("RustPods · ZCode 提问:{}", header)
-    };
-
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = notify_rust::Notification::new()
-            .summary(&summary)
-            .body(&body)
-            .timeout(notify_rust::Timeout::Milliseconds(12000))
-            .show()
-        {
-            debug!("Could not show question notification: {}", e);
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -759,12 +766,6 @@ fn resolve_question(id: u64, reply: AskReply) {
     if let Some(pending) = ASK_HUB.take_pending(id) {
         if pending.reply.send(reply).is_ok() {
             ASK_HUB.mark_resolved(note.clone());
-            // The deny reason travels to the agent, not to the wearer, and
-            // ZCode renders nothing for a denied AskUserQuestion - without
-            // this, a nodded answer is invisible everywhere. The question
-            // notification is too long to re-read, so the outcome gets its
-            // own short pop-up.
-            notify_resolved(&note);
         } else {
             // The server timed out first and already answered pass-through:
             // the choice is moot, so the card must not claim it was applied.
@@ -774,21 +775,6 @@ fn resolve_question(id: u64, reply: AskReply) {
         // The server timed out first; drop the card so it does not linger.
         ASK_HUB.clear_progress(id);
     }
-}
-
-/// Shows a short desktop notification with the answer the gesture committed.
-fn notify_resolved(note: &str) {
-    let note = note.to_string();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = notify_rust::Notification::new()
-            .summary("RustPods · 手势应答")
-            .body(&note)
-            .timeout(notify_rust::Timeout::Milliseconds(8000))
-            .show()
-        {
-            debug!("Could not show resolution notification: {}", e);
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------

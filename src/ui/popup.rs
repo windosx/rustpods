@@ -1,7 +1,6 @@
 use crate::core::models::AirPodsModel;
 use crate::ui::state::RustPodsState;
 use crate::ui::theme::{palette, ApplePalette};
-use crate::ui::UiEvent;
 use gpui_kit::component::Icon;
 use gpui_kit::layer_shell::{
     Anchor as LayerAnchor, KeyboardInteractivity, Layer, LayerShellOptions,
@@ -133,8 +132,6 @@ impl Render for CasePopupWindow {
         let state = self.app_state.read(cx);
         let dev = state.device.clone();
         let (asset_path, is_max) = model_animation_asset(dev.model);
-        let ui_tx = state.controller.ui_tx.clone();
-        let controller = state.controller.clone();
         let closing = self.closing;
         let anim_gen = self.anim_gen;
 
@@ -158,16 +155,6 @@ impl Render for CasePopupWindow {
         } else {
             gpui_kit::rgba(0x00000018)
         };
-        let pill_btn_bg = if p.is_dark {
-            gpui_kit::rgba(0xFFFFFF16)
-        } else {
-            gpui_kit::rgba(0x0000000D)
-        };
-        let pill_btn_hover = if p.is_dark {
-            gpui_kit::rgba(0xFFFFFF24)
-        } else {
-            gpui_kit::rgba(0x00000017)
-        };
 
         let (img_w, img_h) = if is_max { (186., 202.) } else { (336., 168.) };
         let elapsed_ms = self.started_at.elapsed().as_millis() as usize;
@@ -183,7 +170,7 @@ impl Render for CasePopupWindow {
             .size_full()
             .flex()
             .flex_col()
-            .justify_end()
+            .justify_center()
             .items_center()
             .p(px(12.))
             .child(
@@ -196,7 +183,7 @@ impl Render for CasePopupWindow {
                     .shadow_lg()
                     .px(px(20.))
                     .pt(px(16.))
-                    .pb(px(18.))
+                    .pb(px(20.))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -343,90 +330,12 @@ impl Render for CasePopupWindow {
                                 &p,
                             ))
                     })
-                    .child(
-                        div()
-                            .w_full()
-                            .pt(px(4.))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.))
-                            .when(!dev.is_connected, |this| {
-                                let ctrl = controller.clone();
-                                this.child(
-                                    div()
-                                        .id("case-popup-connect-btn")
-                                        .flex_1()
-                                        .h(px(38.))
-                                        .rounded(px(999.))
-                                        .bg(p.accent_blue)
-                                        .hover(|s| s.opacity(0.9))
-                                        .cursor_pointer()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_size(px(13.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(gpui_kit::white())
-                                        .on_click(move |_, _, _| {
-                                            ctrl.connect();
-                                        })
-                                        .child("点击连接"),
-                                )
-                            })
-                            .child({
-                                let view_m = cx.entity().clone();
-                                let tx_m = ui_tx.clone();
-                                div()
-                                    .id("case-popup-open-main-btn")
-                                    .flex_1()
-                                    .h(px(38.))
-                                    .rounded(px(999.))
-                                    .bg(pill_btn_bg)
-                                    .hover(|s| s.bg(pill_btn_hover))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(13.5))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(p.text_primary)
-                                    .on_click(move |_, window, cx| {
-                                        let _ = tx_m.send(UiEvent::OpenWindow);
-                                        view_m.update(cx, |v, cx| v.start_close(window, cx));
-                                    })
-                                    .child("控制中心")
-                            })
-                            .when(dev.is_connected, |this| {
-                                let view_d = cx.entity().clone();
-                                this.child(
-                                    div()
-                                        .id("case-popup-done-btn")
-                                        .flex_1()
-                                        .h(px(38.))
-                                        .rounded(px(999.))
-                                        .bg(p.accent_blue)
-                                        .hover(|s| s.opacity(0.9))
-                                        .cursor_pointer()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_size(px(13.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(gpui_kit::white())
-                                        .on_click(move |_, window, cx| {
-                                            view_d.update(cx, |v, cx| v.start_close(window, cx));
-                                        })
-                                        .child("完成"),
-                                )
-                            }),
-                    )
                     .relative()
                     .with_animation(("case-popup-sheet", anim_gen), anim, move |el, t| {
                         let (dy, alpha) = if closing {
-                            (t * 110.0, (1.0 - t).max(0.0))
+                            (t * 18.0, (1.0 - t).max(0.0))
                         } else {
-                            ((1.0 - t) * 110.0, (t * 1.35).min(1.0))
+                            ((1.0 - t) * 18.0, (t * 1.35).min(1.0))
                         };
                         el.top(px(dy)).opacity(alpha)
                     }),
@@ -570,7 +479,7 @@ pub fn open_or_refresh_case_popup(
         }
     }
 
-    let popup_size = size(px(416.), px(448.));
+    let popup_size = size(px(416.), px(370.));
     let popup_bounds = WindowBounds::Windowed(Bounds::centered(None, popup_size, cx));
     let make_opts = |kind: WindowKind| WindowOptions {
         window_bounds: Some(popup_bounds),
@@ -590,10 +499,10 @@ pub fn open_or_refresh_case_popup(
     let layer_opts = make_opts(WindowKind::LayerShell(LayerShellOptions {
         namespace: "rustpods-popup".to_string(),
         layer: Layer::Overlay,
-        anchor: LayerAnchor::BOTTOM,
+        anchor: LayerAnchor::empty(),
         exclusive_zone: None,
         exclusive_edge: None,
-        margin: Some((px(0.), px(0.), px(28.), px(0.))),
+        margin: None,
         keyboard_interactivity: KeyboardInteractivity::None,
     }));
 
