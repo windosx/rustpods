@@ -15,7 +15,7 @@ pub fn render_battery_card(state: &AirPodsDeviceState, p: &ApplePalette) -> impl
         .flex_row()
         .gap(px(12.))
         .child(render_single_battery_column(
-            "左耳 (Left)",
+            &rust_i18n::t!("battery.left"),
             state.battery_left,
             state.battery_left_charging,
             state.left_in_ear,
@@ -23,7 +23,7 @@ pub fn render_battery_card(state: &AirPodsDeviceState, p: &ApplePalette) -> impl
             p,
         ))
         .child(render_single_battery_column(
-            "右耳 (Right)",
+            &rust_i18n::t!("battery.right"),
             state.battery_right,
             state.battery_right_charging,
             state.right_in_ear,
@@ -31,7 +31,7 @@ pub fn render_battery_card(state: &AirPodsDeviceState, p: &ApplePalette) -> impl
             p,
         ))
         .child(render_single_battery_column(
-            "充电盒 (Case)",
+            &rust_i18n::t!("battery.case"),
             state.battery_case,
             state.battery_case_charging,
             EarStatus::InCase,
@@ -241,20 +241,24 @@ fn format_status_string(
 ) -> String {
     if level.is_none() {
         return if is_case {
-            "盒盖休眠中".to_string()
+            rust_i18n::t!("battery.sleeping").to_string()
         } else {
-            "等待连接".to_string()
+            rust_i18n::t!("battery.waiting_connection").to_string()
         };
     }
-    let charge_str = if charging { "充电中" } else { "使用中" };
+    let charge_str = if charging {
+        rust_i18n::t!("battery.charging")
+    } else {
+        rust_i18n::t!("battery.in_use")
+    };
     if is_case {
         charge_str.to_string()
     } else {
         let ear_str = match ear_status {
-            EarStatus::InEar => "已佩戴",
-            EarStatus::OutOfEar => "未佩戴",
-            EarStatus::InCase => "充电盒中",
-            EarStatus::Disconnected => "未连接",
+            EarStatus::InEar => rust_i18n::t!("battery.worn"),
+            EarStatus::OutOfEar => rust_i18n::t!("battery.unworn"),
+            EarStatus::InCase => rust_i18n::t!("battery.in_case_status"),
+            EarStatus::Disconnected => rust_i18n::t!("battery.disconnected_status"),
         };
         format!("{} • {}", charge_str, ear_str)
     }

@@ -301,7 +301,7 @@ impl Render for CasePopupWindow {
                             .w_full()
                             .flex()
                             .justify_center()
-                            .child(render_popup_battery_cell("头戴耳机", level, charging, &p))
+                            .child(render_popup_battery_cell(&rust_i18n::t!("popup.headphones"), level, charging, &p))
                     } else {
                         div()
                             .w_full()
@@ -312,19 +312,19 @@ impl Render for CasePopupWindow {
                             .justify_around()
                             .gap(px(8.))
                             .child(render_popup_battery_cell(
-                                "左耳 L",
+                                &rust_i18n::t!("popup.left_ear"),
                                 dev.battery_left,
                                 dev.battery_left_charging,
                                 &p,
                             ))
                             .child(render_popup_battery_cell(
-                                "右耳 R",
+                                &rust_i18n::t!("popup.right_ear"),
                                 dev.battery_right,
                                 dev.battery_right_charging,
                                 &p,
                             ))
                             .child(render_popup_battery_cell(
-                                "充电盒",
+                                &rust_i18n::t!("popup.case"),
                                 dev.battery_case,
                                 dev.battery_case_charging,
                                 &p,

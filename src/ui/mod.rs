@@ -49,6 +49,7 @@ icon_assets!(
         Compass,
         Zap,
         MessageCircleQuestionMark,
+        MousePointer,
     ]
 );
 
@@ -160,6 +161,10 @@ fn bootstrap_gui(
         ui_tx: ui_event_tx.clone(),
     };
 
+    let initial_locale = config.read().unwrap().language.resolved_locale();
+    rust_i18n::set_locale(initial_locale);
+    gpui_kit::component::set_locale(initial_locale);
+
     let app_state = cx.new(|_| RustPodsState::new(controller, initial_mode));
 
     // Open initial main window and track its handle so OpenWindow can either
@@ -264,6 +269,10 @@ fn bootstrap_gui(
     // Spawn Tokio background engines.
     rt_handle.spawn(crate::system::zcode_ask::run_socket_server());
     rt_handle.spawn(run_audio_follow(aacp_manager.head_pose()));
+    rt_handle.spawn(crate::system::head_mouse::run_head_mouse_controller(
+        aacp_manager.head_pose(),
+        config.clone(),
+    ));
     {
         let aacp_bg = aacp_manager.clone();
         let dev_bg = device_state.clone();
@@ -843,6 +852,26 @@ pub async fn start_bluetooth_daemon(
                                 StemAction::PlayPause => mpris.play_pause().await,
                                 StemAction::NextTrack => mpris.next().await,
                                 StemAction::PreviousTrack => mpris.previous().await,
+                                StemAction::MouseLeftClick => {
+                                    crate::system::head_mouse::HEAD_MOUSE
+                                        .send_command(crate::system::head_mouse::HeadMouseCommand::Click(
+                                            crate::system::head_mouse::MouseButton::Left,
+                                        ));
+                                }
+                                StemAction::MouseRightClick => {
+                                    crate::system::head_mouse::HEAD_MOUSE
+                                        .send_command(crate::system::head_mouse::HeadMouseCommand::Click(
+                                            crate::system::head_mouse::MouseButton::Right,
+                                        ));
+                                }
+                                StemAction::ToggleMouseControl => {
+                                    crate::system::head_mouse::HEAD_MOUSE
+                                        .send_command(crate::system::head_mouse::HeadMouseCommand::TogglePause);
+                                }
+                                StemAction::ToggleMouseScroll => {
+                                    crate::system::head_mouse::HEAD_MOUSE
+                                        .send_command(crate::system::head_mouse::HeadMouseCommand::ToggleScroll);
+                                }
                                 _ => {}
                             }
                         }

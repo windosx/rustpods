@@ -188,6 +188,23 @@ impl GravityAnchor {
     }
 }
 
+/// Fused attitude and instantaneous angular rate sample.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AttitudeSample {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+    pub yaw_rate: f32,
+    pub pitch_rate: f32,
+    pub roll_rate: f32,
+}
+
+impl AttitudeSample {
+    pub fn angles(&self) -> [f32; 3] {
+        [self.yaw, self.pitch, self.roll]
+    }
+}
+
 /// Fuses gyroscope angular rate with the gravity vector into yaw/pitch/roll.
 ///
 /// The math follows `starman-tech/mousepods` `MotionEngine.step`, which is the
@@ -364,7 +381,7 @@ impl AttitudeIntegrator {
 
     /// Feeds one sample. `gyro` is the rotation rate at offsets 26..32 and
     /// `gravity` the vector at 44..50, both in device counts.
-    fn update(&mut self, gyro: [f32; 3], gravity: [f32; 3]) -> Option<[f32; 3]> {
+    fn update(&mut self, gyro: [f32; 3], gravity: [f32; 3]) -> Option<AttitudeSample> {
         let g_len = len3(gravity);
         if g_len <= 1e-3 {
             return None;
@@ -388,7 +405,14 @@ impl AttitudeIntegrator {
             .unwrap_or(0.0);
         self.last_sample = Some(now);
         if dt <= 0.0 {
-            return Some([self.yaw_deg, self.pitch_deg, self.roll_deg]);
+            return Some(AttitudeSample {
+                yaw: self.yaw_deg,
+                pitch: self.pitch_deg,
+                roll: self.roll_deg,
+                yaw_rate: 0.0,
+                pitch_rate: 0.0,
+                roll_rate: 0.0,
+            });
         }
 
         self.update_bias(gyro, up, dt);
@@ -443,7 +467,18 @@ impl AttitudeIntegrator {
         self.pitch_deg = self.pitch_deg.clamp(-90.0, 90.0);
         self.roll_deg = self.roll_deg.clamp(-90.0, 90.0);
 
-        Some([self.yaw_deg, self.pitch_deg, self.roll_deg])
+        let yaw_rate_dps = yaw_rate * ROTATION_DEG_PER_SEC;
+        let pitch_rate_dps = pitch_rate * ROTATION_DEG_PER_SEC;
+        let roll_rate_dps = roll_rate * ROTATION_DEG_PER_SEC;
+
+        Some(AttitudeSample {
+            yaw: self.yaw_deg,
+            pitch: self.pitch_deg,
+            roll: self.roll_deg,
+            yaw_rate: yaw_rate_dps,
+            pitch_rate: pitch_rate_dps,
+            roll_rate: roll_rate_dps,
+        })
     }
 }
 
@@ -499,7 +534,7 @@ fn wrap_deg(deg: f32) -> f32 {
     d
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct HeadPose {
     /// Nodding: negative looks down, positive looks up. Degrees.
     pub pitch: f32,
@@ -509,6 +544,12 @@ pub struct HeadPose {
     pub yaw: f32,
     pub accel_h: i16,
     pub accel_v: i16,
+    /// Turning velocity left/right. Degrees per second (positive turns right).
+    pub yaw_rate: f32,
+    /// Nodding velocity. Degrees per second (positive tilts up).
+    pub pitch_rate: f32,
+    /// Tilting velocity. Degrees per second (positive tilts right).
+    pub roll_rate: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -827,6 +868,9 @@ impl HeadTracker {
                     yaw: 0.0,
                     accel_h,
                     accel_v,
+                    yaw_rate: 0.0,
+                    pitch_rate: 0.0,
+                    roll_rate: 0.0,
                 },
                 None,
             ));
@@ -852,6 +896,9 @@ impl HeadTracker {
             yaw: yaw.clamp(-180.0, 180.0),
             accel_h,
             accel_v,
+            yaw_rate: 0.0,
+            pitch_rate: 0.0,
+            roll_rate: 0.0,
         };
 
         let gesture = self.detect_gesture(accel_h as f32, accel_v as f32);
@@ -1047,23 +1094,26 @@ impl HeadTracker {
         }
         self.sample_times.push_back(Instant::now());
 
-        let [yaw, pitch, roll] = attitude.unwrap_or([0.0, 0.0, 0.0]);
+        let att = attitude.unwrap_or_default();
 
         // Dump raw and integrated values occasionally so the gyro scale can be
         // calibrated against real movement. `0.122 deg/s per count` comes from
         // the protocol document, which marks it approximate.
         if self.samples_seen % 100 == 0 {
             debug!(
-                "attitude raw gyro=[{:.0},{:.0},{:.0}] grav=[{:.0},{:.0},{:.0}] -> yaw={:.1} pitch={:.1} roll={:.1}",
-                gyro[0], gyro[1], gyro[2], gx, gy, gz, yaw, pitch, roll
+                "attitude raw gyro=[{:.0},{:.0},{:.0}] grav=[{:.0},{:.0},{:.0}] -> yaw={:.1} pitch={:.1} roll={:.1} rates=[{:.1},{:.1},{:.1}]",
+                gyro[0], gyro[1], gyro[2], gx, gy, gz, att.yaw, att.pitch, att.roll, att.yaw_rate, att.pitch_rate, att.roll_rate
             );
         }
         let pose = HeadPose {
-            pitch,
-            yaw,
-            roll,
+            pitch: att.pitch,
+            yaw: att.yaw,
+            roll: att.roll,
             accel_h: user_x,
             accel_v: user_y,
+            yaw_rate: att.yaw_rate,
+            pitch_rate: att.pitch_rate,
+            roll_rate: att.roll_rate,
         };
 
         let gesture = self.detect_gesture(user_x as f32, user_y as f32);
@@ -1112,6 +1162,9 @@ impl HeadTracker {
             roll: roll.clamp(-90.0, 90.0),
             accel_h,
             accel_v,
+            yaw_rate: 0.0,
+            pitch_rate: 0.0,
+            roll_rate: 0.0,
         };
 
         let gesture = self.detect_gesture(accel_h as f32, accel_v as f32);
@@ -1230,7 +1283,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
             integ.update(gyro, gravity);
         }
-        let [yaw, _, _] = integ.update(gyro, gravity).unwrap();
+        let [yaw, _, _] = integ.update(gyro, gravity).unwrap().angles();
         assert!(yaw > 0.0, "yaw should integrate upward, got {}", yaw);
     }
 
@@ -1347,7 +1400,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
             integ.update([0.0, 0.0, 0.0], gravity);
         }
-        let [yaw, pitch, roll] = integ.update([0.0, 0.0, 0.0], gravity).unwrap();
+        let [yaw, pitch, roll] = integ.update([0.0, 0.0, 0.0], gravity).unwrap().angles();
         assert!(yaw.abs() < 0.01, "yaw drifted to {}", yaw);
         assert!(pitch.abs() < 0.01, "pitch drifted to {}", pitch);
         assert!(roll.abs() < 0.01, "roll drifted to {}", roll);
@@ -1364,7 +1417,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
             integ.update(gyro, gravity);
         }
-        let [_yaw, pitch, roll] = integ.update(gyro, gravity).unwrap();
+        let [_yaw, pitch, roll] = integ.update(gyro, gravity).unwrap().angles();
         assert!(pitch.abs() > 0.0, "pitch should move, got {}", pitch);
         assert!(
             roll.abs() < pitch.abs().max(0.5),
@@ -1399,7 +1452,7 @@ mod tests {
             integ.update(bias, gravity);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let [_yaw, pitch, _roll] = integ.update(bias, gravity).unwrap();
+        let [_yaw, pitch, _roll] = integ.update(bias, gravity).unwrap().angles();
         // Ungoverned, 30 s x 16 deg/s = 480 deg of drift (clamped to 90).
         // Governed, the pull bounds it near the bias/pull ratio (~7 deg for
         // this rate); give it generous room either way - the assertion is
@@ -1438,7 +1491,7 @@ mod tests {
             integ.update([0.0, 0.0, 0.0], held_gravity);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let [_yaw, pitch, _roll] = integ.update([0.0, 0.0, 0.0], held_gravity).unwrap();
+        let [_yaw, pitch, _roll] = integ.update([0.0, 0.0, 0.0], held_gravity).unwrap().angles();
         assert!(
             (pitch + 25.0).abs() < 6.0,
             "held -25 deg pose must read near -25, got {}",
@@ -1456,6 +1509,23 @@ mod tests {
         assert!(pose.pitch.abs() < 0.5, "pitch={}", pose.pitch);
         assert!(pose.roll.abs() < 0.5, "roll={}", pose.roll);
         assert!(tracker.is_calibrated());
+    }
+
+    #[test]
+    fn integrator_reports_angular_velocity_in_degrees_per_second() {
+        let mut integ = AttitudeIntegrator::new();
+        let gravity = [0.0, 0.0, 1000.0];
+        // Feed initial sample to anchor time.
+        integ.update([0.0, 0.0, 0.0], gravity);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Rotating 5000 counts/s about z.
+        // 5000 counts/s * 0.122 deg/s per count = ~610 deg/s.
+        let sample = integ.update([0.0, 0.0, 5000.0], gravity).unwrap();
+        assert!(
+            (sample.yaw_rate - 610.0).abs() < 50.0,
+            "yaw_rate should be near 610 deg/s, got {}",
+            sample.yaw_rate
+        );
     }
 
     #[test]

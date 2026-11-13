@@ -3,7 +3,10 @@ use crate::core::aacp::AacpManager;
 use crate::core::device::AirPodsDeviceState;
 use crate::core::head_tracking::{HeadGesture, HeadPose};
 use crate::core::models::AirPodsModel;
-use crate::system::config::{save_config, AppConfig, PauseBehavior};
+use crate::system::config::{
+    save_config, AppConfig, AppLanguage, HeadMouseMode, PauseBehavior, StemAction,
+};
+use crate::system::head_mouse::{HeadMouseCommand, HEAD_MOUSE};
 use crate::system::zcode_ask::{self, AskProgress, AskReply};
 use crate::ui::UiEvent;
 use gpui_kit::component::ThemeMode;
@@ -17,27 +20,30 @@ pub enum NavPage {
     #[default]
     Overview,
     Spatial,
+    HeadMouse,
     Controls,
     Agents,
     Preferences,
 }
 
 impl NavPage {
-    pub const ALL: [NavPage; 5] = [
+    pub const ALL: [NavPage; 6] = [
         NavPage::Overview,
         NavPage::Spatial,
+        NavPage::HeadMouse,
         NavPage::Controls,
         NavPage::Agents,
         NavPage::Preferences,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            NavPage::Overview => "概览首页",
-            NavPage::Spatial => "空间音频",
-            NavPage::Controls => "控制与交互",
-            NavPage::Agents => "智能体接入",
-            NavPage::Preferences => "偏好设置",
+            NavPage::Overview => rust_i18n::t!("nav.overview").to_string(),
+            NavPage::Spatial => rust_i18n::t!("nav.spatial").to_string(),
+            NavPage::HeadMouse => rust_i18n::t!("nav.head_mouse").to_string(),
+            NavPage::Controls => rust_i18n::t!("nav.controls").to_string(),
+            NavPage::Agents => rust_i18n::t!("nav.agents").to_string(),
+            NavPage::Preferences => rust_i18n::t!("nav.preferences").to_string(),
         }
     }
 }
@@ -289,6 +295,106 @@ impl RustPodsController {
             let _ = tx.send(zcode_ask::run_test_question().await);
         });
         rx
+    }
+
+    pub fn toggle_head_mouse(&self, enabled: bool) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_enabled = enabled;
+            save_config(&c);
+        }
+    }
+
+    pub fn set_head_mouse_mode(&self, mode: HeadMouseMode) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_mode = mode;
+            save_config(&c);
+        }
+    }
+
+    pub fn set_head_mouse_speed(&self, speed: f32) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_speed = speed;
+            save_config(&c);
+        }
+    }
+
+    pub fn set_head_mouse_accel(&self, accel: f32) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_accel = accel;
+            save_config(&c);
+        }
+    }
+
+    pub fn set_head_mouse_smoothing(&self, smoothing: f32) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_smoothing = smoothing;
+            save_config(&c);
+        }
+    }
+
+    pub fn set_head_mouse_deadzone(&self, deadzone: f32) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_deadzone = deadzone;
+            save_config(&c);
+        }
+    }
+
+    pub fn toggle_head_mouse_invert_x(&self, invert: bool) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_invert_x = invert;
+            save_config(&c);
+        }
+    }
+
+    pub fn toggle_head_mouse_invert_y(&self, invert: bool) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_invert_y = invert;
+            save_config(&c);
+        }
+    }
+
+    pub fn toggle_head_mouse_roll_click(&self, enabled: bool) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_roll_click = enabled;
+            save_config(&c);
+        }
+    }
+
+    pub fn toggle_head_mouse_dwell_click(&self, enabled: bool) {
+        if let Ok(mut c) = self.config.write() {
+            c.head_mouse_dwell_click = enabled;
+            save_config(&c);
+        }
+    }
+
+    pub fn set_stem_action(&self, press_type: crate::core::aacp::events::StemPressType, action: StemAction) {
+        if let Ok(mut c) = self.config.write() {
+            match press_type {
+                crate::core::aacp::events::StemPressType::Single => c.stem_single_click = action,
+                crate::core::aacp::events::StemPressType::Double => c.stem_double_click = action,
+                crate::core::aacp::events::StemPressType::Triple => c.stem_triple_click = action,
+                crate::core::aacp::events::StemPressType::Long => c.stem_long_press = action,
+            }
+            save_config(&c);
+        }
+    }
+
+    pub fn head_mouse_recenter(&self) {
+        HEAD_MOUSE.send_command(HeadMouseCommand::Recenter);
+    }
+
+    pub fn head_mouse_toggle_pause(&self) {
+        HEAD_MOUSE.send_command(HeadMouseCommand::TogglePause);
+    }
+
+    pub fn set_language(&self, lang: AppLanguage) {
+        if let Ok(mut c) = self.config.write() {
+            c.language = lang;
+            save_config(&c);
+        }
+        let loc = lang.resolved_locale();
+        rust_i18n::set_locale(loc);
+        gpui_kit::component::set_locale(loc);
     }
 }
 

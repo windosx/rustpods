@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod battery;
+pub mod head_mouse;
 pub mod headtracking;
 pub mod hero;
 pub mod noise;

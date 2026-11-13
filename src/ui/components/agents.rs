@@ -6,12 +6,14 @@ use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants as _};
 use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
-use gpui_kit::{div, px, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _};
+use gpui_kit::{
+    div, px, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _,
+};
 
 pub fn render_agents_page(
     state: &RustPodsState,
     app_state: &Entity<RustPodsState>,
-    sensitivity_select: &Entity<SelectState<Vec<&'static str>>>,
+    sensitivity_select: &Entity<SelectState<Vec<String>>>,
     p: &ApplePalette,
 ) -> impl IntoElement {
     let cfg = state.config_snapshot();
@@ -25,7 +27,7 @@ pub fn render_agents_page(
                 p,
                 agent.display_name,
                 Some(agent.description),
-                Tag::secondary().child("即将支持"),
+                Tag::secondary().child(rust_i18n::t!("agents.coming_soon")),
                 with_divider,
             ));
             continue;
@@ -39,9 +41,9 @@ pub fn render_agents_page(
             note.clone()
         } else {
             match &status {
-                HookInstallStatus::Installed(cmd) => format!("已接入 · {}", cmd),
-                HookInstallStatus::NotInstalled => "未接入".to_string(),
-                HookInstallStatus::ConfigUnreadable(e) => format!("配置读取失败: {}", e),
+                HookInstallStatus::Installed(cmd) => format!("{} · {}", rust_i18n::t!("agents.installed"), cmd),
+                HookInstallStatus::NotInstalled => rust_i18n::t!("agents.not_installed").to_string(),
+                HookInstallStatus::ConfigUnreadable(e) => format!("Config error: {}", e),
             }
         };
 
@@ -60,13 +62,13 @@ pub fn render_agents_page(
                     .compact()
                     .rounded(ButtonRounded::Size(px(999.)))
                     .loading(is_testing)
-                    .label(if is_testing { "测试中" } else { "测试" })
+                    .label(if is_testing { rust_i18n::t!("agents.testing") } else { rust_i18n::t!("agents.test") })
                     .on_click(move |_, _, cx| {
                         app_test.update(cx, |s, cx| {
                             s.agent_testing.insert(agent_id, true);
                             s.agent_notes.insert(
                                 agent_id,
-                                "测试进行中:点头作答,或等待自动放行…".to_string(),
+                                "Test in progress: nod to answer, or wait...".to_string(),
                             );
                             let rx = s.controller.start_zcode_test();
                             cx.notify();
@@ -77,12 +79,12 @@ pub fn render_agents_page(
                                 };
                                 let msg = match result {
                                     Ok(AskReply::Select { index, label }) => {
-                                        format!("测试通过:已选择第 {} 项「{}」", index + 1, label)
+                                        format!("Test passed: selected #{} \"{}\"", index + 1, label)
                                     }
                                     Ok(AskReply::Pass) => {
-                                        "测试完成:已放行(未佩戴 / 未连接 / 摇头或超时)".to_string()
+                                        "Test completed: passed through".to_string()
                                     }
-                                    Err(e) => format!("测试失败: {}", e),
+                                    Err(e) => format!("Test failed: {}", e),
                                 };
                                 let _ = this.update(cx, |s, cx| {
                                     s.agent_testing.insert(agent_id, false);
@@ -103,23 +105,30 @@ pub fn render_agents_page(
                     })
                     .compact()
                     .rounded(ButtonRounded::Size(px(999.)))
-                    .label(if is_installed { "卸载" } else { "安装" })
+                    .label(if is_installed { rust_i18n::t!("agents.uninstall") } else { rust_i18n::t!("agents.install") })
                     .on_click(move |_, _, cx| {
                         let installed_now =
                             matches!(agent.status(), HookInstallStatus::Installed(_));
-                        let res = if installed_now {
-                            agent.uninstall()
-                        } else {
-                            agent.install()
-                        };
                         app_install.update(cx, |s, cx| {
-                            match res {
+                            let outcome = if installed_now {
+                                agent.uninstall()
+                            } else {
+                                agent.install()
+                            };
+                            match outcome {
                                 Ok(()) => {
-                                    s.agent_notes.remove(agent_id);
+                                    s.agent_notes.insert(
+                                        agent_id,
+                                        if installed_now {
+                                            "Uninstalled".to_string()
+                                        } else {
+                                            "Installed".to_string()
+                                        },
+                                    );
                                 }
                                 Err(e) => {
                                     s.agent_notes
-                                        .insert(agent_id, format!("操作失败: {}", e));
+                                        .insert(agent_id, format!("Failed: {}", e));
                                 }
                             }
                             cx.notify();
@@ -152,22 +161,22 @@ pub fn render_agents_page(
                         .text_size(px(20.))
                         .font_weight(FontWeight::BOLD)
                         .text_color(p.text_primary)
-                        .child("智能体接入"),
+                        .child(rust_i18n::t!("agents.title")),
                 )
                 .child(
                     div()
                         .text_size(px(12.5))
                         .text_color(p.text_secondary)
-                        .child("智能体弹出选择题时,点头 N 次选择第 N 项,摇头取消;未佩戴或超时自动回退到智能体自己的界面。"),
+                        .child(rust_i18n::t!("agents.desc")),
                 ),
         )
-        .child(section_header(p, "点头应答", None))
+        .child(section_header(p, &rust_i18n::t!("agents.nod_answers"), None))
         .child(
             grouped_card(p)
                 .child(setting_row(
                     p,
-                    "启用点头应答",
-                    Some("关闭后,智能体的选择题不再由点头代答,直接走各自的界面"),
+                    &rust_i18n::t!("agents.nod_answers"),
+                    Some(&rust_i18n::t!("agents.nod_answers_desc")),
                     Switch::new("head-gesture-answers-switch")
                         .checked(cfg.head_gesture_answers_enabled)
                         .on_change(move |checked, _, cx| {
@@ -181,16 +190,16 @@ pub fn render_agents_page(
                 ))
                 .child(setting_row(
                     p,
-                    "手势灵敏度",
-                    Some("点头计数与摇头取消的判定幅度:1 = 需要明显的动作,5 = 轻微动作即可"),
+                    &rust_i18n::t!("agents.sensitivity"),
+                    Some(&rust_i18n::t!("agents.sensitivity_desc")),
                     Select::new(sensitivity_select).w(px(170.)),
                     true,
                 )),
         )
         .child(section_header(
             p,
-            "智能体",
-            Some("安装后,该智能体的选择题会先送到 RustPods 由点头作答"),
+            &rust_i18n::t!("agents.title"),
+            None,
         ))
         .child(agents_group)
 }

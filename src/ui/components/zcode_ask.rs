@@ -11,9 +11,9 @@ pub fn render_zcode_ask_card(
     match (progress, resolved) {
         (Some(ask), _) => {
             let count_text = if ask.count == 0 {
-                "等待点头…".to_string()
+                rust_i18n::t!("agents.waiting_nod").to_string()
             } else {
-                format!("已点头 {} 次", ask.count)
+                format!("{}: {}", rust_i18n::t!("agents.nod_count"), ask.count)
             };
 
             let card = control_card(p)
@@ -45,7 +45,7 @@ pub fn render_zcode_ask_card(
                                         .text_size(px(14.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(p.text_primary)
-                                        .child("ZCode 提问"),
+                                        .child(rust_i18n::t!("agents.ask_title")),
                                 ),
                         )
                         .child(

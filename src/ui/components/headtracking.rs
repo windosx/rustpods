@@ -27,19 +27,19 @@ pub fn render_head_tracking_card(ht: &HeadTrackingViewState, p: &ApplePalette) -
 
     let (gesture_text, gesture_color, gesture_bg) = match ht.gesture {
         Some(HeadGesture::NodYes) => (
-            "✓ 检测到点头（是）".to_string(),
+            rust_i18n::t!("spatial.nod").to_string(),
             p.accent_green,
             p.accent_green.opacity(0.14),
         ),
         Some(HeadGesture::ShakeNo) => (
-            "✗ 检测到摇头（否）".to_string(),
+            rust_i18n::t!("spatial.shake").to_string(),
             p.accent_blue,
             p.accent_blue.opacity(0.14),
         ),
         None => {
             let hint = match ht.rate_hz {
-                Some(rate) => format!("点头 / 摇头可触发手势 · {:.0} Hz", rate),
-                None => "点头 / 摇头可触发手势".to_string(),
+                Some(rate) => format!("{} · {:.0} Hz", rust_i18n::t!("spatial.gesture_hint"), rate),
+                None => rust_i18n::t!("spatial.gesture_hint").to_string(),
             };
             (hint, p.text_secondary, p.pill_bg)
         }
@@ -71,7 +71,7 @@ pub fn render_head_tracking_card(ht: &HeadTrackingViewState, p: &ApplePalette) -
                                 .text_size(px(15.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(p.text_primary)
-                                .child("空间音频与头部追踪"),
+                                .child(rust_i18n::t!("spatial.title")),
                         ),
                 )
                 .when_some(ht.rate_hz.filter(|_| ht.calibrated), |this, hz| {
@@ -128,10 +128,10 @@ pub fn render_head_tracking_card(ht: &HeadTrackingViewState, p: &ApplePalette) -
                             .size_full(),
                         )
                         // Cardinal labels around the dial
-                        .child(cardinal_label("前", p).top(px(2.)).left(px(142.)))
-                        .child(cardinal_label("后", p).bottom(px(2.)).left(px(142.)))
-                        .child(cardinal_label("左", p).left(px(4.)).top(px(141.)))
-                        .child(cardinal_label("右", p).right(px(4.)).top(px(141.))),
+                        .child(cardinal_label(&rust_i18n::t!("spatial.front"), p).top(px(2.)).left(px(142.)))
+                        .child(cardinal_label(&rust_i18n::t!("spatial.back"), p).bottom(px(2.)).left(px(142.)))
+                        .child(cardinal_label(&rust_i18n::t!("spatial.left"), p).left(px(4.)).top(px(141.)))
+                        .child(cardinal_label(&rust_i18n::t!("spatial.right"), p).right(px(4.)).top(px(141.))),
                 ),
         )
         .child(
@@ -141,9 +141,9 @@ pub fn render_head_tracking_card(ht: &HeadTrackingViewState, p: &ApplePalette) -
                 .flex_row()
                 .justify_center()
                 .gap(px(16.))
-                .child(readout_chip("俯仰 pitch", &pitch_str, p))
-                .child(readout_chip("偏航 yaw", &yaw_str, p))
-                .child(readout_chip("横滚 roll", &roll_str, p)),
+                .child(readout_chip(&rust_i18n::t!("spatial.pitch"), &pitch_str, p))
+                .child(readout_chip(&rust_i18n::t!("spatial.yaw"), &yaw_str, p))
+                .child(readout_chip(&rust_i18n::t!("spatial.roll"), &roll_str, p)),
         )
         .child(
             div()

@@ -1,3 +1,8 @@
+#[macro_use]
+extern crate rust_i18n;
+
+i18n!("locales", fallback = "en");
+
 pub mod core;
 pub mod system;
 pub mod ui;
@@ -344,6 +349,8 @@ fn main() {
         info!("Running in headless daemon mode");
         rt.block_on(async {
             let config = Arc::new(std::sync::RwLock::new(system::config::load_config()));
+            let initial_locale = config.read().unwrap().language.resolved_locale();
+            rust_i18n::set_locale(initial_locale);
             let device_state = Arc::new(tokio::sync::RwLock::new(None));
             let aacp_manager = Arc::new(core::aacp::AacpManager::new());
             let mpris_controller = Arc::new(system::mpris::MprisController::new());
@@ -393,6 +400,12 @@ fn main() {
 
             // Head-tracked audio, once per process (see run_audio_follow).
             tokio::spawn(ui::run_audio_follow(aacp_manager.head_pose()));
+
+            // Head-tracked mouse controller.
+            tokio::spawn(system::head_mouse::run_head_mouse_controller(
+                aacp_manager.head_pose(),
+                config.clone(),
+            ));
 
             tokio::spawn(async move {
                 ui::start_bluetooth_daemon(

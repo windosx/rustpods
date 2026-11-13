@@ -24,9 +24,9 @@ pub fn render_noise_control_card(
         let adaptive_strength = dev.adaptive_strength;
 
         let modes = [
-            (NoiseControlMode::NoiseCancellation, "降噪", "anc-btn"),
-            (NoiseControlMode::Off, "关闭", "off-btn"),
-            (NoiseControlMode::Transparency, "通透模式", "trans-btn"),
+            (NoiseControlMode::NoiseCancellation, rust_i18n::t!("noise.anc"), "anc-btn"),
+            (NoiseControlMode::Off, rust_i18n::t!("noise.off"), "off-btn"),
+            (NoiseControlMode::Transparency, rust_i18n::t!("noise.transparency"), "trans-btn"),
         ];
 
         control_card(p)
@@ -44,17 +44,17 @@ pub fn render_noise_control_card(
                             .text_size(px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.text_primary)
-                            .child("噪声控制"),
+                            .child(rust_i18n::t!("noise.title")),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(p.text_secondary)
                             .child(match current_mode {
-                                NoiseControlMode::NoiseCancellation => "降噪已开启",
-                                NoiseControlMode::Transparency => "通透模式已开启",
-                                NoiseControlMode::Adaptive => "自适应",
-                                NoiseControlMode::Off => "已关闭",
+                                NoiseControlMode::NoiseCancellation => rust_i18n::t!("noise.status_anc"),
+                                NoiseControlMode::Transparency => rust_i18n::t!("noise.status_transparency"),
+                                NoiseControlMode::Adaptive => rust_i18n::t!("noise.status_adaptive"),
+                                NoiseControlMode::Off => rust_i18n::t!("noise.status_off"),
                             }),
                     ),
             )
@@ -136,7 +136,7 @@ pub fn render_noise_control_card(
                                     div()
                                         .text_size(px(12.5))
                                         .text_color(p.text_secondary)
-                                        .child("自适应噪声消除强度"),
+                                        .child(rust_i18n::t!("noise.adaptive_strength")),
                                 )
                                 .child(
                                     div()
@@ -144,7 +144,7 @@ pub fn render_noise_control_card(
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(p.text_primary)
                                         .child(format!("{}%", adaptive_strength)),
-                                ),
+                                )
                         )
                         .child(Slider::new(adaptive_slider).horizontal()),
                 )
@@ -171,14 +171,14 @@ pub fn render_noise_control_card(
                             .text_size(px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.text_primary)
-                            .child("声学特性与能力"),
+                            .child(rust_i18n::t!("noise.features_title")),
                     ),
             )
             .child(
                 div()
                     .text_size(px(12.5))
                     .text_color(p.text_secondary)
-                    .child("当前设备为半入耳式经典声学架构，支持高品质计算音频与自适应均衡调节。"),
+                    .child(rust_i18n::t!("noise.features_desc")),
             )
             .child(
                 div()
@@ -187,9 +187,9 @@ pub fn render_noise_control_card(
                     .flex_wrap()
                     .gap(px(8.))
                     .pt(px(2.))
-                    .child(Tag::secondary().child("自适应均衡"))
-                    .child(Tag::secondary().child("入耳检测"))
-                    .child(Tag::secondary().child("高清立体声")),
+                    .child(Tag::secondary().child(rust_i18n::t!("noise.feature_adaptive_eq")))
+                    .child(Tag::secondary().child(rust_i18n::t!("noise.feature_ear_detect")))
+                    .child(Tag::secondary().child(rust_i18n::t!("noise.feature_spatial_audio"))),
             )
             .into_any_element()
     }

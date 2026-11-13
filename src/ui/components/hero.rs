@@ -21,11 +21,11 @@ pub fn render_hero_card(
         && (dev.left_in_ear == EarStatus::InCase || dev.right_in_ear == EarStatus::InCase);
 
     let (status_text, status_color, status_bg) = if !dev.is_connected {
-        ("○ 未连接", p.text_secondary, p.pill_bg)
+        (format!("○ {}", rust_i18n::t!("hero.disconnected")), p.text_secondary, p.pill_bg)
     } else if both_in_case {
-        ("● 充电盒中", p.accent_blue, p.accent_blue.opacity(0.16))
+        (format!("● {}", rust_i18n::t!("hero.in_case")), p.accent_blue, p.accent_blue.opacity(0.16))
     } else {
-        ("● 已连接", p.accent_green, p.accent_green.opacity(0.16))
+        (format!("● {}", rust_i18n::t!("hero.connected")), p.accent_green, p.accent_green.opacity(0.16))
     };
 
     let subtitle_text = format!("{} • {}", dev.capabilities.name, dev.mac_address);
@@ -88,7 +88,7 @@ pub fn render_hero_card(
                                 .ghost()
                                 .compact()
                                 .rounded(ButtonRounded::Size(px(999.)))
-                                .tooltip("重命名 AirPods")
+                                .tooltip(rust_i18n::t!("hero.rename_btn"))
                                 .icon(Icon::new(gpui_kit::assets::IconName::Pencil).size(px(14.))),
                         )
                         .content(move |_popover_state, _window, cx| {
@@ -104,7 +104,7 @@ pub fn render_hero_card(
                                 .child(
                                     Button::new("hero-rename-save")
                                         .primary()
-                                        .label("保存")
+                                        .label(rust_i18n::t!("hero.save"))
                                         .on_click(move |_, window, cx| {
                                             let new_name =
                                                 input_save.read(cx).value().trim().to_string();
@@ -153,7 +153,7 @@ pub fn render_hero_card(
                         Button::new("hero-connect-btn")
                             .primary()
                             .rounded(ButtonRounded::Size(px(999.)))
-                            .label("点击连接")
+                            .label(rust_i18n::t!("hero.connect_btn"))
                             .on_click(move |_, _, cx| {
                                 app_for_connect.read(cx).controller.connect();
                             }),

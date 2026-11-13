@@ -189,16 +189,16 @@ impl Render for AskPopupWindow {
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(p.text_primary)
                                             .child(if is_resolved_only {
-                                                "ZCode 应答完成"
+                                                rust_i18n::t!("agents.ask_resolved")
                                             } else {
-                                                "ZCode 提问"
+                                                rust_i18n::t!("agents.ask_title")
                                             }),
                                     )
                                     .when_some(progress.as_ref(), |this, ask| {
                                         let count_text = if ask.count == 0 {
-                                            "等待点头…".to_string()
+                                            rust_i18n::t!("agents.waiting_nod").to_string()
                                         } else {
-                                            format!("已识别 {} 次点头", ask.count)
+                                            format!("{}: {}", rust_i18n::t!("agents.nod_count"), ask.count)
                                         };
                                         this.child(
                                             div()

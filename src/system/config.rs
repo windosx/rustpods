@@ -17,7 +17,67 @@ pub enum StemAction {
     PreviousTrack,
     ToggleNoiseMode,
     SiriOrAssistant,
+    MouseLeftClick,
+    MouseRightClick,
+    ToggleMouseControl,
+    ToggleMouseScroll,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HeadMouseMode {
+    #[default]
+    Relative,
+    Absolute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AppLanguage {
+    #[default]
+    Auto,
+    ZhCn,
+    EnUs,
+}
+
+impl AppLanguage {
+    pub const ALL: [AppLanguage; 3] = [
+        AppLanguage::Auto,
+        AppLanguage::ZhCn,
+        AppLanguage::EnUs,
+    ];
+
+    pub fn resolved_locale(self) -> &'static str {
+        match self {
+            AppLanguage::Auto => detect_system_locale(),
+            AppLanguage::ZhCn => "zh-CN",
+            AppLanguage::EnUs => "en",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AppLanguage::Auto => "跟随系统 (Auto)",
+            AppLanguage::ZhCn => "简体中文",
+            AppLanguage::EnUs => "English",
+        }
+    }
+}
+
+/// Detects the system language on Linux (checking sys_locale and POSIX env vars).
+pub fn detect_system_locale() -> &'static str {
+    if let Some(locale) = sys_locale::get_locale() {
+        if locale.to_lowercase().starts_with("zh") {
+            return "zh-CN";
+        }
+    }
+    for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(val) = std::env::var(var) {
+            if val.to_lowercase().starts_with("zh") {
+                return "zh-CN";
+            }
+        }
+    }
+    "en"
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,6 +118,30 @@ pub struct AppConfig {
     /// exact battery levels from BLE advertisements.
     #[serde(default)]
     pub proximity_enc_key: Option<String>,
+    /// Controls whether head orientation / angular velocity moves the mouse cursor.
+    #[serde(default)]
+    pub head_mouse_enabled: bool,
+    #[serde(default)]
+    pub head_mouse_mode: HeadMouseMode,
+    #[serde(default = "default_mouse_speed")]
+    pub head_mouse_speed: f32,
+    #[serde(default = "default_mouse_accel")]
+    pub head_mouse_accel: f32,
+    #[serde(default = "default_mouse_smoothing")]
+    pub head_mouse_smoothing: f32,
+    #[serde(default = "default_mouse_deadzone")]
+    pub head_mouse_deadzone: f32,
+    #[serde(default)]
+    pub head_mouse_invert_x: bool,
+    #[serde(default)]
+    pub head_mouse_invert_y: bool,
+    #[serde(default)]
+    pub head_mouse_roll_click: bool,
+    #[serde(default)]
+    pub head_mouse_dwell_click: bool,
+    /// Interface display language (Auto follows system, ZhCn, or EnUs).
+    #[serde(default)]
+    pub language: AppLanguage,
 }
 
 fn default_true() -> bool {
@@ -66,6 +150,22 @@ fn default_true() -> bool {
 
 fn default_gesture_sensitivity() -> u8 {
     3
+}
+
+fn default_mouse_speed() -> f32 {
+    20.0
+}
+
+fn default_mouse_accel() -> f32 {
+    1.0
+}
+
+fn default_mouse_smoothing() -> f32 {
+    0.35
+}
+
+fn default_mouse_deadzone() -> f32 {
+    2.0
 }
 
 impl Default for AppConfig {
@@ -85,6 +185,17 @@ impl Default for AppConfig {
             case_popup_enabled: true,
             proximity_irk: None,
             proximity_enc_key: None,
+            head_mouse_enabled: false,
+            head_mouse_mode: HeadMouseMode::Relative,
+            head_mouse_speed: 20.0,
+            head_mouse_accel: 1.0,
+            head_mouse_smoothing: 0.35,
+            head_mouse_deadzone: 2.0,
+            head_mouse_invert_x: false,
+            head_mouse_invert_y: false,
+            head_mouse_roll_click: false,
+            head_mouse_dwell_click: false,
+            language: AppLanguage::Auto,
         }
     }
 }
@@ -274,11 +385,67 @@ mod tests {
         cfg.case_popup_enabled = false;
         cfg.proximity_irk = Some("0123456789abcdef0123456789abcdef".to_string());
         cfg.proximity_enc_key = Some("fedcba9876543210fedcba9876543210".to_string());
+        cfg.head_mouse_enabled = true;
+        cfg.head_mouse_mode = HeadMouseMode::Absolute;
+        cfg.head_mouse_speed = 35.0;
+        cfg.head_mouse_accel = 1.8;
+        cfg.head_mouse_smoothing = 0.5;
+        cfg.head_mouse_deadzone = 2.5;
+        cfg.head_mouse_invert_x = true;
+        cfg.head_mouse_invert_y = true;
+        cfg.head_mouse_roll_click = true;
+        cfg.head_mouse_dwell_click = true;
+        cfg.language = AppLanguage::EnUs;
         save_config_to(&path, &cfg);
 
         let (loaded, outcome) = load_config_from(&path);
         assert_eq!(outcome, ConfigLoad::Loaded);
         assert_eq!(loaded, cfg);
+        remove_scratch(&path);
+    }
+
+    #[test]
+    fn language_resolution_and_locale_detection() {
+        assert_eq!(AppLanguage::ZhCn.resolved_locale(), "zh-CN");
+        assert_eq!(AppLanguage::EnUs.resolved_locale(), "en");
+        let auto = AppLanguage::Auto.resolved_locale();
+        assert!(auto == "zh-CN" || auto == "en");
+    }
+
+    #[test]
+    fn translations_resolve_in_both_locales() {
+        assert_eq!(rust_i18n::t!("nav.overview", locale = "zh-CN"), "概览首页");
+        assert_eq!(rust_i18n::t!("nav.overview", locale = "en"), "Overview");
+        assert_eq!(rust_i18n::t!("head_mouse.title", locale = "zh-CN"), "头部姿态鼠标");
+        assert_eq!(rust_i18n::t!("head_mouse.title", locale = "en"), "Head Pose Mouse");
+        assert_eq!(rust_i18n::t!("preferences.language", locale = "zh-CN"), "界面语言 (Language)");
+        assert_eq!(rust_i18n::t!("preferences.language", locale = "en"), "Language");
+    }
+
+    #[test]
+    fn older_config_json_without_head_mouse_deserializes_to_defaults() {
+        let path = scratch("older");
+        let json = r#"{
+            "ear_detection_enabled": true,
+            "pause_behavior": "OneRemoved",
+            "conversational_awareness_enabled": false,
+            "stem_single_click": "PlayPause",
+            "stem_double_click": "NextTrack",
+            "stem_triple_click": "PreviousTrack",
+            "stem_long_press": "ToggleNoiseMode",
+            "start_minimized": false,
+            "close_to_tray": true
+        }"#;
+        fs::write(&path, json).unwrap();
+
+        let (loaded, outcome) = load_config_from(&path);
+        assert_eq!(outcome, ConfigLoad::Loaded);
+        assert!(!loaded.head_mouse_enabled);
+        assert_eq!(loaded.head_mouse_speed, 20.0);
+        assert_eq!(loaded.head_mouse_accel, 1.0);
+        assert_eq!(loaded.head_mouse_smoothing, 0.35);
+        assert_eq!(loaded.head_mouse_deadzone, 2.0);
+        assert_eq!(loaded.head_mouse_mode, HeadMouseMode::Relative);
         remove_scratch(&path);
     }
 }

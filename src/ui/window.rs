@@ -1,8 +1,8 @@
 use crate::core::aacp::commands::MicrophoneMode;
 use crate::system::config::PauseBehavior;
 use crate::ui::components::{
-    agents::render_agents_page, battery::render_battery_card, headtracking::render_head_tracking_card,
-    hero::render_hero_card, noise::render_noise_control_card,
+    agents::render_agents_page, battery::render_battery_card, head_mouse::render_head_mouse_page,
+    headtracking::render_head_tracking_card, hero::render_hero_card, noise::render_noise_control_card,
     preferences::render_preferences_page, settings::render_settings_page,
 };
 use crate::ui::state::{NavPage, RustPodsState};
@@ -34,16 +34,56 @@ pub fn window_options(cx: &App) -> WindowOptions {
     opts
 }
 
+fn get_pause_items() -> Vec<String> {
+    vec![
+        rust_i18n::t!("controls.pause_one").to_string(),
+        rust_i18n::t!("controls.pause_both").to_string(),
+        rust_i18n::t!("controls.pause_never").to_string(),
+    ]
+}
+
+fn get_mic_items() -> Vec<String> {
+    vec![
+        rust_i18n::t!("controls.mic_auto").to_string(),
+        rust_i18n::t!("controls.mic_left").to_string(),
+        rust_i18n::t!("controls.mic_right").to_string(),
+    ]
+}
+
+fn get_sens_items() -> Vec<String> {
+    vec![
+        rust_i18n::t!("agents.sens_1").to_string(),
+        rust_i18n::t!("agents.sens_2").to_string(),
+        rust_i18n::t!("agents.sens_3").to_string(),
+        rust_i18n::t!("agents.sens_4").to_string(),
+        rust_i18n::t!("agents.sens_5").to_string(),
+    ]
+}
+
+fn get_mode_items() -> Vec<String> {
+    vec![
+        rust_i18n::t!("head_mouse.mode_relative").to_string(),
+        rust_i18n::t!("head_mouse.mode_absolute").to_string(),
+    ]
+}
+
 pub struct MainWindow {
     app_state: Entity<RustPodsState>,
     rename_input: Entity<InputState>,
     adaptive_slider: Entity<SliderState>,
-    pause_select: Entity<SelectState<Vec<&'static str>>>,
-    mic_select: Entity<SelectState<Vec<&'static str>>>,
-    sensitivity_select: Entity<SelectState<Vec<&'static str>>>,
+    pause_select: Entity<SelectState<Vec<String>>>,
+    mic_select: Entity<SelectState<Vec<String>>>,
+    sensitivity_select: Entity<SelectState<Vec<String>>>,
+    mouse_mode_select: Entity<SelectState<Vec<String>>>,
+    mouse_speed_slider: Entity<SliderState>,
+    mouse_accel_slider: Entity<SliderState>,
+    mouse_smooth_slider: Entity<SliderState>,
+    mouse_deadzone_slider: Entity<SliderState>,
     last_synced_adaptive: u8,
+    last_synced_language: crate::system::config::AppLanguage,
     adaptive_debounce_gen: u64,
     _subscriptions: Vec<Subscription>,
+    _select_subscriptions: Vec<Subscription>,
 }
 
 impl MainWindow {
@@ -75,7 +115,7 @@ impl MainWindow {
         }
 
         let rename_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("输入 AirPods 名称");
+            let mut input = InputState::new(window, cx).placeholder(rust_i18n::t!("shell.rename_placeholder").as_ref());
             input.set_value(&initial_name, window, cx);
             input
         });
@@ -88,11 +128,7 @@ impl MainWindow {
                 .default_value(initial_adaptive as f32)
         });
 
-        let pause_items = vec![
-            "单耳摘下即暂停 (推荐)",
-            "双耳均摘下才暂停",
-            "从不暂停",
-        ];
+        let pause_items = get_pause_items();
         let pause_idx = match cfg.pause_behavior {
             PauseBehavior::OneRemoved => 0,
             PauseBehavior::BothRemoved => 1,
@@ -102,7 +138,7 @@ impl MainWindow {
             SelectState::new(pause_items, Some(IndexPath::default().row(pause_idx)), window, cx)
         });
 
-        let mic_items = vec!["自动切换 (默认)", "始终左耳", "始终右耳"];
+        let mic_items = get_mic_items();
         let mic_idx = match initial_mic {
             MicrophoneMode::Automatic => 0,
             MicrophoneMode::AlwaysLeft => 1,
@@ -112,28 +148,70 @@ impl MainWindow {
             SelectState::new(mic_items, Some(IndexPath::default().row(mic_idx)), window, cx)
         });
 
-        let sens_items = vec![
-            "1 · 很不灵敏",
-            "2 · 较不灵敏",
-            "3 · 标准",
-            "4 · 较灵敏",
-            "5 · 很灵敏",
-        ];
+        let sens_items = get_sens_items();
         let sens_idx = (cfg.gesture_sensitivity.clamp(1, 5) - 1) as usize;
         let sensitivity_select = cx.new(|cx| {
             SelectState::new(sens_items, Some(IndexPath::default().row(sens_idx)), window, cx)
         });
 
+        let mode_items = get_mode_items();
+        let mode_idx = match cfg.head_mouse_mode {
+            crate::system::config::HeadMouseMode::Relative => 0,
+            crate::system::config::HeadMouseMode::Absolute => 1,
+        };
+        let mouse_mode_select = cx.new(|cx| {
+            SelectState::new(mode_items, Some(IndexPath::default().row(mode_idx)), window, cx)
+        });
+
+        let mouse_speed_slider = cx.new(|_| {
+            SliderState::new()
+                .min(5.)
+                .max(60.)
+                .step(1.)
+                .default_value(cfg.head_mouse_speed)
+        });
+
+        let mouse_accel_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(3.)
+                .step(0.1)
+                .default_value(cfg.head_mouse_accel)
+        });
+
+        let mouse_smooth_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(1.)
+                .step(0.05)
+                .default_value(cfg.head_mouse_smoothing)
+        });
+
+        let mouse_deadzone_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.5)
+                .max(5.)
+                .step(0.25)
+                .default_value(cfg.head_mouse_deadzone)
+        });
+
         let mut subscriptions = Vec::new();
 
-        // Re-render window when background state changes, and keep slider synced.
+        // Re-render window when background state changes, and keep slider/language synced.
         subscriptions.push(cx.observe_in(&app_state, window, |this, state, window, cx| {
-            let ext_adaptive = state.read(cx).device.adaptive_strength;
+            let (ext_adaptive, ext_lang) = {
+                let s = state.read(cx);
+                (s.device.adaptive_strength, s.config_snapshot().language)
+            };
             if ext_adaptive != this.last_synced_adaptive {
                 this.last_synced_adaptive = ext_adaptive;
                 this.adaptive_slider.update(cx, |s, cx| {
                     s.set_value(ext_adaptive as f32, window, cx);
                 });
+            }
+            if ext_lang != this.last_synced_language {
+                this.last_synced_language = ext_lang;
+                this.rebuild_selects(window, cx);
             }
             cx.notify();
         }));
@@ -197,12 +275,37 @@ impl MainWindow {
             ));
         }
 
+        let mut this = Self {
+            app_state,
+            rename_input,
+            adaptive_slider,
+            pause_select,
+            mic_select,
+            sensitivity_select,
+            mouse_mode_select,
+            mouse_speed_slider,
+            mouse_accel_slider,
+            mouse_smooth_slider,
+            mouse_deadzone_slider,
+            last_synced_adaptive: initial_adaptive,
+            last_synced_language: cfg.language,
+            adaptive_debounce_gen: 0,
+            _subscriptions: subscriptions,
+            _select_subscriptions: Vec::new(),
+        };
+        this.subscribe_selects(cx);
+        this
+    }
+
+    fn subscribe_selects(&mut self, cx: &mut Context<Self>) {
+        self._select_subscriptions.clear();
+
         // Pause behavior selector.
         {
-            let app_pause = app_state.clone();
-            subscriptions.push(cx.subscribe(
-                &pause_select,
-                move |_this, select, event: &SelectEvent<Vec<&'static str>>, cx| {
+            let app_pause = self.app_state.clone();
+            self._select_subscriptions.push(cx.subscribe(
+                &self.pause_select,
+                move |_this, select, event: &SelectEvent<Vec<String>>, cx| {
                     let SelectEvent::Confirm(_) = event;
                     let row = select.read(cx).selected_index(cx).map(|p| p.row).unwrap_or(0);
                     let behavior = match row {
@@ -220,10 +323,10 @@ impl MainWindow {
 
         // Microphone mode selector.
         {
-            let app_mic = app_state.clone();
-            subscriptions.push(cx.subscribe(
-                &mic_select,
-                move |_this, select, event: &SelectEvent<Vec<&'static str>>, cx| {
+            let app_mic = self.app_state.clone();
+            self._select_subscriptions.push(cx.subscribe(
+                &self.mic_select,
+                move |_this, select, event: &SelectEvent<Vec<String>>, cx| {
                     let SelectEvent::Confirm(_) = event;
                     let row = select.read(cx).selected_index(cx).map(|p| p.row).unwrap_or(0);
                     let mode = match row {
@@ -242,10 +345,10 @@ impl MainWindow {
 
         // Gesture sensitivity selector.
         {
-            let app_sens = app_state.clone();
-            subscriptions.push(cx.subscribe(
-                &sensitivity_select,
-                move |_this, select, event: &SelectEvent<Vec<&'static str>>, cx| {
+            let app_sens = self.app_state.clone();
+            self._select_subscriptions.push(cx.subscribe(
+                &self.sensitivity_select,
+                move |_this, select, event: &SelectEvent<Vec<String>>, cx| {
                     let SelectEvent::Confirm(_) = event;
                     let row = select.read(cx).selected_index(cx).map(|p| p.row).unwrap_or(2);
                     let level = (row as u8) + 1;
@@ -257,23 +360,76 @@ impl MainWindow {
             ));
         }
 
-        Self {
-            app_state,
-            rename_input,
-            adaptive_slider,
-            pause_select,
-            mic_select,
-            sensitivity_select,
-            last_synced_adaptive: initial_adaptive,
-            adaptive_debounce_gen: 0,
-            _subscriptions: subscriptions,
+        // Mouse mode selector.
+        {
+            let app_mode = self.app_state.clone();
+            self._select_subscriptions.push(cx.subscribe(
+                &self.mouse_mode_select,
+                move |_this, select, event: &SelectEvent<Vec<String>>, cx| {
+                    let SelectEvent::Confirm(_) = event;
+                    let row = select.read(cx).selected_index(cx).map(|p| p.row).unwrap_or(0);
+                    let mode = match row {
+                        1 => crate::system::config::HeadMouseMode::Absolute,
+                        _ => crate::system::config::HeadMouseMode::Relative,
+                    };
+                    app_mode.update(cx, |s, cx| {
+                        s.controller.set_head_mouse_mode(mode);
+                        cx.notify();
+                    });
+                },
+            ));
         }
+    }
+
+    fn rebuild_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (cfg, mic) = {
+            let s = self.app_state.read(cx);
+            (s.config_snapshot(), s.device.mic_mode)
+        };
+
+        let pause_row = match cfg.pause_behavior {
+            PauseBehavior::OneRemoved => 0,
+            PauseBehavior::BothRemoved => 1,
+            PauseBehavior::Never => 2,
+        };
+        self.pause_select = cx.new(|cx| {
+            SelectState::new(get_pause_items(), Some(IndexPath::default().row(pause_row)), window, cx)
+        });
+
+        let mic_row = match mic {
+            MicrophoneMode::Automatic => 0,
+            MicrophoneMode::AlwaysLeft => 1,
+            MicrophoneMode::AlwaysRight => 2,
+        };
+        self.mic_select = cx.new(|cx| {
+            SelectState::new(get_mic_items(), Some(IndexPath::default().row(mic_row)), window, cx)
+        });
+
+        let sens_row = (cfg.gesture_sensitivity.clamp(1, 5) - 1) as usize;
+        self.sensitivity_select = cx.new(|cx| {
+            SelectState::new(get_sens_items(), Some(IndexPath::default().row(sens_row)), window, cx)
+        });
+
+        let mode_row = match cfg.head_mouse_mode {
+            crate::system::config::HeadMouseMode::Relative => 0,
+            crate::system::config::HeadMouseMode::Absolute => 1,
+        };
+        self.mouse_mode_select = cx.new(|cx| {
+            SelectState::new(get_mode_items(), Some(IndexPath::default().row(mode_row)), window, cx)
+        });
+
+        self.rename_input.update(cx, |input, cx| {
+            input.set_placeholder(rust_i18n::t!("shell.rename_placeholder").as_ref(), window, cx);
+        });
+
+        self.subscribe_selects(cx);
     }
 
     fn nav_icon(page: NavPage) -> gpui_kit::assets::IconName {
         match page {
             NavPage::Overview => gpui_kit::assets::IconName::Headphones,
             NavPage::Spatial => gpui_kit::assets::IconName::Compass,
+            NavPage::HeadMouse => gpui_kit::assets::IconName::MousePointer,
             NavPage::Controls => gpui_kit::assets::IconName::SlidersHorizontal,
             NavPage::Agents => gpui_kit::assets::IconName::Bot,
             NavPage::Preferences => gpui_kit::assets::IconName::Settings,
@@ -403,9 +559,9 @@ impl Render for MainWindow {
                                             .text_size(px(11.5))
                                             .text_color(p.text_secondary)
                                             .child(if is_connected {
-                                                "AACP 已连接"
+                                                rust_i18n::t!("shell.connected")
                                             } else {
-                                                "等待连接"
+                                                rust_i18n::t!("shell.waiting")
                                             }),
                                     ),
                             )
@@ -415,9 +571,9 @@ impl Render for MainWindow {
                                     .compact()
                                     .rounded(ButtonRounded::Size(px(999.)))
                                     .tooltip(if is_dark {
-                                        "切换到浅色模式"
+                                        rust_i18n::t!("shell.toggle_light")
                                     } else {
-                                        "切换到深色模式"
+                                        rust_i18n::t!("shell.toggle_dark")
                                     })
                                     .icon(Icon::new(if is_dark {
                                         gpui_kit::component::IconName::Sun
@@ -439,6 +595,36 @@ impl Render for MainWindow {
                             ),
                     ),
             );
+
+        let view_handle = cx.entity().clone();
+        let on_enable_request = {
+            let view = view_handle.clone();
+            std::rc::Rc::new(move |_window: &mut Window, cx: &mut App| {
+                view.update(cx, |_this, cx| {
+                    cx.spawn(async move |this, cx| {
+                        let res = tokio::task::spawn_blocking(crate::system::head_mouse::grant_uinput_permission_pkexec)
+                            .await
+                            .unwrap_or_else(|e| Err(format!("任务执行异常: {}", e)));
+
+                        let _ = this.update(cx, |this, cx| {
+                            if res.is_ok() && crate::system::head_mouse::UinputStatus::probe().is_available() {
+                                this.app_state.update(cx, |s, cx| {
+                                    s.controller.toggle_head_mouse(true);
+                                    cx.notify();
+                                });
+                            } else {
+                                this.app_state.update(cx, |s, cx| {
+                                    s.controller.toggle_head_mouse(false);
+                                    cx.notify();
+                                });
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                });
+            })
+        };
 
         let page_content = match active_page {
             NavPage::Overview => div()
@@ -469,6 +655,19 @@ impl Render for MainWindow {
                 .gap(px(14.))
                 .child(render_head_tracking_card(&state.head_tracking, &p))
                 .into_any_element(),
+
+            NavPage::HeadMouse => render_head_mouse_page(
+                state,
+                &self.app_state,
+                &self.mouse_mode_select,
+                &self.mouse_speed_slider,
+                &self.mouse_accel_slider,
+                &self.mouse_smooth_slider,
+                &self.mouse_deadzone_slider,
+                on_enable_request,
+                &p,
+            )
+            .into_any_element(),
 
             NavPage::Controls => render_settings_page(
                 state,
