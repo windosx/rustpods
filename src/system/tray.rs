@@ -1,15 +1,77 @@
 use crate::core::aacp::commands::NoiseControlMode;
 use crate::core::device::AirPodsDeviceState;
+use crate::system::config::{save_config, AppConfig};
+use crate::ui::UiEvent;
 use ksni::menu::*;
 use ksni::{Icon, ToolTip, Tray};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+
+/// Applies a noise-control mode the way every entry point does: push it to the
+/// accessory, then publish the updated device state. The accessory never
+/// echoes the mode back, so without this shared publish the window and tray
+/// would show the old mode until restart. One helper instead of three copies
+/// (tray daemon closure, tray GUI closure, controller).
+pub async fn apply_noise_mode(
+    aacp: &Arc<crate::core::aacp::AacpManager>,
+    device_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    mode: NoiseControlMode,
+) {
+    let _ = aacp.set_noise_mode(mode).await;
+    let updated = {
+        let mut guard = device_state.write().await;
+        match guard.as_mut() {
+            Some(state) => {
+                state.noise_mode = mode;
+                Some(state.clone())
+            }
+            None => None,
+        }
+    };
+    if let Some(state) = updated {
+        let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state));
+    }
+}
+
+/// Applies an ear-detection toggle the way every entry point does: persist it,
+/// push it to the accessory, and publish the updated device state.
+pub async fn apply_ear_detection_toggle(
+    aacp: &Arc<crate::core::aacp::AacpManager>,
+    config: &Arc<std::sync::RwLock<AppConfig>>,
+    device_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    enabled: bool,
+) {
+    if let Ok(mut c) = config.write() {
+        c.ear_detection_enabled = enabled;
+        save_config(&c);
+    }
+    let _ = aacp.set_ear_detection(enabled).await;
+    let updated = {
+        let mut guard = device_state.write().await;
+        match guard.as_mut() {
+            Some(state) => {
+                state.ear_detection_enabled = enabled;
+                Some(state.clone())
+            }
+            None => None,
+        }
+    };
+    if let Some(state) = updated {
+        let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state));
+    }
+}
 
 pub struct RustPodsTray {
     pub device_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
     pub on_open_window: Arc<dyn Fn() + Send + Sync>,
     pub on_set_noise_mode: Arc<dyn Fn(NoiseControlMode) + Send + Sync>,
     pub on_toggle_ear_detection: Arc<dyn Fn(bool) + Send + Sync>,
+    /// Requests a graceful application shutdown. `std::process::exit` here
+    /// would skip every Drop - most importantly the HRTF client's, which
+    /// restores the default audio sink on the way out.
+    pub on_quit: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Tray for RustPodsTray {
@@ -74,18 +136,24 @@ impl Tray for RustPodsTray {
             let c = state
                 .battery_case
                 .map(|v| format!("{}%", v))
-                .unwrap_or_else(|| "闭盖".to_string());
+                .unwrap_or_else(|| rust_i18n::t!("tray.case_closed").to_string());
             let charge_sym = if state.battery_left_charging || state.battery_right_charging {
-                " [充电中]"
+                format!(" [{}]", rust_i18n::t!("battery.charging"))
             } else {
-                ""
+                String::new()
             };
 
             ToolTip {
                 icon_name: "audio-headphones".to_string(),
                 icon_pixmap: vec![],
                 title: format!("{} (AirPods){}", state.name, charge_sym),
-                description: format!("左耳: {}  右耳: {}  充电盒: {}", l, r, c),
+                description: rust_i18n::t!(
+                    "tray.tip_description",
+                    left = l,
+                    right = r,
+                    case = c
+                )
+                .to_string(),
             }
         } else {
             ToolTip {
@@ -109,14 +177,14 @@ impl Tray for RustPodsTray {
 
         if let Some(state) = state_opt {
             let header_text = if !state.is_connected {
-                format!("{} (未连接)", state.name)
+                format!("{} {}", state.name, rust_i18n::t!("tray.tag_disconnected"))
             } else if !state.is_wearing_any()
                 && (state.left_in_ear == crate::core::aacp::events::EarStatus::InCase
                     || state.right_in_ear == crate::core::aacp::events::EarStatus::InCase)
             {
-                format!("{} (充电盒中)", state.name)
+                format!("{} {}", state.name, rust_i18n::t!("tray.tag_in_case"))
             } else {
-                format!("{} (已连接)", state.name)
+                format!("{} {}", state.name, rust_i18n::t!("tray.tag_connected"))
             };
             menu.push(
                 StandardItem {
@@ -139,9 +207,15 @@ impl Tray for RustPodsTray {
             let c_str = state
                 .battery_case
                 .map(|v| format!("{}%", v))
-                .unwrap_or_else(|| "闭盖".to_string());
+                .unwrap_or_else(|| rust_i18n::t!("tray.case_closed").to_string());
 
-            let batt_text = format!("左耳: {} | 右耳: {} | 充电盒: {}", l_str, r_str, c_str);
+            let batt_text = rust_i18n::t!(
+                "tray.battery_line",
+                left = l_str,
+                right = r_str,
+                case = c_str
+            )
+            .to_string();
             menu.push(
                 StandardItem {
                     label: batt_text,
@@ -162,12 +236,13 @@ impl Tray for RustPodsTray {
                 mode_items.push(
                     StandardItem {
                         label: format!(
-                            "{} 降噪 (Noise Cancellation)",
+                            "{} {}",
                             if current_mode == NoiseControlMode::NoiseCancellation {
-                                "● "
+                                "●"
                             } else {
-                                "○ "
-                            }
+                                "○"
+                            },
+                            rust_i18n::t!("noise.anc")
                         ),
                         activate: Box::new(move |_| {
                             on_mode_anc(NoiseControlMode::NoiseCancellation);
@@ -181,12 +256,13 @@ impl Tray for RustPodsTray {
                 mode_items.push(
                     StandardItem {
                         label: format!(
-                            "{} 通透模式 (Transparency)",
+                            "{} {}",
                             if current_mode == NoiseControlMode::Transparency {
-                                "● "
+                                "●"
                             } else {
-                                "○ "
-                            }
+                                "○"
+                            },
+                            rust_i18n::t!("noise.transparency")
                         ),
                         activate: Box::new(move |_| {
                             on_mode_trans(NoiseControlMode::Transparency);
@@ -201,12 +277,13 @@ impl Tray for RustPodsTray {
                     mode_items.push(
                         StandardItem {
                             label: format!(
-                                "{} 自适应 (Adaptive)",
+                                "{} {}",
                                 if current_mode == NoiseControlMode::Adaptive {
-                                    "● "
+                                    "●"
                                 } else {
-                                    "○ "
-                                }
+                                    "○"
+                                },
+                                rust_i18n::t!("noise.adaptive")
                             ),
                             activate: Box::new(move |_| {
                                 on_mode_adapt(NoiseControlMode::Adaptive);
@@ -221,12 +298,13 @@ impl Tray for RustPodsTray {
                 mode_items.push(
                     StandardItem {
                         label: format!(
-                            "{} 关闭 (Off)",
+                            "{} {}",
                             if current_mode == NoiseControlMode::Off {
-                                "● "
+                                "●"
                             } else {
-                                "○ "
-                            }
+                                "○"
+                            },
+                            rust_i18n::t!("noise.off")
                         ),
                         activate: Box::new(move |_| {
                             on_mode_off(NoiseControlMode::Off);
@@ -238,7 +316,7 @@ impl Tray for RustPodsTray {
 
                 menu.push(
                     SubMenu {
-                        label: "噪声控制".into(),
+                        label: rust_i18n::t!("tray.noise_control").into(),
                         submenu: mode_items,
                         ..Default::default()
                     }
@@ -251,7 +329,7 @@ impl Tray for RustPodsTray {
             let ear_enabled = state.ear_detection_enabled;
             menu.push(
                 CheckmarkItem {
-                    label: "自动入耳检测".into(),
+                    label: rust_i18n::t!("tray.ear_detection").into(),
                     checked: ear_enabled,
                     activate: Box::new(move |_| {
                         on_toggle(!ear_enabled);
@@ -263,7 +341,7 @@ impl Tray for RustPodsTray {
         } else {
             menu.push(
                 StandardItem {
-                    label: "未连接 AirPods".into(),
+                    label: rust_i18n::t!("tray.not_connected").into(),
                     enabled: false,
                     ..Default::default()
                 }
@@ -276,7 +354,7 @@ impl Tray for RustPodsTray {
         let on_open = self.on_open_window.clone();
         menu.push(
             StandardItem {
-                label: "打开 RustPods 设置...".into(),
+                label: rust_i18n::t!("tray.open_app").into(),
                 activate: Box::new(move |_| {
                     on_open();
                 }),
@@ -285,11 +363,12 @@ impl Tray for RustPodsTray {
             .into(),
         );
 
+        let on_quit = self.on_quit.clone();
         menu.push(
             StandardItem {
-                label: "退出应用".into(),
-                activate: Box::new(|_| {
-                    std::process::exit(0);
+                label: rust_i18n::t!("tray.quit").into(),
+                activate: Box::new(move |_| {
+                    on_quit();
                 }),
                 ..Default::default()
             }
@@ -394,7 +473,7 @@ fn is_in_lightning_glyph(x: usize, y: usize, size: usize) -> bool {
     if norm_y < 22.0 || norm_y > 42.0 || norm_x < 26.0 || norm_x > 38.0 {
         return false;
     }
-    if norm_y >= 31.0 && norm_y <= 33.0 && norm_x >= 27.0 && norm_x <= 37.0 {
+    if (31.0..=33.0).contains(&norm_y) && (27.0..=37.0).contains(&norm_x) {
         return true;
     }
     if norm_y < 32.0 {

@@ -283,11 +283,10 @@ fn azimuth_in(pod: &Pod) -> Option<f32> {
         let Value::Struct(items) = &prop.value else { continue };
         let mut i = 0;
         while i + 1 < items.len() {
-            if let (Value::String(k), Value::Float(v)) = (&items[i], &items[i + 1]) {
-                if k == "spatL:Azimuth" {
+            if let (Value::String(k), Value::Float(v)) = (&items[i], &items[i + 1])
+                && k == "spatL:Azimuth" {
                     return Some(*v);
                 }
-            }
             i += 2;
         }
     }

@@ -82,15 +82,6 @@ impl NoiseControlMode {
     pub fn to_u8(self) -> u8 {
         self as u8
     }
-
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Self::Off => "关闭",
-            Self::NoiseCancellation => "降噪",
-            Self::Transparency => "通透模式",
-            Self::Adaptive => "自适应",
-        }
-    }
 }
 
 #[repr(u8)]

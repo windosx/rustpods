@@ -249,8 +249,8 @@ async fn parse_proximity_message(
     };
     let mut case_charging = (flags & 0x04) != 0;
 
-    if let Some(enc_key) = enc_key_opt {
-        if data.len() >= 27 {
+    if let Some(enc_key) = enc_key_opt
+        && data.len() >= 27 {
             let mut block = [0u8; 16];
             block.copy_from_slice(&data[data.len() - 16..]);
             let dec = decrypt_proximity_payload(&enc_key, &block);
@@ -280,7 +280,6 @@ async fn parse_proximity_message(
                 case_charging = chg;
             }
         }
-    }
 
     let xor_factor = are_values_flipped ^ is_this_pod_in_case;
     let left_in_ear = if xor_factor {

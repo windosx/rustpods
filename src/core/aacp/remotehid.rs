@@ -158,6 +158,12 @@ impl Default for Generation {
 }
 
 impl Generation {
+    /// Advances the counter and returns the value to put on the wire.
+    ///
+    /// Not an iterator - the name matches the protocol's "generation" field,
+    /// and a `clippy::should_implement_trait` rename would churn every call
+    /// site without adding clarity.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> u8 {
         let g = self.0;
         self.0 = self.0.wrapping_add(1);
@@ -367,6 +373,58 @@ fn extract_int(text: &str, key: &str) -> Option<i64> {
     let rest = &text[start..];
     let end = rest.find('<')?;
     rest[..end].parse().ok()
+}
+
+/// Minimal base64 decoder for the descriptor blobs embedded in DeviceConnect
+/// plists. Invalid characters are skipped, which matches the permissive
+/// treatment the wire format needs: the plist body is truncated at the next
+/// tag, so the tail can end mid-run without padding.
+pub fn decode_base64(input: &str) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for byte in input.bytes() {
+        let Some(index) = TABLE.iter().position(|&c| c == byte) else {
+            continue;
+        };
+        buffer = (buffer << 6) | index as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// Records a DeviceConnect frame in the registry, ignoring any other frame
+/// shape.
+///
+/// The single home for the extraction rules (kind, response bit, plist start,
+/// base64 descriptor) so the AACP receive loop and the head-tracking
+/// diagnostics cannot drift apart. Frames whose plist was truncated by a
+/// short read register with whatever prefix survived; a later, complete
+/// DeviceConnect for the same device id overwrites it.
+pub fn record_device_connect(registry: &mut DeviceRegistry, frame: &[u8]) {
+    let Some((_g, header, _p)) = parse_frame(frame) else {
+        return;
+    };
+    if header.kind() != Some(Kind::HostConnect) || header.is_response {
+        return;
+    }
+    let Some(start) = frame.iter().position(|&b| b == b'<') else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&frame[start..]).to_string();
+    let descriptor = text
+        .find("<key>ReportDescriptor</key><data>")
+        .and_then(|s| {
+            let rest = &text[s + "<key>ReportDescriptor</key><data>".len()..];
+            rest.find('<').map(|e| decode_base64(&rest[..e]))
+        })
+        .unwrap_or_default();
+    registry.record(header.device, &text, &descriptor);
 }
 
 /// The 58-byte motion block carried by `devmotion6` InputReports.
@@ -621,8 +679,7 @@ mod tests {
         assert_eq!(generation.next(), 2);
         assert_eq!(generation.current(), 3);
 
-        let mut wrap = Generation::default();
-        wrap.0 = 255;
+        let mut wrap = Generation(255);
         assert_eq!(wrap.next(), 255);
         assert_eq!(wrap.current(), 1, "wraps to 1, never 0");
     }

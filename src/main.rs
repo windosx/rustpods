@@ -356,18 +356,34 @@ fn main() {
             let mpris_controller = Arc::new(system::mpris::MprisController::new());
             let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
 
+            // Graceful-shutdown signal for the tray's quit item: returning
+            // from here (rather than std::process::exit) lets the runtime drop
+            // every task, whose Drops run - most importantly the HRTF client
+            // restoring the default audio sink.
+            let (quit_tx_raw, quit_rx) = tokio::sync::oneshot::channel::<()>();
+            // A oneshot sender is consumed by `send`; the tray callback may
+            // fire more than once, so keep it in a take-cell behind a mutex
+            // (the callback is a plain `Fn`).
+            let quit_tx = std::sync::Mutex::new(Some(quit_tx_raw));
+
             // Spawn tray in daemon mode
             let tray_state = device_state.clone();
             let aacp_noise = aacp_manager.clone();
+            let tray_dev_noise = device_state.clone();
+            let tray_tx_noise = ui_tx.clone();
             let aacp_ear = aacp_manager.clone();
             let tray_config = config.clone();
+            let tray_dev_ear = device_state.clone();
+            let tray_tx_ear = ui_tx.clone();
             let tray = system::tray::RustPodsTray {
                 device_state: tray_state,
                 on_open_window: Arc::new(|| {}),
                 on_set_noise_mode: Arc::new(move |mode| {
                     let aacp = aacp_noise.clone();
+                    let dev = tray_dev_noise.clone();
+                    let tx = tray_tx_noise.clone();
                     tokio::spawn(async move {
-                        let _ = aacp.set_noise_mode(mode).await;
+                        system::tray::apply_noise_mode(&aacp, &dev, &tx, mode).await;
                     });
                 }),
                 on_toggle_ear_detection: Arc::new(move |enabled| {
@@ -375,13 +391,19 @@ fn main() {
                     // Persist like the GUI tray does: the daemon's auto-pause
                     // gate reads the config, so a tray-only toggle used to
                     // leave the pause behaviour untouched.
-                    if let Ok(mut c) = tray_config.write() {
-                        c.ear_detection_enabled = enabled;
-                        system::config::save_config(&c);
-                    }
+                    let cfg = tray_config.clone();
+                    let dev = tray_dev_ear.clone();
+                    let tx = tray_tx_ear.clone();
                     tokio::spawn(async move {
-                        let _ = aacp.set_ear_detection(enabled).await;
+                        system::tray::apply_ear_detection_toggle(&aacp, &cfg, &dev, &tx, enabled)
+                            .await;
                     });
+                }),
+                on_quit: Arc::new(move || {
+                    // Take the sender out so repeat clicks are no-ops.
+                    if let Some(tx) = quit_tx.lock().ok().and_then(|mut slot| slot.take()) {
+                        let _ = tx.send(());
+                    }
                 }),
             };
             tokio::spawn(async move {
@@ -391,7 +413,7 @@ fn main() {
 
             // Consume UI events in background
             tokio::spawn(async move {
-                while let Some(_) = ui_rx.recv().await {}
+                while ui_rx.recv().await.is_some() {}
             });
 
             // Serve ZCode question hooks in the daemon too: whichever process
@@ -418,9 +440,12 @@ fn main() {
                 .await;
             });
 
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to listen for ctrl-c");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = quit_rx => {
+                    info!("Shutdown requested from the tray");
+                }
+            }
             info!("Daemon shutting down");
         });
     } else {
@@ -589,24 +614,7 @@ async fn run_remotehid_test(target: &str) {
             let Ok(Ok(frame)) = tokio::time::timeout(remaining, frames.recv()).await else {
                 break;
             };
-            let Some((_g, header, _p)) = remotehid::parse_frame(&frame) else {
-                continue;
-            };
-            if header.kind() != Some(remotehid::Kind::HostConnect) || header.is_response {
-                continue;
-            }
-            let Some(start) = frame.iter().position(|&b| b == b'<') else {
-                continue;
-            };
-            let text = String::from_utf8_lossy(&frame[start..]).to_string();
-            let descriptor = text
-                .find("<key>ReportDescriptor</key><data>")
-                .and_then(|s| {
-                    let rest = &text[s + "<key>ReportDescriptor</key><data>".len()..];
-                    rest.find('<').map(|e| decode_base64(&rest[..e]))
-                })
-                .unwrap_or_default();
-            registry.record(header.device, &text, &descriptor);
+            remotehid::record_device_connect(&mut registry, &frame);
         }
 
         let announced: Vec<String> = registry.all().map(|d| format!("{}={}", d.service, d.device)).collect();
@@ -643,35 +651,16 @@ async fn run_remotehid_test(target: &str) {
                             else {
                                 continue;
                             };
-                            let Some((_g, header, _p)) = remotehid::parse_frame(&frame) else {
-                                continue;
-                            };
-                            if header.kind() != Some(remotehid::Kind::HostConnect) {
-                                continue;
-                            }
-                            if let Some(start) = frame.iter().position(|&b| b == b'<') {
-                                let text = String::from_utf8_lossy(&frame[start..]).to_string();
-                                let descriptor = text
-                                    .find("<key>ReportDescriptor</key><data>")
-                                    .and_then(|s| {
-                                        let rest =
-                                            &text[s + "<key>ReportDescriptor</key><data>".len()..];
-                                        rest.find('<').map(|e| decode_base64(&rest[..e]))
-                                    })
-                                    .unwrap_or_default();
-                                registry.record(header.device, &text, &descriptor);
-                            }
+                            remotehid::record_device_connect(&mut registry, &frame);
                         }
                         let now: Vec<String> =
                             registry.all().map(|d| d.service.clone()).collect();
                         tracing::info!("After waiting: {} services {:?}", now.len(), now);
                         if let Some(packet) =
                             supervisor.record_announcement(&registry, &mut generation)
-                        {
-                            if !packet.is_empty() {
+                            && !packet.is_empty() {
                                 let _ = aacp.send_raw(packet).await;
                             }
-                        }
                     }
                     Recovery::CycleLink | Recovery::WaitForWearer => continue,
                 }
@@ -699,24 +688,7 @@ async fn run_remotehid_test(target: &str) {
                             else {
                                 continue;
                             };
-                            let Some((_g, header, _p)) = remotehid::parse_frame(&frame) else {
-                                continue;
-                            };
-                            if header.kind() != Some(remotehid::Kind::HostConnect) {
-                                continue;
-                            }
-                            if let Some(start) = frame.iter().position(|&b| b == b'<') {
-                                let text = String::from_utf8_lossy(&frame[start..]).to_string();
-                                let descriptor = text
-                                    .find("<key>ReportDescriptor</key><data>")
-                                    .and_then(|s| {
-                                        let rest =
-                                            &text[s + "<key>ReportDescriptor</key><data>".len()..];
-                                        rest.find('<').map(|e| decode_base64(&rest[..e]))
-                                    })
-                                    .unwrap_or_default();
-                                registry.record(header.device, &text, &descriptor);
-                            }
+                            remotehid::record_device_connect(&mut registry, &frame);
                         }
                         let names: Vec<String> = registry.all().map(|d| d.service.clone()).collect();
                         tracing::info!("After waiting on this link: {} services {:?}", names.len(), names);
@@ -776,26 +748,6 @@ async fn run_remotehid_test(target: &str) {
 }
 
 
-
-/// Minimal base64 decoder for the descriptor blobs embedded in DeviceConnect.
-fn decode_base64(input: &str) -> Vec<u8> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::new();
-    let mut buffer: u32 = 0;
-    let mut bits = 0;
-    for byte in input.bytes() {
-        let Some(index) = TABLE.iter().position(|&c| c == byte) else {
-            continue;
-        };
-        buffer = (buffer << 6) | index as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-        }
-    }
-    out
-}
 
 async fn run_head_tracking_test(target: &str) {
     use std::time::Duration;
@@ -1109,12 +1061,18 @@ async fn prepare_connection(target: &str) -> Option<Arc<core::aacp::AacpManager>
     };
 
     tracing::info!("Ensuring {} is connected...", addr);
-    let _ = tokio::process::Command::new("bluetoothctl")
-        .arg("connect")
-        .arg(addr.to_string())
-        .output()
-        .await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Through BlueZ instead of a `bluetoothctl` shell-out: the API resolves
+    // when the link is actually up, so the fixed 3 s sleep the shell version
+    // needed is replaced by a short profile-settle wait.
+    match crate::system::bluetooth::BluetoothManager::new().await {
+        Ok(bm) => {
+            if let Err(e) = bm.ensure_connected(addr).await {
+                tracing::warn!("Could not connect to {}: {} (continuing anyway)", addr, e);
+            }
+        }
+        Err(e) => tracing::warn!("BlueZ unavailable for the diagnostic connect: {}", e),
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let aacp = Arc::new(core::aacp::AacpManager::new());
 

@@ -31,6 +31,43 @@ pub enum HeadMouseMode {
     Absolute,
 }
 
+/// The head-mouse settings the controller consumes, copied out of the config
+/// in one short lock. The controller runs at sample rate (~100 Hz) plus a
+/// 120 Hz render tick; cloning the whole [`AppConfig`] there was both wasteful
+/// and easy to desync. Copying this small struct instead keeps the lock hold
+/// down to a field read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeadMouseParams {
+    pub enabled: bool,
+    pub mode: HeadMouseMode,
+    pub speed: f32,
+    pub accel: f32,
+    pub smoothing: f32,
+    pub deadzone: f32,
+    pub invert_x: bool,
+    pub invert_y: bool,
+    pub roll_click: bool,
+    pub dwell_click: bool,
+}
+
+impl AppConfig {
+    /// Copies the head-mouse subset out of the config.
+    pub fn head_mouse_params(&self) -> HeadMouseParams {
+        HeadMouseParams {
+            enabled: self.head_mouse_enabled,
+            mode: self.head_mouse_mode,
+            speed: self.head_mouse_speed,
+            accel: self.head_mouse_accel,
+            smoothing: self.head_mouse_smoothing,
+            deadzone: self.head_mouse_deadzone,
+            invert_x: self.head_mouse_invert_x,
+            invert_y: self.head_mouse_invert_y,
+            roll_click: self.head_mouse_roll_click,
+            dwell_click: self.head_mouse_dwell_click,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AppLanguage {
     #[default]
@@ -65,17 +102,15 @@ impl AppLanguage {
 
 /// Detects the system language on Linux (checking sys_locale and POSIX env vars).
 pub fn detect_system_locale() -> &'static str {
-    if let Some(locale) = sys_locale::get_locale() {
-        if locale.to_lowercase().starts_with("zh") {
+    if let Some(locale) = sys_locale::get_locale()
+        && locale.to_lowercase().starts_with("zh") {
             return "zh-CN";
         }
-    }
     for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Ok(val) = std::env::var(var) {
-            if val.to_lowercase().starts_with("zh") {
+        if let Ok(val) = std::env::var(var)
+            && val.to_lowercase().starts_with("zh") {
                 return "zh-CN";
             }
-        }
     }
     "en"
 }
@@ -337,9 +372,11 @@ mod tests {
     #[test]
     fn valid_file_loads_untouched() {
         let path = scratch("valid");
-        let mut cfg = AppConfig::default();
-        cfg.close_to_tray = false;
-        cfg.pause_behavior = PauseBehavior::Never;
+        let cfg = AppConfig {
+            close_to_tray: false,
+            pause_behavior: PauseBehavior::Never,
+            ..AppConfig::default()
+        };
         save_config_to(&path, &cfg);
         let on_disk = fs::read_to_string(&path).unwrap();
 
@@ -374,28 +411,33 @@ mod tests {
     #[test]
     fn save_then_load_roundtrips_every_field() {
         let path = scratch("roundtrip");
-        let mut cfg = AppConfig::default();
-        cfg.ear_detection_enabled = false;
-        cfg.pause_behavior = PauseBehavior::BothRemoved;
-        cfg.conversational_awareness_enabled = true;
-        cfg.stem_long_press = StemAction::SiriOrAssistant;
-        cfg.start_minimized = true;
-        cfg.close_to_tray = false;
-        cfg.head_gesture_answers_enabled = false;
-        cfg.case_popup_enabled = false;
-        cfg.proximity_irk = Some("0123456789abcdef0123456789abcdef".to_string());
-        cfg.proximity_enc_key = Some("fedcba9876543210fedcba9876543210".to_string());
-        cfg.head_mouse_enabled = true;
-        cfg.head_mouse_mode = HeadMouseMode::Absolute;
-        cfg.head_mouse_speed = 35.0;
-        cfg.head_mouse_accel = 1.8;
-        cfg.head_mouse_smoothing = 0.5;
-        cfg.head_mouse_deadzone = 2.5;
-        cfg.head_mouse_invert_x = true;
-        cfg.head_mouse_invert_y = true;
-        cfg.head_mouse_roll_click = true;
-        cfg.head_mouse_dwell_click = true;
-        cfg.language = AppLanguage::EnUs;
+        let cfg = AppConfig {
+            ear_detection_enabled: false,
+            pause_behavior: PauseBehavior::BothRemoved,
+            conversational_awareness_enabled: true,
+            stem_single_click: StemAction::ToggleNoiseMode,
+            stem_double_click: StemAction::MouseLeftClick,
+            stem_triple_click: StemAction::MouseRightClick,
+            stem_long_press: StemAction::SiriOrAssistant,
+            gesture_sensitivity: 5,
+            start_minimized: true,
+            close_to_tray: false,
+            head_gesture_answers_enabled: false,
+            case_popup_enabled: false,
+            proximity_irk: Some("0123456789abcdef0123456789abcdef".to_string()),
+            proximity_enc_key: Some("fedcba9876543210fedcba9876543210".to_string()),
+            head_mouse_enabled: true,
+            head_mouse_mode: HeadMouseMode::Absolute,
+            head_mouse_speed: 35.0,
+            head_mouse_accel: 1.8,
+            head_mouse_smoothing: 0.5,
+            head_mouse_deadzone: 2.5,
+            head_mouse_invert_x: true,
+            head_mouse_invert_y: true,
+            head_mouse_roll_click: true,
+            head_mouse_dwell_click: true,
+            language: AppLanguage::EnUs,
+        };
         save_config_to(&path, &cfg);
 
         let (loaded, outcome) = load_config_from(&path);

@@ -16,9 +16,6 @@ hex = "0.4"
 futures = "0.3"
 zbus = { version = "5", features = ["tokio"] }
 ksni = "0.3"
-# Desktop notifications for incoming ZCode questions (visible in daemon mode).
-notify-rust = "4"
-image = "0.25"
 aes = "0.8"
 cipher = "0.4"
 libc = "0.2"

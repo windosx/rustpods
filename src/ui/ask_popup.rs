@@ -110,22 +110,19 @@ impl Render for AskPopupWindow {
             Animation::new(Duration::from_millis(320)).with_easing(ease_out_quint())
         };
 
+        // Auto-close transitions are scheduled from here but executed later:
+        // closing inside render would mutate window state mid-render. The
+        // empty case needs no handling at all - the UI loop in mod.rs closes
+        // the popup once neither progress nor a fresh resolution exists.
         let is_resolved_only = progress.is_none() && resolved.is_some();
-        let is_empty = progress.is_none() && resolved.is_none();
-
-        if is_empty && !self.closing {
-            self.start_close(window, cx);
-        } else if is_resolved_only && !self.closing && !self.auto_close_scheduled {
+        if is_resolved_only && !self.closing && !self.auto_close_scheduled {
             self.auto_close_scheduled = true;
-            let view_c = cx.entity().clone();
-            cx.spawn_in(window, async move |_this, cx| {
+            cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(1200))
                     .await;
-                let _ = cx.update(|window, cx| {
-                    view_c.update(cx, |v, cx| {
-                        v.start_close(window, cx);
-                    });
+                let _ = this.update_in(cx, |view, window, cx| {
+                    view.start_close(window, cx);
                 });
             })
             .detach();
@@ -440,8 +437,8 @@ pub fn open_or_refresh_ask_popup(
     slot: &Arc<Mutex<Option<WindowHandle<AskPopupWindow>>>>,
     cx: &mut App,
 ) {
-    if let Ok(mut guard) = slot.lock() {
-        if let Some(handle) = guard.as_ref() {
+    if let Ok(mut guard) = slot.lock()
+        && let Some(handle) = guard.as_ref() {
             let mut is_closing = false;
             let ok = handle
                 .update(cx, |view, _window, cx| {
@@ -456,7 +453,6 @@ pub fn open_or_refresh_ask_popup(
             }
             *guard = None;
         }
-    }
 
     let popup_size = size(px(460.), px(320.));
     let popup_bounds = WindowBounds::Windowed(Bounds::centered(None, popup_size, cx));

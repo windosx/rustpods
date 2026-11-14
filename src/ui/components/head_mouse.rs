@@ -9,15 +9,29 @@ use gpui_kit::component::tag::Tag;
 use gpui_kit::{div, px, App, Entity, IntoElement, ParentElement as _, Styled as _, Window};
 use std::rc::Rc;
 
+/// Authorization callback that may pop the Polkit dialog.
+pub type EnableRequest = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// The gpui-kit select holding a localized option list.
+pub type MouseSelect = Entity<gpui_kit::component::select::SelectState<Vec<String>>>;
+/// The gpui-kit slider used by the tuning rows.
+pub type MouseSlider = Entity<gpui_kit::component::slider::SliderState>;
+
+/// The five tuning widgets the head-mouse page binds to, grouped so the
+/// render function's signature stays readable.
+pub struct HeadMouseWidgets<'a> {
+    pub mode_select: &'a MouseSelect,
+    pub speed: &'a MouseSlider,
+    pub accel: &'a MouseSlider,
+    pub smoothing: &'a MouseSlider,
+    pub deadzone: &'a MouseSlider,
+}
+
 pub fn render_head_mouse_page(
     state: &RustPodsState,
     app_state: &Entity<RustPodsState>,
-    mode_select: &Entity<gpui_kit::component::select::SelectState<Vec<String>>>,
-    speed_slider: &Entity<gpui_kit::component::slider::SliderState>,
-    accel_slider: &Entity<gpui_kit::component::slider::SliderState>,
-    smooth_slider: &Entity<gpui_kit::component::slider::SliderState>,
-    deadzone_slider: &Entity<gpui_kit::component::slider::SliderState>,
-    on_enable_request: Rc<dyn Fn(&mut Window, &mut App)>,
+    widgets: &HeadMouseWidgets<'_>,
+    on_enable_request: EnableRequest,
     p: &ApplePalette,
 ) -> impl IntoElement {
     let cfg = state.config_snapshot();
@@ -162,7 +176,7 @@ pub fn render_head_mouse_page(
                     p,
                     &rust_i18n::t!("head_mouse.tracking_mode"),
                     Some(&rust_i18n::t!("head_mouse.tracking_mode_desc")),
-                    Select::new(mode_select).w(px(220.)),
+                    Select::new(widgets.mode_select).w(px(220.)),
                     false,
                 ))
                 .child(setting_row(
@@ -210,7 +224,7 @@ pub fn render_head_mouse_page(
                     Some(&format!("{}: {:.0} px/°", rust_i18n::t!("head_mouse.speed"), cfg.head_mouse_speed)),
                     div()
                         .w(px(200.))
-                        .child(Slider::new(speed_slider).horizontal()),
+                        .child(Slider::new(widgets.speed).horizontal()),
                     false,
                 ))
                 .child(setting_row(
@@ -219,7 +233,7 @@ pub fn render_head_mouse_page(
                     Some(&format!("{}: {:.1}x", rust_i18n::t!("head_mouse.accel"), cfg.head_mouse_accel)),
                     div()
                         .w(px(200.))
-                        .child(Slider::new(accel_slider).horizontal()),
+                        .child(Slider::new(widgets.accel).horizontal()),
                     true,
                 ))
                 .child(setting_row(
@@ -228,7 +242,7 @@ pub fn render_head_mouse_page(
                     Some(&format!("{}: {:.2}", rust_i18n::t!("head_mouse.smooth"), cfg.head_mouse_smoothing)),
                     div()
                         .w(px(200.))
-                        .child(Slider::new(smooth_slider).horizontal()),
+                        .child(Slider::new(widgets.smoothing).horizontal()),
                     true,
                 ))
                 .child(setting_row(
@@ -237,7 +251,7 @@ pub fn render_head_mouse_page(
                     Some(&format!("{}: {:.1}°/s", rust_i18n::t!("head_mouse.deadzone"), cfg.head_mouse_deadzone)),
                     div()
                         .w(px(200.))
-                        .child(Slider::new(deadzone_slider).horizontal()),
+                        .child(Slider::new(widgets.deadzone).horizontal()),
                     true,
                 )),
         )

@@ -1,12 +1,17 @@
 use super::engine::MouseButton;
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AttributeSet, EventType, InputEvent, Key, RelativeAxisType,
+    AbsInfo, AbsoluteAxisType, AttributeSet, EventType, InputEvent, Key, RelativeAxisType,
+    UinputAbsSetup,
 };
 use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 use tracing::{debug, info};
+
+/// Upper bound of the virtual absolute axes; the compositor stretches
+/// 0..=`ABS_MAX` across the whole screen.
+pub const ABS_MAX: i32 = 1023;
 
 /// Status of the Linux /dev/uinput subsystem on the host machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,18 +42,15 @@ impl UinputStatus {
     pub fn is_available(&self) -> bool {
         matches!(self, Self::Available)
     }
-
-    pub fn description(&self) -> &'static str {
-        match self {
-            Self::Available => "正常可用",
-            Self::PermissionDenied => "无访问权限 (需要加入 input 用户组或配置 udev 规则)",
-            Self::NotFound => "未找到 /dev/uinput 驱动节点",
-            Self::Unavailable => "不可用",
-        }
-    }
 }
 
 /// Linux virtual mouse device powered by /dev/uinput.
+///
+/// The device carries BOTH relative and absolute axes: relative for the
+/// velocity-driven cursor, absolute for the head-angle-driven pointing mode.
+/// On the absolute axes the compositor maps the 0..[`ABS_MAX`] space onto the
+/// screen, which is what lets absolute mode work without knowing the screen
+/// size.
 pub struct UinputMouseDevice {
     device: VirtualDevice,
     accum_x: f32,
@@ -70,10 +72,21 @@ impl UinputMouseDevice {
         rel_axes.insert(RelativeAxisType::REL_WHEEL);
         rel_axes.insert(RelativeAxisType::REL_HWHEEL);
 
+        let abs_x = UinputAbsSetup::new(
+            AbsoluteAxisType::ABS_X,
+            AbsInfo::new(ABS_MAX / 2, 0, ABS_MAX, 0, 0, 0),
+        );
+        let abs_y = UinputAbsSetup::new(
+            AbsoluteAxisType::ABS_Y,
+            AbsInfo::new(ABS_MAX / 2, 0, ABS_MAX, 0, 0, 0),
+        );
+
         let device = VirtualDeviceBuilder::new()?
             .name("RustPods Head Mouse")
             .with_keys(&keys)?
             .with_relative_axes(&rel_axes)?
+            .with_absolute_axis(&abs_x)?
+            .with_absolute_axis(&abs_y)?
             .build()?;
 
         info!("Created virtual mouse device via /dev/uinput");
@@ -111,6 +124,18 @@ impl UinputMouseDevice {
         Ok(())
     }
 
+    /// Emits an absolute cursor position, clamped to the 0..[`ABS_MAX`] space
+    /// the axes were declared with.
+    pub fn move_abs(&mut self, x: f32, y: f32) -> io::Result<()> {
+        let ix = (x.round() as i32).clamp(0, ABS_MAX);
+        let iy = (y.round() as i32).clamp(0, ABS_MAX);
+        let events = [
+            InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, ix),
+            InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, iy),
+        ];
+        self.device.emit(&events)
+    }
+
     /// Emits vertical scroll events.
     pub fn scroll(&mut self, lines: f32) -> io::Result<()> {
         self.accum_scroll += lines;
@@ -123,22 +148,27 @@ impl UinputMouseDevice {
         Ok(())
     }
 
-    /// Emits a mouse click (press then release).
-    pub fn click(&mut self, button: MouseButton) -> io::Result<()> {
+    /// Emits a button press. The matching [`Self::release`] comes later from
+    /// the controller's render tick, so no async worker is ever blocked on the
+    /// press duration.
+    pub fn press(&mut self, button: MouseButton) -> io::Result<()> {
+        self.emit_button(button, 1)
+    }
+
+    /// Emits a button release.
+    pub fn release(&mut self, button: MouseButton) -> io::Result<()> {
+        self.emit_button(button, 0)
+    }
+
+    fn emit_button(&mut self, button: MouseButton, value: i32) -> io::Result<()> {
         let key = match button {
             MouseButton::Left => Key::BTN_LEFT,
             MouseButton::Right => Key::BTN_RIGHT,
             MouseButton::Middle => Key::BTN_MIDDLE,
         };
-
-        let press = InputEvent::new(EventType::KEY, key.0, 1);
-        let release = InputEvent::new(EventType::KEY, key.0, 0);
-
-        self.device.emit(&[press])?;
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        self.device.emit(&[release])?;
-
-        debug!("Emitted mouse click: {:?}", button);
+        let event = InputEvent::new(EventType::KEY, key.0, value);
+        self.device.emit(&[event])?;
+        debug!("Emitted mouse button {:?} = {}", button, value);
         Ok(())
     }
 }

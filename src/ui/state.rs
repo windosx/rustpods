@@ -126,22 +126,7 @@ impl RustPodsController {
         let dev = self.device_state.clone();
         let tx = self.ui_tx.clone();
         self.rt.spawn(async move {
-            let _ = aacp.set_noise_mode(mode).await;
-            // The accessory never echoes the mode back, so without this the
-            // window and tray would show the old mode until restart.
-            let updated = {
-                let mut guard = dev.write().await;
-                match guard.as_mut() {
-                    Some(state) => {
-                        state.noise_mode = mode;
-                        Some(state.clone())
-                    }
-                    None => None,
-                }
-            };
-            if let Some(state) = updated {
-                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
-            }
+            crate::system::tray::apply_noise_mode(&aacp, &dev, &tx, mode).await;
         });
     }
 
@@ -168,28 +153,12 @@ impl RustPodsController {
     }
 
     pub fn toggle_ear_detection(&self, enabled: bool) {
-        if let Ok(mut c) = self.config.write() {
-            c.ear_detection_enabled = enabled;
-            save_config(&c);
-        }
         let aacp = self.aacp.clone();
+        let cfg = self.config.clone();
         let dev = self.device_state.clone();
         let tx = self.ui_tx.clone();
         self.rt.spawn(async move {
-            let _ = aacp.set_ear_detection(enabled).await;
-            let updated = {
-                let mut guard = dev.write().await;
-                match guard.as_mut() {
-                    Some(state) => {
-                        state.ear_detection_enabled = enabled;
-                        Some(state.clone())
-                    }
-                    None => None,
-                }
-            };
-            if let Some(state) = updated {
-                let _ = tx.send(UiEvent::DeviceStateUpdated(state));
-            }
+            crate::system::tray::apply_ear_detection_toggle(&aacp, &cfg, &dev, &tx, enabled).await;
         });
     }
 
@@ -413,9 +382,12 @@ pub struct RustPodsState {
 
 impl RustPodsState {
     pub fn new(controller: RustPodsController, theme_mode: ThemeMode) -> Self {
+        // Neutral placeholder: BlueZ populates the real device within seconds
+        // of startup. (This used to carry a developer's personal MAC and
+        // device name, which every other user saw as their first frame.)
         let device = AirPodsDeviceState::new(
-            "CC:68:E0:38:9C:E9".to_string(),
-            "浩的AirPods".to_string(),
+            "00:00:00:00:00:00".to_string(),
+            "AirPods".to_string(),
             AirPodsModel::AirPods3,
         );
         Self {

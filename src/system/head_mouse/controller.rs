@@ -1,12 +1,17 @@
 use super::engine::{MouseButton, MouseEngine};
 use super::uinput::{UinputMouseDevice, UinputStatus};
 use crate::core::head_tracking::HeadPose;
-use crate::system::config::AppConfig;
+use crate::system::config::{AppConfig, HeadMouseMode};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
+
+/// How long the virtual button stays pressed on a click. The release happens
+/// on a later render tick, so the async controller is never blocked on the
+/// press duration (the old inline `thread::sleep` stalled a tokio worker).
+const CLICK_HOLD_MS: u128 = 15;
 
 /// Runtime operational state of the head mouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,17 +45,6 @@ impl HeadMouseState {
             4 => Self::Paused,
             5 => Self::ScrollMode,
             _ => Self::Disabled,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Disabled => "已停用",
-            Self::PermissionDenied => "未授权 /dev/uinput",
-            Self::Disconnected => "等待耳机连接",
-            Self::Active => "正在运行",
-            Self::Paused => "已暂停",
-            Self::ScrollMode => "滚轮滚动模式",
         }
     }
 }
@@ -129,6 +123,15 @@ pub async fn run_head_mouse_controller(
 
     let mut device: Option<UinputMouseDevice> = None;
     let mut engine = MouseEngine::new(0.35);
+    // Tuning copied out of the config; only the small [`HeadMouseParams`] is
+    // cloned, never the whole AppConfig, and the 120 Hz render tick reads a
+    // single bool instead of taking a full snapshot.
+    let mut params = AppConfig::default().head_mouse_params();
+    let mut last_smoothing: Option<f32> = None;
+    let mut engine_mode = params.mode;
+    // A click whose press went out and whose release is pending, so the
+    // press-hold never blocks an async worker.
+    let mut pending_release: Option<(MouseButton, Instant)> = None;
 
     let mut paused = false;
     let mut scroll_mode = false;
@@ -140,6 +143,17 @@ pub async fn run_head_mouse_controller(
 
     info!("Head mouse background controller started");
 
+    // Releases a pending click, if one is in flight.
+    macro_rules! flush_release {
+        () => {
+            if let Some((btn, _)) = pending_release.take() {
+                if let Some(dev) = device.as_mut() {
+                    let _ = dev.release(btn);
+                }
+            }
+        };
+    }
+
     loop {
         tokio::select! {
             // 1. Hardware motion sample arrival
@@ -150,10 +164,14 @@ pub async fn run_head_mouse_controller(
 
                 let pose = *pose_rx.borrow();
                 let now = Instant::now();
-                let cfg = { config.read().unwrap().clone() };
+                params = config
+                    .read()
+                    .map(|c| c.head_mouse_params())
+                    .unwrap_or(params);
 
-                if !cfg.head_mouse_enabled {
+                if !params.enabled {
                     HEAD_MOUSE.set_state(HeadMouseState::Disabled);
+                    flush_release!();
                     device = None;
                     current_vel = (0.0, 0.0);
                     continue;
@@ -162,6 +180,7 @@ pub async fn run_head_mouse_controller(
                 // Check device connectivity
                 let Some(pose) = pose else {
                     HEAD_MOUSE.set_state(HeadMouseState::Disconnected);
+                    flush_release!();
                     current_vel = (0.0, 0.0);
                     continue;
                 };
@@ -174,13 +193,25 @@ pub async fn run_head_mouse_controller(
                         continue;
                     }
                     match UinputMouseDevice::create() {
-                        Ok(dev) => device = Some(dev),
+                        Ok(dev) => {
+                            device = Some(dev);
+                            engine_mode = params.mode;
+                        }
                         Err(e) => {
                             error!("Failed to initialize uinput device: {}", e);
                             HEAD_MOUSE.set_state(HeadMouseState::PermissionDenied);
                             continue;
                         }
                     }
+                }
+
+                // A mode change must reset the engine: relative mode accumulates
+                // raw pixels while absolute mode chases a position in the
+                // 0..1023 virtual space, and the two must never mix in one
+                // accumulator.
+                if engine_mode != params.mode {
+                    engine.reset();
+                    engine_mode = params.mode;
                 }
 
                 // Update operational state
@@ -199,37 +230,53 @@ pub async fn run_head_mouse_controller(
                     .unwrap_or(0.01);
                 last_sample_time = Some(now);
 
-                engine.set_smoothing(cfg.head_mouse_smoothing);
-                engine.roll_click.enabled = cfg.head_mouse_roll_click;
-                engine.dwell_click.enabled = cfg.head_mouse_dwell_click;
+                // Rebuild the 1-Euro filters only when the smoothing knob
+                // actually changed: recreating them every sample wiped their
+                // history, which silently disabled smoothing altogether.
+                if last_smoothing != Some(params.smoothing) {
+                    engine.set_smoothing(params.smoothing);
+                    last_smoothing = Some(params.smoothing);
+                }
+                engine.roll_click.enabled = params.roll_click;
+                engine.dwell_click.enabled = params.dwell_click;
 
-                let output = engine.step(
-                    pose.yaw_rate,
-                    pose.pitch_rate,
-                    pose.roll_rate,
-                    dt,
-                    now,
-                    cfg.head_mouse_speed,
-                    cfg.head_mouse_accel,
-                    cfg.head_mouse_deadzone,
-                    cfg.head_mouse_invert_x,
-                    cfg.head_mouse_invert_y,
-                    scroll_mode,
-                );
+                let output = match params.mode {
+                    HeadMouseMode::Absolute => {
+                        engine.step_absolute(pose.yaw, pose.pitch, pose.roll_rate, dt, now, &params)
+                    }
+                    HeadMouseMode::Relative => {
+                        engine.step(
+                            pose.yaw_rate,
+                            pose.pitch_rate,
+                            pose.roll_rate,
+                            dt,
+                            now,
+                            &params,
+                            scroll_mode,
+                        )
+                    }
+                };
 
                 if let Some(dev) = device.as_mut() {
-                    // Handle gesture clicks (roll click or dwell click)
+                    // Handle gesture clicks (roll click or dwell click): press
+                    // now, release on a later render tick.
                     if let Some(btn) = output.click {
-                        let _ = dev.click(btn);
+                        let _ = dev.press(btn);
+                        pending_release = Some((btn, now));
                     }
                     // Handle scroll
                     if output.scroll.abs() > 0.001 {
                         let _ = dev.scroll(output.scroll);
                     }
+                    // Handle absolute positioning
+                    if let Some((x, y)) = output.abs_pos {
+                        let _ = dev.move_abs(x, y);
+                    }
                 }
 
-                // Update translational velocity in pixels/second
-                if dt > 0.0 && !scroll_mode {
+                // Update translational velocity in pixels/second (relative mode
+                // only; absolute mode has no per-tick velocity to interpolate).
+                if dt > 0.0 && !scroll_mode && params.mode == HeadMouseMode::Relative {
                     current_vel = (output.delta.0 / dt, output.delta.1 / dt);
                 } else {
                     current_vel = (0.0, 0.0);
@@ -242,28 +289,39 @@ pub async fn run_head_mouse_controller(
                 let dt = now.duration_since(last_render_time).as_secs_f32().min(0.05);
                 last_render_time = now;
 
-                let cfg = { config.read().unwrap().clone() };
-                if !cfg.head_mouse_enabled || paused || scroll_mode {
+                let enabled = config
+                    .read()
+                    .map(|c| c.head_mouse_enabled)
+                    .unwrap_or(false);
+                if !enabled || paused || scroll_mode {
                     continue;
                 }
 
                 if let Some(dev) = device.as_mut() {
-                    if let Some(t_last) = last_sample_time {
-                        let age = now.duration_since(t_last).as_secs_f32();
-                        // Fade out velocity if Bluetooth packets stall past 80 ms
-                        let fade = if age < 0.08 {
-                            1.0
-                        } else {
-                            (1.0 - (age - 0.08) / 0.1).clamp(0.0, 1.0)
-                        };
-
-                        let dx = current_vel.0 * dt * fade;
-                        let dy = current_vel.1 * dt * fade;
-
-                        if dx.abs() > 0.01 || dy.abs() > 0.01 {
-                            let _ = dev.move_rel(dx, dy);
+                    // Release a click whose press-hold has run its course.
+                    if let Some((btn, t0)) = pending_release
+                        && now.duration_since(t0).as_millis() >= CLICK_HOLD_MS {
+                            let _ = dev.release(btn);
+                            pending_release = None;
                         }
-                    }
+
+                    if params.mode == HeadMouseMode::Relative
+                        && let Some(t_last) = last_sample_time {
+                            let age = now.duration_since(t_last).as_secs_f32();
+                            // Fade out velocity if Bluetooth packets stall past 80 ms
+                            let fade = if age < 0.08 {
+                                1.0
+                            } else {
+                                (1.0 - (age - 0.08) / 0.1).clamp(0.0, 1.0)
+                            };
+
+                            let dx = current_vel.0 * dt * fade;
+                            let dy = current_vel.1 * dt * fade;
+
+                            if dx.abs() > 0.01 || dy.abs() > 0.01 {
+                                let _ = dev.move_rel(dx, dy);
+                            }
+                        }
                 }
             }
 
@@ -295,7 +353,8 @@ pub async fn run_head_mouse_controller(
                     }
                     HeadMouseCommand::Click(btn) => {
                         if let Some(dev) = device.as_mut() {
-                            let _ = dev.click(btn);
+                            let _ = dev.press(btn);
+                            pending_release = Some((btn, Instant::now()));
                         }
                     }
                     HeadMouseCommand::Recenter => {

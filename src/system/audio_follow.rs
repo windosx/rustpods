@@ -14,9 +14,10 @@
 //! writes all four angles (`spatL:Azimuth`, `spatL:Elevation`, `spatR:Azimuth`,
 //! `spatR:Elevation`) in a single `SPA_PROP_params` struct.
 //!
-//! [`PanState`] is the older amplitude pan. It is kept as a zero-dependency
-//! fallback and is deliberately not stacked on the HRTF chain: with convolution
-//! in the path, an extra channel gain would apply the head position twice.
+//! The older amplitude-pan fallback and its one-axis scheduler were removed:
+//! nothing called them in production, and keeping untested-against-hardware
+//! fallback code around invited exactly the kind of drift that bit the
+//! sign conventions. [`StageSchedule`] is the only retuning policy.
 //!
 //! ## Why the graph is shipped as a config file
 //!
@@ -32,20 +33,6 @@
 //! behind the `audio-follow` feature and is the only place in the project that
 //! touches PipeWire.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Arc;
-
-
-/// Maximum gain boost applied to the near channel, in millibels.
-///
-/// 600 mB is about +6 dB, which puts the near channel clearly forward without
-/// clipping on typical material.
-const MAX_BOOST_MB: i32 = 600;
-/// Maximum cut applied to the far channel.
-const MAX_CUT_MB: i32 = -600;
-/// Head yaw, in degrees, that reaches full pan.
-const FULL_PAN_DEG: f32 = 45.0;
-
 /// How far the HRTF azimuth may drift from where it was last written before it
 /// is pushed to PipeWire, in degrees.
 ///
@@ -59,6 +46,10 @@ const FULL_PAN_DEG: f32 = 45.0;
 /// sources, so the steps stay inaudible while bounding the rebuild rate: a slow
 /// head turn produces single-digit updates per second instead of a hundred.
 pub const AZIMUTH_STEP_DEG: f32 = 5.0;
+// Checked at compile time: below ~1.0 the rebuilds would dominate the CPU
+// budget, above ~10.0 the stair-steps themselves become audible (the minimum
+// audible angle in front is about 3.6 degrees).
+const _: () = assert!(AZIMUTH_STEP_DEG >= 1.0 && AZIMUTH_STEP_DEG <= 10.0);
 
 /// Smallest interval between HRTF updates, as a hard floor on the rebuild rate.
 ///
@@ -103,100 +94,6 @@ pub fn azimuth_for_yaw(yaw_deg: f32) -> f32 {
     // accumulates on a value that is already in range.
     let az = -yaw_deg;
     az.rem_euclid(360.0)
-}
-
-/// Decides when the HRTF needs retuning, so the rebuild rate stays bounded.
-///
-/// Kept separate from the PipeWire calls so the policy can be tested without a
-/// server, and so the sensor thread only has to call [`should_update`].
-///
-/// [`should_update`]: AzimuthSchedule::should_update
-#[derive(Debug)]
-pub struct AzimuthSchedule {
-    /// The azimuth most recently handed to PipeWire, in degrees.
-    written: f32,
-    /// When that happened, as a count of elapsed milliseconds.
-    last_write_ms: Option<u64>,
-    /// Set by [`reset`], so the next update ignores the step and interval tests.
-    forced: bool,
-}
-
-impl Default for AzimuthSchedule {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AzimuthSchedule {
-    pub fn new() -> Self {
-        Self {
-            written: AZIMUTH_CENTRE_DEG,
-            last_write_ms: None,
-            forced: false,
-        }
-    }
-
-    /// The azimuth currently in effect.
-    pub fn written(&self) -> f32 {
-        self.written
-    }
-
-    /// Whether a new yaw is far enough from the last write, and late enough, to
-    /// justify another convolver rebuild.
-    ///
-    /// `now_ms` is elapsed milliseconds from an arbitrary origin; the struct only
-    /// ever compares differences, so it holds no clock of its own.
-    pub fn should_update(&self, yaw_deg: f32, now_ms: u64) -> bool {
-        if !yaw_deg.is_finite() {
-            return false;
-        }
-        if self.forced {
-            return true;
-        }
-        let target = azimuth_for_yaw(yaw_deg);
-        if angle_between(target, self.written) < AZIMUTH_STEP_DEG {
-            return false;
-        }
-        match self.last_write_ms {
-            None => true,
-            Some(last) => now_ms.saturating_sub(last) >= MIN_UPDATE_INTERVAL_MS,
-        }
-    }
-
-    /// Records that `yaw_deg` was written, and returns the azimuth to send.
-    pub fn commit(&mut self, yaw_deg: f32, now_ms: u64) -> f32 {
-        let target = azimuth_for_yaw(yaw_deg);
-        self.written = target;
-        self.last_write_ms = Some(now_ms);
-        self.forced = false;
-        target
-    }
-
-    /// Makes the next [`should_update`] return true, whatever the position.
-    ///
-    /// Used when tracking stops: the mix has to return to centre, and that is
-    /// exactly the case the step test would suppress, since the last written
-    /// azimuth may already be within one step of it.
-    ///
-    /// [`should_update`]: AzimuthSchedule::should_update
-    pub fn reset(&mut self) {
-        self.written = AZIMUTH_CENTRE_DEG;
-        self.last_write_ms = None;
-        self.forced = true;
-    }
-}
-
-/// Signed angular distance between two azimuths, in degrees, in `[0, 180]`.
-///
-/// A plain subtraction would report 359 degrees of movement for a one-degree
-/// wobble across the wrap point, which would retune on every sample.
-fn angle_between(a: f32, b: f32) -> f32 {
-    let diff = (a - b).rem_euclid(360.0);
-    if diff > 180.0 {
-        360.0 - diff
-    } else {
-        diff
-    }
 }
 
 /// Shortest angular distance between two angles, in degrees, in `[0, 180]`.
@@ -402,65 +299,6 @@ impl StageSchedule {
         self.written = StageAngles::CENTRE;
         self.last_write_ms = None;
         self.forced = true;
-    }
-}
-
-/// Shared, lock-free pan value in millibels.
-///
-/// The audio callback and the sensor loop run on different threads and must not
-/// block each other, so the value is a pair of atomics rather than a mutex.
-#[derive(Debug)]
-pub struct PanState {
-    left_mb: AtomicI32,
-    right_mb: AtomicI32,
-    /// Set when the wearer is not being tracked, so the mix returns to centre.
-    centered: AtomicBool,
-}
-
-impl PanState {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            left_mb: AtomicI32::new(0),
-            right_mb: AtomicI32::new(0),
-            centered: AtomicBool::new(true),
-        })
-    }
-
-    /// Applies a head yaw, in degrees. Positive turns right.
-    ///
-    /// The mapping is linear in yaw up to [`FULL_PAN_DEG`] and clamped beyond it,
-    /// so a small turn produces a small shift and a full turn is bounded rather
-    /// than pulling one channel to silence.
-    pub fn set_yaw(&self, yaw_deg: f32) {
-        if !yaw_deg.is_finite() {
-            return;
-        }
-        let norm = (yaw_deg / FULL_PAN_DEG).clamp(-1.0, 1.0);
-        // Turning right makes the right channel the near one.
-        let left = (-norm * MAX_BOOST_MB as f32) as i32;
-        let right = (norm * MAX_BOOST_MB as f32) as i32;
-        self.left_mb.store(left.clamp(MAX_CUT_MB, MAX_BOOST_MB), Ordering::Relaxed);
-        self.right_mb
-            .store(right.clamp(MAX_CUT_MB, MAX_BOOST_MB), Ordering::Relaxed);
-        self.centered.store(false, Ordering::Relaxed);
-    }
-
-    /// Returns the mix to centre, for when tracking stops.
-    pub fn centre(&self) {
-        self.left_mb.store(0, Ordering::Relaxed);
-        self.right_mb.store(0, Ordering::Relaxed);
-        self.centered.store(true, Ordering::Relaxed);
-    }
-
-    pub fn gains_mb(&self) -> (i32, i32) {
-        (
-            self.left_mb.load(Ordering::Relaxed),
-            self.right_mb.load(Ordering::Relaxed),
-        )
-    }
-
-    pub fn is_centered(&self) -> bool {
-        self.centered.load(Ordering::Relaxed)
     }
 }
 
@@ -758,8 +596,8 @@ mod pipewire_link {
                 // it into the slot is all the closure does. The listener is
                 // attached after `.register()` below, once the slot is filled.
                 if global.type_ == pw::types::ObjectType::Metadata {
-                    if let Some(props) = global.props {
-                        if props.get("metadata.name") == Some("default")
+                    if let Some(props) = global.props
+                        && props.get("metadata.name") == Some("default")
                             && meta_slot.borrow().is_none()
                         {
                             match registry_cb.bind::<pw::metadata::Metadata, _>(global) {
@@ -769,7 +607,6 @@ mod pipewire_link {
                                 Err(e) => warn!("Could not bind default metadata: {}", e),
                             }
                         }
-                    }
                     return;
                 }
                 if global.type_ != pw::types::ObjectType::Node {
@@ -813,7 +650,7 @@ mod pipewire_link {
         let meta_quit = Rc::clone(&default_meta);
         let current_quit = Rc::clone(&current_sink);
         let saved_quit = Rc::clone(&saved_sink);
-        let _recv = receiver.attach(&mainloop.loop_(), move |command| match command {
+        let _recv = receiver.attach(mainloop.loop_(), move |command| match command {
             HrtfCommand::Azimuth(deg) => {
                 // Heartbeat: complete pending setup (metadata listener + route)
                 // before the write. See the note above the command handler.
@@ -945,87 +782,17 @@ mod pipewire_link {
 mod tests {
     use super::*;
 
-    #[test]
-    fn centred_by_default() {
-        let pan = PanState::new();
-        assert_eq!(pan.gains_mb(), (0, 0));
-        assert!(pan.is_centered());
-    }
-
-    #[test]
-    fn turning_right_lifts_the_right_channel() {
-        let pan = PanState::new();
-        pan.set_yaw(30.0);
-        let (left, right) = pan.gains_mb();
-        assert!(right > 0, "right should be boosted, got {}", right);
-        assert!(left < 0, "left should be cut, got {}", left);
-        assert!(!pan.is_centered());
-    }
-
-    #[test]
-    fn turning_left_lifts_the_left_channel() {
-        let pan = PanState::new();
-        pan.set_yaw(-30.0);
-        let (left, right) = pan.gains_mb();
-        assert!(left > 0, "left should be boosted, got {}", left);
-        assert!(right < 0, "right should be cut, got {}", right);
-    }
-
-    #[test]
-    fn pan_is_symmetric() {
-        let a = PanState::new();
-        a.set_yaw(25.0);
-        let b = PanState::new();
-        b.set_yaw(-25.0);
-        let (al, ar) = a.gains_mb();
-        let (bl, br) = b.gains_mb();
-        assert_eq!(al, -bl, "left gains should mirror");
-        assert_eq!(ar, -br, "right gains should mirror");
-    }
-
-    #[test]
-    fn full_pan_is_clamped() {
-        let pan = PanState::new();
-        // Beyond the full-pan angle the boost must not keep growing.
-        pan.set_yaw(170.0);
-        let (_, right) = pan.gains_mb();
-        assert_eq!(right, MAX_BOOST_MB);
-        pan.set_yaw(-170.0);
-        let (left, _) = pan.gains_mb();
-        assert_eq!(left, MAX_BOOST_MB);
-    }
-
-    #[test]
-    fn small_turns_produce_small_shifts() {
-        let pan = PanState::new();
-        pan.set_yaw(5.0);
-        let (left, right) = pan.gains_mb();
-        assert!(
-            right.abs() < MAX_BOOST_MB / 2,
-            "a 5 degree turn should not approach full pan, got {}",
-            right
-        );
-        assert!(right > 0, "but it should still move, got {}", right);
-        assert!(left < 0);
-    }
-
-    #[test]
-    fn centring_restores_a_balanced_mix() {
-        let pan = PanState::new();
-        pan.set_yaw(40.0);
-        pan.centre();
-        assert_eq!(pan.gains_mb(), (0, 0));
-        assert!(pan.is_centered());
-    }
-
-    #[test]
-    fn non_finite_input_is_ignored() {
-        let pan = PanState::new();
-        pan.set_yaw(20.0);
-        let before = pan.gains_mb();
-        pan.set_yaw(f32::NAN);
-        pan.set_yaw(f32::INFINITY);
-        assert_eq!(pan.gains_mb(), before, "NaN must not corrupt the gains");
+    /// Signed angular distance between two azimuths, in degrees, in `[0, 180]`.
+    ///
+    /// A plain subtraction would report 359 degrees of movement for a one-degree
+    /// wobble across the wrap point, which would retune on every sample.
+    fn angle_between(a: f32, b: f32) -> f32 {
+        let diff = (a - b).rem_euclid(360.0);
+        if diff > 180.0 {
+            360.0 - diff
+        } else {
+            diff
+        }
     }
 
     // --- azimuth mapping ---------------------------------------------------
@@ -1080,95 +847,6 @@ mod tests {
     fn non_finite_yaw_maps_to_centre() {
         assert_eq!(azimuth_for_yaw(f32::NAN), 0.0);
         assert_eq!(azimuth_for_yaw(f32::INFINITY), 0.0);
-    }
-
-    // --- update scheduling --------------------------------------------------
-
-    #[test]
-    fn small_head_movements_do_not_retune() {
-        let sched = AzimuthSchedule::new();
-        // Well inside one step: rebuilding the convolver for this would be waste.
-        assert!(!sched.should_update(1.0, 10_000));
-        assert!(!sched.should_update(-2.0, 10_000));
-    }
-
-    #[test]
-    fn a_real_turn_does_retune() {
-        let sched = AzimuthSchedule::new();
-        assert!(
-            sched.should_update(20.0, 10_000),
-            "20 degrees is well past the step threshold"
-        );
-    }
-
-    #[test]
-    fn the_wrap_point_does_not_count_as_a_huge_move() {
-        let mut sched = AzimuthSchedule::new();
-        // Start just below the wrap point.
-        sched.commit(0.5, 0);
-        assert_eq!(sched.written(), 359.5);
-        // A one-degree wobble across 0 must not look like 359 degrees.
-        assert!(
-            !sched.should_update(0.0, 10_000),
-            "crossing the wrap point is a small move, not a full turn"
-        );
-    }
-
-    #[test]
-    fn rebuild_rate_is_capped() {
-        let mut sched = AzimuthSchedule::new();
-        sched.commit(60.0, 1_000);
-        // Far enough to pass the step test, but too soon after the last write.
-        assert!(
-            !sched.should_update(0.0, 1_000 + MIN_UPDATE_INTERVAL_MS - 1),
-            "must not retune inside the interval floor"
-        );
-        assert!(
-            sched.should_update(0.0, 1_000 + MIN_UPDATE_INTERVAL_MS),
-            "must retune once the interval has passed"
-        );
-    }
-
-    #[test]
-    fn commit_records_what_was_written() {
-        let mut sched = AzimuthSchedule::new();
-        let az = sched.commit(45.0, 500);
-        assert_eq!(az, sched.written());
-        assert!((az - 315.0).abs() < 1e-4, "got {}", az);
-        // Having just written, the same position is not due again.
-        assert!(!sched.should_update(45.0, 500 + MIN_UPDATE_INTERVAL_MS));
-    }
-
-    #[test]
-    fn reset_forces_a_recentre() {
-        let mut sched = AzimuthSchedule::new();
-        sched.commit(90.0, 0);
-        assert!(sched.written() != 0.0);
-        sched.reset();
-        assert_eq!(sched.written(), 0.0);
-        // With no prior write, coming back to centre is allowed immediately.
-        assert!(sched.should_update(0.0, 1));
-    }
-
-    #[test]
-    fn the_step_threshold_stays_below_the_audible_angle() {
-        // The minimum audible angle in front is about 3.6 degrees; a coarse step
-        // keeps the rebuild rate down but must not become audible as stair-steps.
-        assert!(
-            AZIMUTH_STEP_DEG >= 1.0,
-            "too fine: rebuilds would dominate the CPU budget"
-        );
-        assert!(
-            AZIMUTH_STEP_DEG <= 10.0,
-            "too coarse: the step itself would be audible"
-        );
-    }
-
-    #[test]
-    fn azimuth_step_is_independent_of_the_amplitude_pan() {
-        // The amplitude pan is a fallback with its own, coarser full-scale angle;
-        // the HRTF path is accurate and must not inherit it.
-        assert!(FULL_PAN_DEG > AZIMUTH_STEP_DEG * 2.0);
     }
 
     // --- 3D stereo stage (L/R +/-30° + yaw/pitch/roll) ---------------------

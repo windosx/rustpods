@@ -12,9 +12,10 @@
 //!   failure path falls back to "ask", which leaves the normal question UI in
 //!   place - a broken gesture channel must never wedge ZCode.
 //! * [`run_socket_server`] runs inside RustPods (GUI or `--no-gui` daemon). It
-//!   registers the question in the [`ASK_HUB`], shows a notification, and
-//!   waits for [`run_question_answers`] - the tokio task feeding head poses to
-//!   the [`NodCounter`](crate::core::nod_counter::NodCounter) - to resolve it.
+//!   registers the question in the [`ASK_HUB`], which surfaces it as the ask
+//!   card in the UI, and waits for [`run_question_answers`] - the tokio task
+//!   feeding head poses to the
+//!   [`NodCounter`](crate::core::nod_counter::NodCounter) - to resolve it.
 //!
 //! The answer travels back as a `deny` decision whose reason carries the
 //! choice, which the agent reads as the user's answer. Shaking the head,
@@ -342,12 +343,11 @@ impl AskHub {
     /// Records a nod count for the UI.
     fn set_count(&self, id: u64, count: usize) {
         let mut progress = self.progress.lock().unwrap();
-        if let Some(p) = progress.as_mut() {
-            if p.id == id {
+        if let Some(p) = progress.as_mut()
+            && p.id == id {
                 p.count = count;
                 self.notify.notify_waiters();
             }
-        }
     }
 
     fn clear_progress(&self, id: u64) {
@@ -385,12 +385,11 @@ impl AskHub {
             let progress = self.progress.lock().unwrap();
             progress.as_ref().map(|p| p.id)
         };
-        if let Some(id) = id {
-            if let Some(pending) = self.take_pending(id) {
+        if let Some(id) = id
+            && let Some(pending) = self.take_pending(id) {
                 let _ = pending.reply.send(AskReply::Pass);
                 self.clear_progress(id);
             }
-        }
     }
 
     /// Snapshot for the UI card.
@@ -430,6 +429,12 @@ impl AskHub {
             .lock()
             .unwrap()
             .is_some_and(|at| at.elapsed() < TRACKING_FRESH_AFTER)
+    }
+}
+
+impl Default for AskHub {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -718,7 +723,7 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
         // actually saw against the thresholds it actually uses: a nod must
         // dip below `baseline - depth` (6° at sensitivity 3) and return
         // above `baseline - depth/3`.
-        if last_telemetry.map_or(true, |t| t.elapsed() >= TELEMETRY_EVERY) {
+        if last_telemetry.is_none_or(|t| t.elapsed() >= TELEMETRY_EVERY) {
             last_telemetry = Some(now);
             let (min_dev, max_yaw) = counter.take_telemetry();
             let (baseline, pitch_swing, count, down) = counter.snapshot();

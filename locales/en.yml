@@ -193,3 +193,16 @@ popup:
   left_ear: "Left Ear"
   right_ear: "Right Ear"
   case: "Charging Case"
+
+tray:
+  tag_disconnected: "(disconnected)"
+  tag_in_case: "(in case)"
+  tag_connected: "(connected)"
+  battery_line: "Left %{left} | Right %{right} | Case %{case}"
+  tip_description: "Left: %{left}  Right: %{right}  Case: %{case}"
+  case_closed: "closed"
+  noise_control: "Noise Control"
+  ear_detection: "In-ear detection"
+  not_connected: "No AirPods connected"
+  open_app: "Open RustPods Settings..."
+  quit: "Quit"

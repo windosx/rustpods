@@ -125,6 +125,26 @@ impl BluetoothManager {
         Ok(list)
     }
 
+    /// Brings a Classic-Bluetooth connection up, or verifies the existing one.
+    ///
+    /// The shell-out to `bluetoothctl connect` this replaces spawned a process
+    /// per attempt and lost BlueZ's structured error; the API also skips the
+    /// fixed 3 s sleep the shell version needed because `connect()` resolves
+    /// when the link is actually up.
+    pub async fn ensure_connected(&self, addr: Address) -> Result<(), String> {
+        let adapter = self.get_default_adapter().await?;
+        let device = adapter
+            .device(addr)
+            .map_err(|e| format!("Device {} not found: {}", addr, e))?;
+        if device.is_connected().await.unwrap_or(false) {
+            return Ok(());
+        }
+        device
+            .connect()
+            .await
+            .map_err(|e| format!("Bluetooth connect to {} failed: {}", addr, e))
+    }
+
     pub async fn watch_connection_events<F>(
         &self,
         target_addr: Address,
@@ -150,13 +170,12 @@ impl BluetoothManager {
             use futures::StreamExt;
             while let Some(evt) = events.next().await {
                 let bluer::DeviceEvent::PropertyChanged(prop) = evt;
-                if let bluer::DeviceProperty::Connected(connected) = prop {
-                    if connected != last_connected {
+                if let bluer::DeviceProperty::Connected(connected) = prop
+                    && connected != last_connected {
                         last_connected = connected;
                         info!("AirPods connection state changed: connected = {}", connected);
                         callback(connected);
                     }
-                }
             }
         });
 

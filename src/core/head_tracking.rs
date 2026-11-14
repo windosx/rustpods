@@ -106,8 +106,14 @@ struct GravityAnchor {
     /// Mean device-frame gravity direction over the first seconds of
     /// streaming; `None` until captured. Defines "zero" pitch/roll.
     neutral: Option<[f32; 3]>,
+    /// Mean gravity magnitude at capture time, in device counts. The live
+    /// samples are sanity-checked against it, since a magnitude far off the
+    /// captured norm means the sensor is not in a state worth trusting.
+    neutral_norm: f32,
     /// Accumulator for the neutral capture.
     acc: [f32; 3],
+    /// Accumulated raw magnitudes for [`Self::neutral_norm`].
+    acc_norm: f32,
     /// Samples accumulated so far.
     n: u32,
 }
@@ -125,14 +131,6 @@ impl GravityAnchor {
     /// that drift cannot accumulate, slow enough that nod dynamics stay
     /// dominated by the gyro (a 0.3 s nod receives only ~13% pull).
     const PULL: f32 = 0.006;
-
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
 
     /// Feeds one gravity sample plus the current integrated pitch/roll (the
     /// lateral/forward unit vectors, device frame) and returns the corrected
@@ -153,12 +151,23 @@ impl GravityAnchor {
 
         let Some(neutral) = self.neutral else {
             self.acc = add3(self.acc, unit);
+            self.acc_norm += len;
             self.n += 1;
             if self.n >= Self::CAPTURE_SAMPLES {
                 self.neutral = Some(normalize3(self.acc));
+                self.neutral_norm = self.acc_norm / self.n as f32;
             }
             return (pitch_deg, roll_deg);
         };
+
+        // The magnitude has to stay inside the sanity band around what was
+        // captured: outside it the sensor is waking up, saturated, or the bud
+        // is out of an ear, and applying the observation would steer the
+        // attitude with garbage.
+        let ratio = len / self.neutral_norm;
+        if !(Self::NORM_BAND.0..=Self::NORM_BAND.1).contains(&ratio) {
+            return (pitch_deg, roll_deg);
+        }
 
         // Rotation taking neutral to current, as an axis-scaled vector.
         // cross(a,b) = |a||b| * sin(angle) * right(a->b); its projection on
@@ -1099,7 +1108,7 @@ impl HeadTracker {
         // Dump raw and integrated values occasionally so the gyro scale can be
         // calibrated against real movement. `0.122 deg/s per count` comes from
         // the protocol document, which marks it approximate.
-        if self.samples_seen % 100 == 0 {
+        if self.samples_seen.is_multiple_of(100) {
             debug!(
                 "attitude raw gyro=[{:.0},{:.0},{:.0}] grav=[{:.0},{:.0},{:.0}] -> yaw={:.1} pitch={:.1} roll={:.1} rates=[{:.1},{:.1},{:.1}]",
                 gyro[0], gyro[1], gyro[2], gx, gy, gz, att.yaw, att.pitch, att.roll, att.yaw_rate, att.pitch_rate, att.roll_rate
@@ -1497,6 +1506,39 @@ mod tests {
             "held -25 deg pose must read near -25, got {}",
             pitch
         );
+    }
+
+    #[test]
+    fn gravity_anchor_ignores_an_unsane_gravity_magnitude() {
+        // Outside the 0.5-2.0 band around the captured norm the sensor is
+        // waking up, saturated, or the bud is out of an ear; the observation
+        // must not steer the attitude.
+        let mut anchor = GravityAnchor::default();
+        let neutral = [0.0, 0.0, 1000.0];
+        let lateral = [1.0, 0.0, 0.0];
+        let forward = [0.0, 1.0, 0.0];
+        // Capture (~1 s worth).
+        let mut pitch = 0.0;
+        for _ in 0..100 {
+            let (p, _r) = anchor.correct(neutral, pitch, 0.0, lateral, forward);
+            pitch = p;
+        }
+        // A tilted vector with a sane magnitude (~1000) pulls the pitch.
+        let tilted = [0.0, 500.0, 866.0]; // 30 degrees off vertical, |g| ~= 1000
+        let (moved, _) = anchor.correct(tilted, 0.0, 0.0, lateral, forward);
+        assert!(
+            moved.abs() > f32::EPSILON,
+            "a sane tilted gravity vector must correct the pitch"
+        );
+        // The same tilt at 3x magnitude is out of band: no correction.
+        let (unchanged, _) = anchor.correct(
+            [0.0, 1500.0, 2598.0],
+            0.0,
+            0.0,
+            lateral,
+            forward,
+        );
+        assert_eq!(unchanged, 0.0, "an out-of-band magnitude must be ignored");
     }
 
     #[test]

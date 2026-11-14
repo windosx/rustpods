@@ -166,10 +166,6 @@ pub struct NodCounter {
     /// 300 ms nod entirely, and "nods never count" is undiagnosable without
     /// knowing the depth the counter actually saw.
     tel_min_dev: f32,
-    /// Highest pitch excursion above the baseline since the last
-    /// [`Self::take_telemetry`] - the up-stroke level, which is what decides
-    /// whether a nod in a lowered posture can ever be counted.
-    tel_max_dev: f32,
     /// Largest yaw excursion from the yaw reference since the last
     /// [`Self::take_telemetry`], for the same reason.
     tel_max_yaw_dev: f32,
@@ -212,7 +208,6 @@ impl NodCounter {
             // right away loses the nod that crosses within the first 150 ms.
             since_count: MIN_NOD_INTERVAL,
             tel_min_dev: 0.0,
-            tel_max_dev: 0.0,
             tel_max_yaw_dev: 0.0,
         }
     }
@@ -386,8 +381,8 @@ impl NodCounter {
             // the screen-watching baseline - live telemetry, 2026-11-09).
             // Re-anchor onto the always-on reference EMA, which has settled
             // on the midline of their actual answering oscillation.
-            if self.count == 0 && self.down_secs > REANCHOR_AFTER_SECS {
-                if let Some(reference) = self.ref_ema {
+            if self.count == 0 && self.down_secs > REANCHOR_AFTER_SECS
+                && let Some(reference) = self.ref_ema {
                     self.baseline = Some(reference);
                     self.down_secs = 0.0;
                     self.down = false;
@@ -395,7 +390,6 @@ impl NodCounter {
                     self.dip_low = pitch_deg;
                     return None;
                 }
-            }
             // Return stroke: climbed halfway out of the dip.
             if pitch_deg > self.dip_low + self.depth * RETURN_FROM_DIP {
                 self.count += 1;
@@ -411,8 +405,16 @@ impl NodCounter {
         // The wearer has stopped nodding: commit whatever was counted. The
         // head must be back near the baseline first - a slow, deliberate nod
         // can spend longer than the quiet window on the way down, and
-        // committing mid-dip would truncate the count.
-        if self.count > 0 && !self.down && self.since_count > QUIET_COMMIT_SECS {
+        // committing mid-dip would truncate the count. A wearer who finishes
+        // a sequence parked below the dip threshold (still `down`) gets the
+        // commit after the quiet window plus the grace period instead of
+        // never.
+        let quiet_long_enough = if self.down {
+            self.since_count > QUIET_COMMIT_SECS + PARKED_COMMIT_GRACE
+        } else {
+            self.since_count > QUIET_COMMIT_SECS
+        };
+        if self.count > 0 && quiet_long_enough {
             let total = self.count;
             self.reset();
             return Some(NodEvent::Commit(total));
@@ -843,6 +845,28 @@ mod tests {
         assert!(
             events.contains(&NodEvent::Commit(1)),
             "a nod relative to the current head pose must count: {events:?}"
+        );
+    }
+
+    #[test]
+    fn finishing_parked_below_the_dip_threshold_still_commits() {
+        // The wearer nods once and then leaves their head below the dip
+        // threshold instead of returning to rest - the count must still
+        // commit after the quiet window plus the grace period, not never.
+        let mut counter = NodCounter::new();
+        hold(&mut counter, 0.0, 0.5, 0.0);
+        let mut events = nod(&mut counter, -10.0);
+        assert!(events.contains(&NodEvent::Counted(1)), "{events:?}");
+        // Parked below the threshold: still `down`, no return stroke.
+        events.extend(hold(
+            &mut counter,
+            -12.0,
+            QUIET_COMMIT_SECS + PARKED_COMMIT_GRACE + 0.2,
+            0.0,
+        ));
+        assert!(
+            events.contains(&NodEvent::Commit(1)),
+            "a sequence finished parked below the threshold must commit: {events:?}"
         );
     }
 }

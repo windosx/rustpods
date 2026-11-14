@@ -120,50 +120,6 @@ pub fn make_rename_packet(name: &str) -> Vec<u8> {
     packet
 }
 
-pub fn make_smart_routing_packet(
-    self_mac: &str,
-    target_mac: &str,
-    streaming_state: bool,
-) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(138);
-
-    // Target MAC in reverse byte order
-    let target_mac_bytes: Vec<u8> = target_mac
-        .split(':')
-        .filter_map(|s| u8::from_str_radix(s, 16).ok())
-        .collect();
-    buffer.extend(target_mac_bytes.iter().rev());
-
-    buffer.extend_from_slice(&[0x82, 0x00]);
-    buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
-    buffer.extend_from_slice(b"PlayingApp");
-    buffer.push(0x56);
-    buffer.extend_from_slice(b"com.apple.Music");
-    buffer.push(0x52);
-    buffer.extend_from_slice(b"HostStreamingState");
-    buffer.push(0x42);
-    buffer.extend_from_slice(if streaming_state { b"YES" } else { b"NO" });
-    buffer.push(0x49);
-    buffer.extend_from_slice(b"btAddress");
-    buffer.push(0x51);
-    buffer.extend_from_slice(self_mac.as_bytes());
-    buffer.extend_from_slice(b"btName");
-    buffer.push(0x43);
-    buffer.extend_from_slice(b"Mac");
-    buffer.push(0x58);
-    buffer.extend_from_slice(b"otherDevice");
-    buffer.extend_from_slice(b"AudioCategory");
-    buffer.extend_from_slice(&[0x31, 0x2D, 0x01]);
-
-    while buffer.len() < 138 {
-        buffer.push(0x00);
-    }
-
-    let mut packet = vec![0x04, 0x00, 0x04, 0x00, 0x10, 0x00];
-    packet.extend(buffer);
-    packet
-}
-
 pub fn parse_aacp_packet(packet: &[u8]) -> Option<AacpEvent> {
     if packet.len() < 6 {
         return None;
@@ -279,51 +235,25 @@ pub fn parse_aacp_packet(packet: &[u8]) -> Option<AacpEvent> {
             // different layout; self-consistency is the grounded choice.
             if payload.len() >= 4 && payload[0] == 0x01 {
                 let len = payload[1] as usize;
-                if payload.len() >= 3 + len {
-                    if let Ok(name) = std::str::from_utf8(&payload[3..3 + len]) {
+                if payload.len() >= 3 + len
+                    && let Ok(name) = std::str::from_utf8(&payload[3..3 + len]) {
                         return Some(AacpEvent::Renamed(name.to_string()));
                     }
-                }
             } else if payload.len() > 1 {
                 let len = payload[0] as usize;
-                if payload.len() >= 1 + len {
-                    if let Ok(name) = std::str::from_utf8(&payload[1..1 + len]) {
+                if payload.len() > len
+                    && let Ok(name) = std::str::from_utf8(&payload[1..1 + len]) {
                         return Some(AacpEvent::Renamed(name.to_string()));
                     }
-                }
             }
             None
         }
 
         opcodes::INFORMATION => {
-            if payload.len() >= 6 {
-                let data = &payload[4..];
-                let mut index = 0;
-                while index < data.len() && data[index] != 0x00 {
-                    index += 1;
-                }
-                let mut strings = Vec::new();
-                while index < data.len() {
-                    while index < data.len() && data[index] == 0x00 {
-                        index += 1;
-                    }
-                    if index >= data.len() {
-                        break;
-                    }
-                    let start = index;
-                    while index < data.len() && data[index] != 0x00 {
-                        index += 1;
-                    }
-                    let str_bytes = &data[start..index];
-                    if let Ok(s) = std::str::from_utf8(str_bytes) {
-                        strings.push(s.to_string());
-                    }
-                }
-                if strings.len() > 1 {
-                    strings.remove(0);
-                    debug!("Parsed AirPods Hardware Information: {:?}", strings);
-                }
-            }
+            // Hardware information (model/serial strings) has no consumer yet;
+            // the parsed-value plumbing was removed with it. Keep the frame
+            // visible at trace level in case a feature needs it later.
+            trace!("Hardware information frame ({} bytes)", payload.len());
             None
         }
 

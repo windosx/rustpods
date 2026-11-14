@@ -5,7 +5,7 @@ pub mod remotehid;
 pub mod rtbuddy;
 pub mod session;
 
-use bluer::l2cap::{Socket, SocketAddr};
+use bluer::l2cap::{SeqPacket, Socket, SocketAddr};
 use bluer::{Address, AddressType};
 use commands::{ControlCommandId, MicrophoneMode, NoiseControlMode};
 use events::AacpEvent;
@@ -13,7 +13,7 @@ use packets::*;
 use crate::core::aacp::events::EarStatus;
 use crate::core::head_tracking::{HeadGesture, HeadPose, HeadTracker};
 use crate::core::spatial::{SpatialClaim, SpatialMode, SpatialSession};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
@@ -78,6 +78,20 @@ pub struct AacpManager {
     /// head-tracked mode, so the enable path is gated on this the same way.
     spatial: Arc<Mutex<SpatialSession>>,
     head_tracking_starting: Arc<AtomicBool>,
+    /// The socket of the most recent successful [`Self::open`], if any. It is
+    /// the only strong reference: the receive task holds a weak one, so
+    /// replacing this slot retires a superseded receive loop at its next
+    /// iteration instead of leaving it parked on a dead link until the
+    /// watchdog expires.
+    active_socket: Arc<Mutex<Option<Arc<SeqPacket>>>>,
+    /// Monotonic connection counter. The receive task captures its own epoch
+    /// at spawn and skips the shared-state cleanup if a newer session has
+    /// taken over.
+    conn_epoch: Arc<AtomicU64>,
+    /// RemoteHID message counter shared by [`Self::start_head_tracking`]'s
+    /// negotiation and [`Self::stop_head_tracking`], so the stop frame
+    /// continues the sequence the stream was started with.
+    remotehid_generation: Arc<Mutex<remotehid::Generation>>,
 }
 
 
@@ -240,6 +254,9 @@ impl AacpManager {
             remotes: Arc::new(Mutex::new(remotehid::DeviceRegistry::new())),
             spatial: Arc::new(Mutex::new(SpatialSession::new())),
             head_tracking_starting: Arc::new(AtomicBool::new(false)),
+            active_socket: Arc::new(Mutex::new(None)),
+            conn_epoch: Arc::new(AtomicU64::new(0)),
+            remotehid_generation: Arc::new(Mutex::new(remotehid::Generation::default())),
         }
     }
 
@@ -367,6 +384,13 @@ impl AacpManager {
 
         request_force_active(&*seq_packet);
 
+        // This session takes over the active slot. Dropping the previous
+        // strong reference makes the superseded receive task's weak upgrade
+        // fail on its next iteration, so it exits at once instead of racing
+        // the new session for the shared state until its watchdog fires.
+        let epoch = self.conn_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.active_socket.lock().await = Some(Arc::clone(&seq_packet));
+
         info!("L2CAP AACP connected to {}", addr);
 
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(128);
@@ -393,7 +417,13 @@ impl AacpManager {
         });
 
         // Spawn receive loop
-        let seq_packet_recv = Arc::clone(&seq_packet);
+        //
+        // The task holds the socket only weakly: the strong reference lives in
+        // `active_socket`, so a reconnect (or a handshake-failure rollback)
+        // retires this loop deterministically. It also captures its epoch and
+        // skips the shared-state cleanup when a newer session exists.
+        let seq_packet_recv = Arc::downgrade(&seq_packet);
+        let epoch_counter = Arc::clone(&self.conn_epoch);
         let event_tx = self.event_tx.clone();
         let state_clone = Arc::clone(&self.state);
         let send_tx_cleanup = Arc::clone(&self.send_tx);
@@ -407,7 +437,7 @@ impl AacpManager {
         let self_head_status = Arc::clone(&self.head_status);
 
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 2048];
+            let mut buf = vec![0u8; AACP_RECEIVE_MTU as usize];
             // Log the first sensor frame, then only the occasional one: the
             // stream runs at ~50 Hz and would otherwise bury everything else.
             let mut sensor_frames: u64 = 0;
@@ -417,6 +447,14 @@ impl AacpManager {
             // does not flood the log at wire rate.
             let mut gate_logged_at = None::<std::time::Instant>;
             loop {
+                // A newer `open` (or a rollback after a failed handshake) drops
+                // the strong reference in `active_socket`; failing this upgrade
+                // retires this task immediately instead of leaving it parked on
+                // a superseded link until the watchdog fires.
+                let Some(seq_packet_recv) = seq_packet_recv.upgrade() else {
+                    debug!("AACP receive loop superseded by a newer connection");
+                    return;
+                };
                 // A dead L2CAP link does not necessarily close the socket:
                 // buds out of range or grabbed by another host leave this
                 // recv parked forever while the process looks alive. A read
@@ -518,7 +556,7 @@ impl AacpManager {
                             sensor_frames += 1;
                             if sensor_frames == 1 {
                                 info!("Head tracking stream started ({} byte samples)", len);
-                            } else if sensor_frames % 500 == 0 {
+                            } else if sensor_frames.is_multiple_of(500) {
                                 debug!("Head tracking: {} samples received", sensor_frames);
                             }
                             // Attitude only means something while the buds are
@@ -619,7 +657,13 @@ impl AacpManager {
                 }
             }
 
-            // Cleanup state on disconnect
+            // Cleanup state on disconnect - but only if this session is still
+            // the active one: a loop whose socket was replaced by a newer
+            // connection must not clobber that connection's state.
+            if epoch_counter.load(Ordering::SeqCst) != epoch {
+                debug!("AACP receive loop exit skipped: a newer session owns the state");
+                return;
+            }
             {
                 let mut state = state_clone.write().await;
                 state.is_connected = false;
@@ -649,7 +693,21 @@ impl AacpManager {
 
         // Initialize handshake sequence
         if handshake {
-            self.init_handshake().await?;
+            if let Err(e) = self.init_handshake().await {
+                // Roll the optimistic "connected" state back: a caller that
+                // sees the error must also see `is_connected() == false` and a
+                // cleared sender. Dropping the active slot makes the receive
+                // loop exit at its next iteration instead of waiting out the
+                // watchdog on a session that never completed.
+                *self.active_socket.lock().await = None;
+                {
+                    let mut state = self.state.write().await;
+                    state.is_connected = false;
+                    state.airpods_address = None;
+                }
+                *self.send_tx.lock().await = None;
+                return Err(e);
+            }
             // Ask for the current status once the handshake is done. The
             // accessory pushes battery/ear state early - sometimes before
             // this side is ready to cache it - and ear detection is
@@ -927,6 +985,7 @@ impl AacpManager {
         let frames = self.rtb_acp_tx.subscribe();
         let status = Arc::clone(&self.head_status);
         let remotes = Arc::clone(&self.remotes);
+        let generation = Arc::clone(&self.remotehid_generation);
         let address = self.state.read().await.airpods_address;
         let starting = Arc::clone(&self.head_tracking_starting);
 
@@ -956,7 +1015,7 @@ impl AacpManager {
                 }
             }
 
-            if let Err(e) = drive_remote_hid(sender, frames, tracker, address, status, remotes).await {
+            if let Err(e) = drive_remote_hid(sender, frames, tracker, address, status, remotes, generation).await {
                 warn!("RemoteHID could not be started: {}", e);
             }
         });
@@ -968,13 +1027,20 @@ impl AacpManager {
         debug!("Stopping head tracking...");
         // Writing a zero interval is the documented way to stop a RemoteHID
         // stream; the SensorDataWX stop frame only applies to that transport.
-        let stop = remotehid::make_set_interval(
-            remotehid::Generation::default().next(),
-            7, // devmotion6; corrected below if the real id differs
-            0,
-        );
-        let _ = self.send_raw(stop).await;
-        Ok(())
+        //
+        // The accessory reassigns device ids on every connect, so the stop has
+        // to target the device negotiated on THIS connection - the same
+        // registry `drive_remote_hid` picked the start frame from. A
+        // hard-coded id would aim the zero interval at a device that may not
+        // exist and leave the stream running.
+        let device = self.remotes.lock().await.motion_device().map(|d| d.device);
+        let Some(device) = device else {
+            return Err("no motion device announced on this connection".to_string());
+        };
+        // Continue the generation sequence the start frame used.
+        let mut generation = self.remotehid_generation.lock().await;
+        let stop = remotehid::make_set_interval(generation.next(), device, 0);
+        self.send_raw(stop).await
     }
 }
 
@@ -991,8 +1057,8 @@ async fn drive_remote_hid(
     address: Option<Address>,
     status: Arc<Mutex<String>>,
     remotes: Arc<Mutex<remotehid::DeviceRegistry>>,
+    generation: Arc<Mutex<remotehid::Generation>>,
 ) -> Result<(), String> {
-    let mut generation = remotehid::Generation::default();
     let mut supervisor = session::StreamSupervisor::new();
 
     // The announcement burst can lag the AACP session by several seconds on a
@@ -1051,7 +1117,10 @@ async fn drive_remote_hid(
             };
         }
 
-        if let Some(packet) = supervisor.record_announcement(&registry, &mut generation) {
+        if let Some(packet) = {
+            let mut generation = generation.lock().await;
+            supervisor.record_announcement(&registry, &mut generation)
+        } {
             if !packet.is_empty() {
                 info!("Writing the sample interval for the motion service");
                 *status.lock().await =
@@ -1088,35 +1157,19 @@ async fn drive_remote_hid(
 /// How many announcement windows to watch before giving up on this attempt.
 const ROUNDS: u32 = 4;
 
+impl Default for AacpManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Records a DeviceConnect advertisement in the shared registry.
 ///
 /// Called from the receive loop, which sees the burst during the handshake - well
 /// before anything asks for the stream.
 async fn record_advertisement(registry: &Mutex<remotehid::DeviceRegistry>, frame: &[u8]) {
     let mut guard = registry.lock().await;
-    record_connect(&mut guard, frame);
-}
-
-/// Records a DeviceConnect frame in the registry, ignoring anything else.
-fn record_connect(registry: &mut remotehid::DeviceRegistry, frame: &[u8]) {
-    let Some((_g, header, _p)) = remotehid::parse_frame(frame) else {
-        return;
-    };
-    if header.kind() != Some(remotehid::Kind::HostConnect) || header.is_response {
-        return;
-    }
-    let Some(start) = frame.iter().position(|&b| b == b'<') else {
-        return;
-    };
-    let text = String::from_utf8_lossy(&frame[start..]).to_string();
-    let descriptor = text
-        .find("<key>ReportDescriptor</key><data>")
-        .and_then(|s| {
-            let rest = &text[s + "<key>ReportDescriptor</key><data>".len()..];
-            rest.find('<').map(|e| decode_b64(&rest[..e]))
-        })
-        .unwrap_or_default();
-    registry.record(header.device, &text, &descriptor);
+    remotehid::record_device_connect(&mut guard, frame);
 }
 
 /// Bytes of motion data in a RemoteHID InputReport, after the report-id byte.
@@ -1131,7 +1184,7 @@ fn is_motion_input_report(packet: &[u8]) -> bool {
     header.kind() == Some(remotehid::Kind::InputReport)
         && !header.is_response
         // payload starts at the report-id byte; the motion block follows it.
-        && payload.len() >= 1 + MOTION_BLOCK_LEN
+        && payload.len() > MOTION_BLOCK_LEN
 }
 
 /// The receive-loop routing decision for an opcode-0x17 frame: XML path or
@@ -1148,26 +1201,6 @@ fn routes_to_xml(packet: &[u8]) -> bool {
     let is_advertisement = rtbuddy::ServiceAdvertisement::parse(packet).is_some();
     let is_motion_report = !is_advertisement && is_motion_input_report(packet);
     packet.contains(&b'<') && !is_motion_report
-}
-
-/// Minimal base64 decoder for the descriptor blobs in DeviceConnect.
-fn decode_b64(input: &str) -> Vec<u8> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::new();
-    let mut buffer: u32 = 0;
-    let mut bits = 0;
-    for byte in input.bytes() {
-        let Some(index) = TABLE.iter().position(|&c| c == byte) else {
-            continue;
-        };
-        buffer = (buffer << 6) | index as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

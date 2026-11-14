@@ -20,6 +20,7 @@ use gpui_kit::{
 };
 use state::{RustPodsController, RustPodsState};
 use std::borrow::Cow;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -33,6 +34,9 @@ pub enum UiEvent {
     CaseLidOpened,
     CaseLidClosed,
     HeadGesture(crate::core::head_tracking::HeadGesture),
+    /// Requests a graceful application shutdown, so every Drop (notably the
+    /// HRTF client restoring the default audio sink) runs before exit.
+    Quit,
 }
 
 // Extra Lucide icons used in RustPods beyond gpui-component's default bundle.
@@ -198,20 +202,7 @@ fn bootstrap_gui(
             let dev = dev_tray_noise.clone();
             let tx = tx_tray_noise.clone();
             rt_noise.spawn(async move {
-                let _ = aacp.set_noise_mode(mode).await;
-                let updated = {
-                    let mut guard = dev.write().await;
-                    match guard.as_mut() {
-                        Some(state) => {
-                            state.noise_mode = mode;
-                            Some(state.clone())
-                        }
-                        None => None,
-                    }
-                };
-                if let Some(state) = updated {
-                    let _ = tx.send(UiEvent::DeviceStateUpdated(state));
-                }
+                crate::system::tray::apply_noise_mode(&aacp, &dev, &tx, mode).await;
             });
         });
 
@@ -222,28 +213,18 @@ fn bootstrap_gui(
         let rt_ear = rt_handle.clone();
         let on_tray_ear = Arc::new(move |enabled: bool| {
             let aacp = aacp_tray_ear.clone();
-            if let Ok(mut c) = cfg_tray_ear.write() {
-                c.ear_detection_enabled = enabled;
-                save_config(&c);
-            }
+            let cfg = cfg_tray_ear.clone();
             let dev = dev_tray_ear.clone();
             let tx = tx_tray_ear.clone();
             rt_ear.spawn(async move {
-                let _ = aacp.set_ear_detection(enabled).await;
-                let updated = {
-                    let mut guard = dev.write().await;
-                    match guard.as_mut() {
-                        Some(state) => {
-                            state.ear_detection_enabled = enabled;
-                            Some(state.clone())
-                        }
-                        None => None,
-                    }
-                };
-                if let Some(state) = updated {
-                    let _ = tx.send(UiEvent::DeviceStateUpdated(state));
-                }
+                crate::system::tray::apply_ear_detection_toggle(&aacp, &cfg, &dev, &tx, enabled)
+                    .await;
             });
+        });
+
+        let tx_tray_quit = ui_event_tx.clone();
+        let on_tray_quit = Arc::new(move || {
+            let _ = tx_tray_quit.send(UiEvent::Quit);
         });
 
         let tray = RustPodsTray {
@@ -251,6 +232,7 @@ fn bootstrap_gui(
             on_open_window: on_open_win,
             on_set_noise_mode: on_tray_noise,
             on_toggle_ear_detection: on_tray_ear,
+            on_quit: on_tray_quit,
         };
 
         let tray_holder_clone = tray_handle_holder.clone();
@@ -292,11 +274,11 @@ fn bootstrap_gui(
         let tray_ev = tray_handle_holder.clone();
         let rt_ev = rt_handle.clone();
         cx.spawn(async move |cx| {
-            let mut gesture_gen: u64 = 0;
+            let gesture_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
             while let Some(evt) = ui_event_rx.recv().await {
                 match evt {
                     UiEvent::DeviceStateUpdated(new_dev) => {
-                        let _ = state_ev.update(cx, |s, cx| {
+                        state_ev.update(cx, |s, cx| {
                             s.device = new_dev;
                             cx.notify();
                         });
@@ -309,29 +291,29 @@ fn bootstrap_gui(
                         });
                     }
                     UiEvent::OpenWindow => {
-                        let _ = cx.update(|cx| {
+                        cx.update(|cx| {
                             open_or_activate_window(&state_ev, &win_ev, cx);
                         });
                     }
                     UiEvent::CaseLidOpened => {
-                        let _ = cx.update(|cx| {
+                        cx.update(|cx| {
                             popup::open_or_refresh_case_popup(&state_ev, &popup_ev, cx);
                         });
                     }
                     UiEvent::CaseLidClosed => {
-                        let _ = cx.update(|cx| {
+                        cx.update(|cx| {
                             popup::close_case_popup(&popup_ev, cx);
                         });
                     }
                     UiEvent::ConnectedChanged(connected) => {
-                        let _ = state_ev.update(cx, |s, cx| {
+                        state_ev.update(cx, |s, cx| {
                             s.device.is_connected = connected;
                             if !connected {
                                 s.head_tracking.pose = None;
                                 s.head_tracking.calibrated = false;
                                 s.head_tracking.rate_hz = None;
                                 s.head_tracking.status =
-                                    "等待数据流…（请确认 AirPods 已连接）".to_string();
+                                    rust_i18n::t!("spatial.waiting_connected").to_string();
                             }
                             cx.notify();
                         });
@@ -345,26 +327,33 @@ fn bootstrap_gui(
                     }
                     UiEvent::HeadGesture(gesture) => {
                         info!("Head gesture: {:?}", gesture);
-                        gesture_gen = gesture_gen.wrapping_add(1);
-                        let expected = gesture_gen;
-                        let _ = state_ev.update(cx, |s, cx| {
+                        // Generation guard so a badge shown for gesture N is only
+                        // cleared by N's own timer: two identical gestures in a
+                        // row must not clear each other early.
+                        let expected = gesture_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        state_ev.update(cx, |s, cx| {
                             s.head_tracking.gesture = Some(gesture);
                             cx.notify();
                         });
                         let state_clear = state_ev.clone();
+                        let gen_counter = gesture_gen.clone();
                         cx.spawn(async move |cx| {
                             cx.background_executor()
                                 .timer(Duration::from_millis(1800))
                                 .await;
-                            let _ = state_clear.update(cx, |s, cx| {
-                                if s.head_tracking.gesture == Some(gesture) {
-                                    let _ = expected;
+                            state_clear.update(cx, |s, cx| {
+                                if gen_counter.load(Ordering::SeqCst) == expected
+                                    && s.head_tracking.gesture == Some(gesture)
+                                {
                                     s.head_tracking.gesture = None;
                                     cx.notify();
                                 }
                             });
                         })
                         .detach();
+                    }
+                    UiEvent::Quit => {
+                        cx.update(|cx| cx.quit());
                     }
                 }
             }
@@ -407,18 +396,20 @@ fn bootstrap_gui(
 
                 let calibrated = aacp_feed.is_head_tracking_active().await;
                 let rate = aacp_feed.head_tracking_rate_hz().await;
-                let _ = state_feed.update(cx, |s, cx| {
+                state_feed.update(cx, |s, cx| {
                     s.head_tracking.pose = pose;
                     s.head_tracking.calibrated = calibrated;
                     s.head_tracking.rate_hz = rate;
                     if pose.is_some() {
                         s.head_tracking.status = if calibrated {
                             match rate {
-                                Some(hz) => format!("实时姿态流 · {:.0} Hz", hz),
-                                None => "实时姿态流".to_string(),
+                                Some(hz) => {
+                                    format!("{} · {:.0} Hz", rust_i18n::t!("spatial.live_stream"), hz)
+                                }
+                                None => rust_i18n::t!("spatial.live_stream").to_string(),
                             }
                         } else {
-                            "正在校准中立姿态…（保持头部静止）".to_string()
+                            rust_i18n::t!("spatial.calibrating").to_string()
                         };
                     }
                     cx.notify();
@@ -442,7 +433,7 @@ fn bootstrap_gui(
             let progress = crate::system::zcode_ask::ASK_HUB.progress_snapshot();
             let resolved = crate::system::zcode_ask::ASK_HUB.resolved_note();
 
-            let _ = state_ask.update(cx, |s, cx| {
+            state_ask.update(cx, |s, cx| {
                 if s.zcode_progress != progress || s.zcode_resolved != resolved {
                     s.zcode_progress = progress.clone();
                     s.zcode_resolved = resolved.clone();
@@ -455,7 +446,7 @@ fn bootstrap_gui(
                     active_qid = Some(q.id);
                     let st = state_ask.clone();
                     let slot = ask_popup_slot.clone();
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         ask_popup::open_or_refresh_ask_popup(&st, &slot, cx);
                     });
                 }
@@ -463,7 +454,7 @@ fn bootstrap_gui(
                 active_qid = None;
                 if resolved.is_none() {
                     let slot = ask_popup_slot.clone();
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         ask_popup::close_ask_popup(&slot, cx);
                     });
                 }
@@ -478,8 +469,8 @@ fn open_or_activate_window(
     slot: &Arc<std::sync::Mutex<Option<AnyWindowHandle>>>,
     cx: &mut App,
 ) {
-    if let Ok(mut guard) = slot.lock() {
-        if let Some(handle) = guard.as_ref() {
+    if let Ok(mut guard) = slot.lock()
+        && let Some(handle) = guard.as_ref() {
             if handle
                 .update(cx, |_, window, _| {
                     window.activate_window();
@@ -490,7 +481,6 @@ fn open_or_activate_window(
             }
             *guard = None;
         }
-    }
 
     let state_for_win = app_state.clone();
     match gpui_kit::open_window(window_options(cx), cx, move |window, cx| {
@@ -607,17 +597,16 @@ pub async fn start_bluetooth_daemon(
         }
     };
 
-    if let Ok(ad) = bt_manager.get_default_adapter().await {
-        if let Ok(addr) = ad.address().await {
+    if let Ok(ad) = bt_manager.get_default_adapter().await
+        && let Ok(addr) = ad.address().await {
             info!("Local Bluetooth Adapter MAC: {}", addr);
             aacp.set_local_address(addr.to_string()).await;
         }
-    }
 
     // Pre-populate device state with paired AirPods so BLE proximity monitor
     // can immediately associate beacons on startup without waiting for a connect event.
-    if let Ok(paired) = bt_manager.find_paired_airpods().await {
-        if let Some(first_paired) = paired.first() {
+    if let Ok(paired) = bt_manager.find_paired_airpods().await
+        && let Some(first_paired) = paired.first() {
             let mut lock = dev_state.write().await;
             if lock.is_none() {
                 let state = AirPodsDeviceState::new(
@@ -629,7 +618,6 @@ pub async fn start_bluetooth_daemon(
                 let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state));
             }
         }
-    }
 
     loop {
         info!("Searching for connected AirPods...");
@@ -740,12 +728,11 @@ pub async fn start_bluetooth_daemon(
                     let event = tokio::select! {
                         event = event_rx.recv() => event,
                         _ = health.tick() => {
-                            if let Ok(connected_pods) = bt_manager.find_connected_airpods().await {
-                                if !connected_pods.iter().any(|p| p.address == pod.address) {
+                            if let Ok(connected_pods) = bt_manager.find_connected_airpods().await
+                                && !connected_pods.iter().any(|p| p.address == pod.address) {
                                     info!("BlueZ reported AirPods disconnected; leaving the event loop");
                                     break;
                                 }
-                            }
                             if !aacp.is_connected().await {
                                 warn!("AACP socket is gone; leaving the event loop");
                                 break;
@@ -945,8 +932,8 @@ pub async fn start_bluetooth_daemon(
 
             Ok(_) => {
                 debug!("No connected AirPods detected, checking paired devices...");
-                if let Ok(paired) = bt_manager.find_paired_airpods().await {
-                    if let Some(first_paired) = paired.first() {
+                if let Ok(paired) = bt_manager.find_paired_airpods().await
+                    && let Some(first_paired) = paired.first() {
                         let addr_str = first_paired.address.to_string();
                         let mut lock = dev_state.write().await;
                         let state = match lock.as_mut() {
@@ -977,7 +964,6 @@ pub async fn start_bluetooth_daemon(
                             let _ = ui_tx.send(UiEvent::DeviceStateUpdated(updated));
                         }
                     }
-                }
                 let _ = ui_tx.send(UiEvent::ConnectedChanged(false));
             }
 

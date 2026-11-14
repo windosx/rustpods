@@ -38,24 +38,32 @@ impl MprisController {
         }
     }
 
+
     pub async fn get_player_names(&self, conn: &Connection) -> Vec<String> {
         let dbus_proxy = zbus::fdo::DBusProxy::new(conn)
             .await
             .map_err(|e| error!("Failed to create DBusProxy: {}", e))
             .ok();
 
-        if let Some(proxy) = dbus_proxy {
-            if let Ok(names) = proxy.list_names().await {
+        if let Some(proxy) = dbus_proxy
+            && let Ok(names) = proxy.list_names().await {
                 return names
                     .into_iter()
                     .filter(|name| name.starts_with("org.mpris.MediaPlayer2."))
                     .map(|n| n.to_string())
                     .collect();
             }
-        }
         Vec::new()
     }
+}
 
+impl Default for MprisController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MprisController {
     pub async fn handle_ear_detection_pause(&self) {
         info!("Earbuds removed: auto-pausing media players...");
         let conn = match Connection::session().await {
@@ -74,18 +82,14 @@ impl MprisController {
                 .destination(player_name.as_str())
                 .and_then(|b| b.path("/org/mpris/MediaPlayer2"));
 
-            if let Ok(builder) = proxy_res {
-                if let Ok(proxy) = builder.build().await {
-                    if let Ok(status) = proxy.playback_status().await {
-                        if status == "Playing" {
-                            if let Ok(_) = proxy.pause().await {
+            if let Ok(builder) = proxy_res
+                && let Ok(proxy) = builder.build().await
+                    && let Ok(status) = proxy.playback_status().await
+                        && status == "Playing"
+                            && let Ok(_) = proxy.pause().await {
                                 info!("Paused player: {}", player_name);
                                 paused_set.insert(player_name);
                             }
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -105,8 +109,8 @@ impl MprisController {
                 .destination(player_name.as_str())
                 .and_then(|b| b.path("/org/mpris/MediaPlayer2"));
 
-            if let Ok(builder) = proxy_res {
-                if let Ok(proxy) = builder.build().await {
+            if let Ok(builder) = proxy_res
+                && let Ok(proxy) = builder.build().await {
                     // Only resume what is still paused. If the user resumed or
                     // stopped the player themselves while the buds were out,
                     // forcing play() here would start playback they ended.
@@ -118,7 +122,6 @@ impl MprisController {
                         info!("Resumed player: {}", player_name);
                     }
                 }
-            }
         }
     }
 
@@ -137,11 +140,10 @@ impl MprisController {
                 .destination(primary.as_str())
                 .and_then(|b| b.path("/org/mpris/MediaPlayer2"));
 
-            if let Ok(builder) = proxy_res {
-                if let Ok(proxy) = builder.build().await {
+            if let Ok(builder) = proxy_res
+                && let Ok(proxy) = builder.build().await {
                     let _ = proxy.play_pause().await;
                 }
-            }
         }
     }
 
@@ -160,11 +162,10 @@ impl MprisController {
                 .destination(primary.as_str())
                 .and_then(|b| b.path("/org/mpris/MediaPlayer2"));
 
-            if let Ok(builder) = proxy_res {
-                if let Ok(proxy) = builder.build().await {
+            if let Ok(builder) = proxy_res
+                && let Ok(proxy) = builder.build().await {
                     let _ = proxy.next().await;
                 }
-            }
         }
     }
 
@@ -183,11 +184,10 @@ impl MprisController {
                 .destination(primary.as_str())
                 .and_then(|b| b.path("/org/mpris/MediaPlayer2"));
 
-            if let Ok(builder) = proxy_res {
-                if let Ok(proxy) = builder.build().await {
+            if let Ok(builder) = proxy_res
+                && let Ok(proxy) = builder.build().await {
                     let _ = proxy.previous().await;
                 }
-            }
         }
     }
 }

@@ -193,3 +193,16 @@ popup:
   left_ear: "左耳 L"
   right_ear: "右耳 R"
   case: "充电盒"
+
+tray:
+  tag_disconnected: "(未连接)"
+  tag_in_case: "(充电盒中)"
+  tag_connected: "(已连接)"
+  battery_line: "左耳 %{left} | 右耳 %{right} | 充电盒 %{case}"
+  tip_description: "左耳: %{left}  右耳: %{right}  充电盒: %{case}"
+  case_closed: "闭盖"
+  noise_control: "噪声控制"
+  ear_detection: "自动入耳检测"
+  not_connected: "未连接 AirPods"
+  open_app: "打开 RustPods 设置..."
+  quit: "退出应用"

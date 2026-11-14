@@ -167,17 +167,15 @@ impl StreamSupervisor {
     /// Decides what to do when an attempt announced some services but not the
     /// motion one.
     ///
-    /// Cutting the link here is counter-productive: the accessory announces its
-    /// services incrementally while it finishes coming up, so reconnecting resets
-    /// that progress. Observed during testing - an early reconnect produced
-    /// 0, 1, 2, 3 services on successive attempts, while leaving it alone reached
-    /// all eight.
+    /// Always [`Recovery::KeepWaiting`]: the accessory announces its services
+    /// incrementally while it finishes coming up, so reconnecting resets that
+    /// progress. Observed during testing - an early reconnect produced
+    /// 0, 1, 2, 3 services on successive attempts, while leaving it alone
+    /// reached all eight. `announced` is logged so a stalled accessory is
+    /// visible in the trace.
     pub fn after_partial(&mut self, announced: usize) -> Recovery {
-        if announced >= FULL_SERVICE_COUNT {
-            return Recovery::KeepWaiting;
-        }
         debug!(
-            "{} of {} services so far; the accessory is still initialising",
+            "{} of {} services so far; the accessory is still initialising, keeping the link",
             announced, FULL_SERVICE_COUNT
         );
         Recovery::KeepWaiting

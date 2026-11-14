@@ -1,5 +1,6 @@
 use crate::core::aacp::commands::MicrophoneMode;
 use crate::system::config::PauseBehavior;
+use crate::ui::state::RustPodsController;
 use crate::ui::components::{
     agents::render_agents_page, battery::render_battery_card, head_mouse::render_head_mouse_page,
     headtracking::render_head_tracking_card, hero::render_hero_card, noise::render_noise_control_card,
@@ -19,6 +20,10 @@ use gpui_kit::{
     Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use std::time::Duration;
+
+/// Coalesces slider drags into at most one config write per 150 ms, the same
+/// debounce the adaptive-strength slider uses.
+const MOUSE_SLIDER_DEBOUNCE_MS: u64 = 150;
 
 pub fn window_options(cx: &App) -> WindowOptions {
     let mut opts = WindowOptions {
@@ -82,6 +87,10 @@ pub struct MainWindow {
     last_synced_adaptive: u8,
     last_synced_language: crate::system::config::AppLanguage,
     adaptive_debounce_gen: u64,
+    /// Debounce generations for the four head-mouse sliders (speed, accel,
+    /// smoothing, deadzone). These sliders had no event subscription at all
+    /// once, so dragging them moved the knob without ever touching the config.
+    mouse_slider_gens: [u64; 4],
     _subscriptions: Vec<Subscription>,
     _select_subscriptions: Vec<Subscription>,
 }
@@ -265,7 +274,7 @@ impl MainWindow {
                             .read_with(cx, |view, _| view.adaptive_debounce_gen == expected_gen)
                             .unwrap_or(false);
                         if should_send {
-                            let _ = app_send.read_with(cx, |s, _| {
+                            app_send.read_with(cx, |s, _| {
                                 s.controller.set_adaptive_strength(snapped);
                             });
                         }
@@ -274,6 +283,14 @@ impl MainWindow {
                 },
             ));
         }
+
+        // The slider entities move into `Self` below; the subscriptions need
+        // their own clones.
+        let speed_slider_sub = mouse_speed_slider.clone();
+        let accel_slider_sub = mouse_accel_slider.clone();
+        let smooth_slider_sub = mouse_smooth_slider.clone();
+        let deadzone_slider_sub = mouse_deadzone_slider.clone();
+        let app_state_sub = app_state.clone();
 
         let mut this = Self {
             app_state,
@@ -290,11 +307,78 @@ impl MainWindow {
             last_synced_adaptive: initial_adaptive,
             last_synced_language: cfg.language,
             adaptive_debounce_gen: 0,
+            mouse_slider_gens: [0; 4],
             _subscriptions: subscriptions,
             _select_subscriptions: Vec::new(),
         };
+        this.bind_mouse_slider(
+            &speed_slider_sub,
+            0,
+            &app_state_sub,
+            cx,
+            RustPodsController::set_head_mouse_speed,
+        );
+        this.bind_mouse_slider(
+            &accel_slider_sub,
+            1,
+            &app_state_sub,
+            cx,
+            RustPodsController::set_head_mouse_accel,
+        );
+        this.bind_mouse_slider(
+            &smooth_slider_sub,
+            2,
+            &app_state_sub,
+            cx,
+            RustPodsController::set_head_mouse_smoothing,
+        );
+        this.bind_mouse_slider(
+            &deadzone_slider_sub,
+            3,
+            &app_state_sub,
+            cx,
+            RustPodsController::set_head_mouse_deadzone,
+        );
         this.subscribe_selects(cx);
         this
+    }
+
+    /// Wires one head-mouse slider to its config setter with the shared
+    /// debounce: only the latest drag position within the window is written.
+    fn bind_mouse_slider(
+        &mut self,
+        slider: &Entity<SliderState>,
+        idx: usize,
+        app_state: &Entity<RustPodsState>,
+        cx: &mut Context<Self>,
+        apply: fn(&RustPodsController, f32),
+    ) {
+        let app = app_state.clone();
+        self._subscriptions.push(cx.subscribe(
+            slider,
+            move |this, _slider, event: &SliderEvent, cx| {
+                let raw = match event {
+                    SliderEvent::Change(SliderValue::Single(v))
+                    | SliderEvent::Release(SliderValue::Single(v)) => *v,
+                    _ => return,
+                };
+                this.mouse_slider_gens[idx] = this.mouse_slider_gens[idx].wrapping_add(1);
+                let expected_gen = this.mouse_slider_gens[idx];
+                let app = app.clone();
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(MOUSE_SLIDER_DEBOUNCE_MS))
+                        .await;
+                    let due = this
+                        .read_with(cx, |view, _| view.mouse_slider_gens[idx] == expected_gen)
+                        .unwrap_or(false);
+                    if due {
+                        app.read_with(cx, |s, _| apply(&s.controller, raw));
+                    }
+                })
+                .detach();
+            },
+        ));
     }
 
     fn subscribe_selects(&mut self, cx: &mut Context<Self>) {
@@ -659,11 +743,13 @@ impl Render for MainWindow {
             NavPage::HeadMouse => render_head_mouse_page(
                 state,
                 &self.app_state,
-                &self.mouse_mode_select,
-                &self.mouse_speed_slider,
-                &self.mouse_accel_slider,
-                &self.mouse_smooth_slider,
-                &self.mouse_deadzone_slider,
+                &crate::ui::components::head_mouse::HeadMouseWidgets {
+                    mode_select: &self.mouse_mode_select,
+                    speed: &self.mouse_speed_slider,
+                    accel: &self.mouse_accel_slider,
+                    smoothing: &self.mouse_smooth_slider,
+                    deadzone: &self.mouse_deadzone_slider,
+                },
                 on_enable_request,
                 &p,
             )

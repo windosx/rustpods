@@ -127,7 +127,7 @@ impl CasePopupWindow {
 }
 
 impl Render for CasePopupWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let state = self.app_state.read(cx);
         let dev = state.device.clone();
@@ -159,7 +159,6 @@ impl Render for CasePopupWindow {
         let (img_w, img_h) = if is_max { (186., 202.) } else { (336., 168.) };
         let elapsed_ms = self.started_at.elapsed().as_millis() as usize;
 
-        let _ = window;
         let anim = if closing {
             Animation::new(Duration::from_millis(POPUP_CLOSE_ANIM_MS)).with_easing(ease_in_out)
         } else {
@@ -458,8 +457,8 @@ pub fn open_or_refresh_case_popup(
     slot: &std::sync::Arc<std::sync::Mutex<Option<WindowHandle<CasePopupWindow>>>>,
     cx: &mut App,
 ) {
-    if let Ok(mut guard) = slot.lock() {
-        if let Some(handle) = guard.as_ref() {
+    if let Ok(mut guard) = slot.lock()
+        && let Some(handle) = guard.as_ref() {
             if handle
                 .update(cx, |view, window, cx| {
                     let was_closing = view.closing;
@@ -477,7 +476,6 @@ pub fn open_or_refresh_case_popup(
             }
             *guard = None;
         }
-    }
 
     let popup_size = size(px(416.), px(370.));
     let popup_bounds = WindowBounds::Windowed(Bounds::centered(None, popup_size, cx));
