@@ -58,7 +58,7 @@ jobs:
       - name: Install packaging tools (cargo-binstall, cargo-deb, cargo-generate-rpm)
         run: |
           curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-          cargo binstall -y --no-confirm cargo-deb cargo-generate-rpm
+          cargo binstall --no-confirm cargo-deb cargo-generate-rpm
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
