@@ -68,6 +68,13 @@ const ANIM_AIRPODS_4: &[u8] = include_bytes!("../../assets/animations/airpods_4.
 const ANIM_AIRPODS_PRO: &[u8] = include_bytes!("../../assets/animations/airpods_pro.webp");
 const ANIM_AIRPODS_PRO_2: &[u8] = include_bytes!("../../assets/animations/airpods_pro_2.webp");
 const ANIM_AIRPODS_MAX: &[u8] = include_bytes!("../../assets/animations/airpods_max.webp");
+const IMG_AIRPODS_1: &[u8] = include_bytes!("../../assets/models/airpods_1.png");
+const IMG_AIRPODS_2: &[u8] = include_bytes!("../../assets/models/airpods_2.png");
+const IMG_AIRPODS_3: &[u8] = include_bytes!("../../assets/models/airpods_3.png");
+const IMG_AIRPODS_4: &[u8] = include_bytes!("../../assets/models/airpods_4.png");
+const IMG_AIRPODS_PRO: &[u8] = include_bytes!("../../assets/models/airpods_pro.png");
+const IMG_AIRPODS_PRO_2: &[u8] = include_bytes!("../../assets/models/airpods_pro_2.png");
+const IMG_AIRPODS_MAX: &[u8] = include_bytes!("../../assets/models/airpods_max.png");
 const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/icons/hicolor/128x128/apps/rustpods.png");
 const APP_ICON_PNG_32: &[u8] = include_bytes!("../../assets/icons/hicolor/32x32/apps/rustpods.png");
 
@@ -81,6 +88,13 @@ impl AssetSource for CompositeAssets {
             "animations/airpods_pro.webp" => Some(ANIM_AIRPODS_PRO),
             "animations/airpods_pro_2.webp" => Some(ANIM_AIRPODS_PRO_2),
             "animations/airpods_max.webp" => Some(ANIM_AIRPODS_MAX),
+            "models/airpods_1.png" => Some(IMG_AIRPODS_1),
+            "models/airpods_2.png" => Some(IMG_AIRPODS_2),
+            "models/airpods_3.png" => Some(IMG_AIRPODS_3),
+            "models/airpods_4.png" => Some(IMG_AIRPODS_4),
+            "models/airpods_pro.png" => Some(IMG_AIRPODS_PRO),
+            "models/airpods_pro_2.png" => Some(IMG_AIRPODS_PRO_2),
+            "models/airpods_max.png" => Some(IMG_AIRPODS_MAX),
             "icons/rustpods.png" => Some(APP_ICON_PNG),
             "icons/rustpods_32.png" => Some(APP_ICON_PNG_32),
             _ => None,
@@ -409,12 +423,19 @@ fn bootstrap_gui(
         cx.spawn(async move |cx| {
             let mut last_render = None::<std::time::Instant>;
             loop {
-                if pose_rx.changed().await.is_err() {
+                // Wait for a new pose, with a timeout so a stalled stream does not leave the UI permanently frozen.
+                let changed = tokio::time::timeout(Duration::from_millis(250), pose_rx.changed()).await;
+                if let Ok(Err(_)) = changed {
                     break;
                 }
-                let pose = *pose_rx.borrow_and_update();
+                let pose = if changed.is_ok() {
+                    *pose_rx.borrow_and_update()
+                } else {
+                    *pose_rx.borrow()
+                };
                 let now = std::time::Instant::now();
                 if pose.is_some()
+                    && changed.is_ok()
                     && last_render.is_some_and(|t| now.duration_since(t) < RENDER_INTERVAL)
                 {
                     continue;
@@ -427,7 +448,7 @@ fn bootstrap_gui(
                     s.head_tracking.pose = pose;
                     s.head_tracking.calibrated = calibrated;
                     s.head_tracking.rate_hz = rate;
-                    if pose.is_some() {
+                    if pose.is_some() && rate.is_some() {
                         s.head_tracking.status = if calibrated {
                             match rate {
                                 Some(hz) => {
@@ -438,6 +459,8 @@ fn bootstrap_gui(
                         } else {
                             rust_i18n::t!("spatial.calibrating").to_string()
                         };
+                    } else if rate.is_none() {
+                        s.head_tracking.status = rust_i18n::t!("spatial.waiting_stream").to_string();
                     }
                     cx.notify();
                 });
@@ -804,11 +827,11 @@ pub async fn start_bluetooth_daemon(
                             if !last_both_in_ear && current_state.is_wearing_both() {
                                 let camera = aacp.clone();
                                 tokio::spawn(async move {
-                                    if camera.head_samples_seen().await == 0 {
+                                    if !camera.is_head_tracking_streaming().await {
                                         if !camera.has_motion_device().await {
                                             let _ = camera.subscribe_rtbuddy_motion().await;
                                         }
-                                        let _ = camera.start_head_tracking().await;
+                                        let _ = camera.rearm_motion_stream().await;
                                     }
                                 });
                             }

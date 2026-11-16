@@ -158,10 +158,10 @@ agents:
   install: "安装"
   uninstall: "卸载"
   coming_soon: "即将支持"
-  ask_resolved: "ZCode 应答完成"
-  ask_title: "ZCode 提问"
+  ask_resolved: "%{agent} 应答完成"
+  ask_title: "%{agent} 提问"
   waiting_nod: "等待点头…"
-  nod_count: "已点头 {} 次"
+  nod_count: "已点头 %{count} 次"
 
 preferences:
   appearance_title: "外观与桌面体验"

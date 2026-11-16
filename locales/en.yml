@@ -158,10 +158,10 @@ agents:
   install: "Install"
   uninstall: "Uninstall"
   coming_soon: "Coming Soon"
-  ask_resolved: "ZCode Question Resolved"
-  ask_title: "ZCode Question"
+  ask_resolved: "%{agent} Question Resolved"
+  ask_title: "%{agent} Question"
   waiting_nod: "Waiting for nod..."
-  nod_count: "Nodded {} times"
+  nod_count: "Nodded %{count} times"
 
 preferences:
   appearance_title: "Appearance & Desktop"

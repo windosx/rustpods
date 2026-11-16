@@ -94,6 +94,19 @@ struct Cli {
     #[arg(long, hide = true, help = "Remove the installed ZCode AskUserQuestion hook")]
     zcode_hook_uninstall: bool,
 
+    #[arg(long, hide = true, help = "Codex PreToolUse hook: answer ask_question with head nods")]
+    codex_ask_hook: bool,
+
+    #[arg(
+        long,
+        hide = true,
+        help = "Install the Codex hook into ~/.codex/hooks.json"
+    )]
+    codex_hook_install: bool,
+
+    #[arg(long, hide = true, help = "Remove the installed Codex hook")]
+    codex_hook_uninstall: bool,
+
     #[arg(
         long,
         hide = true,
@@ -366,10 +379,10 @@ fn main() {
         return;
     }
 
-    // ZCode plumbing. These run standalone (no GTK, no Bluetooth, no instance
-    // lock) because the hook fires while ZCode is already talking to the real
+    // Agent hooks plumbing. These run standalone (no GTK, no Bluetooth, no instance
+    // lock) because the hook fires while ZCode / Codex is already talking to the real
     // daemon over the socket.
-    if cli.zcode_ask_hook {
+    if cli.zcode_ask_hook || cli.codex_ask_hook {
         let code = rt.block_on(system::zcode_ask::run_hook_mode());
         std::process::exit(code);
     }
@@ -388,6 +401,26 @@ fn main() {
             Ok(()) => info!("ZCode hook removed"),
             Err(e) => {
                 error!("Removing the ZCode hook failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if cli.codex_hook_install {
+        match system::codex_ask::install_hook() {
+            Ok(()) => info!("Codex hook installed"),
+            Err(e) => {
+                error!("Installing the Codex hook failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if cli.codex_hook_uninstall {
+        match system::codex_ask::uninstall_hook() {
+            Ok(()) => info!("Codex hook removed"),
+            Err(e) => {
+                error!("Removing the Codex hook failed: {}", e);
                 std::process::exit(1);
             }
         }

@@ -786,10 +786,28 @@ impl HeadTracker {
         self.samples_seen
     }
 
+    /// True if samples have arrived recently (within 1.5 seconds) and the tracker is active.
+    pub fn is_streaming(&self) -> bool {
+        self.active
+            && self
+                .sample_times
+                .back()
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(1500))
+    }
+
+    /// Timestamp of the most recently parsed sample, if any.
+    pub fn last_sample_time(&self) -> Option<Instant> {
+        self.sample_times.back().copied()
+    }
+
     /// Sample rate over the recent window, or `None` until enough samples have
-    /// arrived to measure it.
+    /// arrived to measure it (or if no sample has arrived in the last 1.5 seconds).
     pub fn sample_rate_hz(&self) -> Option<f32> {
         if self.sample_times.len() < 2 {
+            return None;
+        }
+        let newest = self.sample_times.back()?;
+        if newest.elapsed() >= std::time::Duration::from_millis(1500) {
             return None;
         }
         let oldest = self.sample_times.front()?;
@@ -885,6 +903,7 @@ impl HeadTracker {
             ));
         }
 
+        self.active = true;
         self.samples_seen += 1;
         if self.sample_times.len() >= RATE_WINDOW {
             self.sample_times.pop_front();
@@ -1097,6 +1116,7 @@ impl HeadTracker {
         let attitude = self.attitude.update(gyro, gravity);
 
         self.calibrated = true;
+        self.active = true;
         self.samples_seen += 1;
         if self.sample_times.len() >= RATE_WINDOW {
             self.sample_times.pop_front();
@@ -1158,6 +1178,7 @@ impl HeadTracker {
         let roll = (gz / magnitude).clamp(-1.0, 1.0).asin().to_degrees();
 
         self.calibrated = true;
+        self.active = true;
         self.samples_seen += 1;
         if self.sample_times.len() >= RATE_WINDOW {
             self.sample_times.pop_front();
@@ -1791,6 +1812,25 @@ mod tests {
         tracker.parse_packet(&frame(1000, 2000, 2000, 0, 0));
         let rate = tracker.sample_rate_hz().expect("two samples give a rate");
         assert!(rate > 0.0 && rate.is_finite(), "rate={}", rate);
+        assert!(tracker.is_streaming(), "tracker should be streaming right after packets");
+    }
+
+    #[test]
+    fn sample_rate_and_is_streaming_expire_after_silence() {
+        let mut tracker = calibrated_tracker();
+        tracker.parse_packet(&frame(1000, 2000, 2000, 0, 0));
+        tracker.parse_packet(&frame(1000, 2000, 2000, 0, 0));
+        assert!(tracker.sample_rate_hz().is_some());
+        assert!(tracker.is_streaming());
+
+        // Simulate 2 seconds of silence
+        let past = Instant::now() - std::time::Duration::from_secs(2);
+        for t in tracker.sample_times.iter_mut() {
+            *t = past;
+        }
+
+        assert!(tracker.sample_rate_hz().is_none(), "sample rate should be None when stream is silent");
+        assert!(!tracker.is_streaming(), "is_streaming should be false when stream is silent");
     }
 
     #[test]

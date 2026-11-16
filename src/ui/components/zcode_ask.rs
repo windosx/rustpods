@@ -1,11 +1,11 @@
-use crate::system::zcode_ask::AskProgress;
+use crate::system::zcode_ask::{AskProgress, ResolvedNote};
 use crate::ui::theme::{control_card, ApplePalette};
 use gpui_kit::component::Icon;
 use gpui_kit::{div, px, FontWeight, IntoElement, ParentElement as _, Styled as _};
 
 pub fn render_zcode_ask_card(
     progress: Option<&AskProgress>,
-    resolved: Option<&str>,
+    resolved: Option<&ResolvedNote>,
     p: &ApplePalette,
 ) -> Option<impl IntoElement> {
     match (progress, resolved) {
@@ -13,7 +13,7 @@ pub fn render_zcode_ask_card(
             let count_text = if ask.count == 0 {
                 rust_i18n::t!("agents.waiting_nod").to_string()
             } else {
-                format!("{}: {}", rust_i18n::t!("agents.nod_count"), ask.count)
+                rust_i18n::t!("agents.nod_count", count = ask.count).to_string()
             };
 
             let card = control_card(p)
@@ -45,7 +45,7 @@ pub fn render_zcode_ask_card(
                                         .text_size(px(14.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(p.text_primary)
-                                        .child(rust_i18n::t!("agents.ask_title")),
+                                        .child(rust_i18n::t!("agents.ask_title", agent = ask.agent.as_str())),
                                 ),
                         )
                         .child(
@@ -119,7 +119,7 @@ pub fn render_zcode_ask_card(
 
             Some(card)
         }
-        (None, Some(resolved_text)) => {
+        (None, Some(resolved_note)) => {
             let card = control_card(p)
                 .border_color(p.accent_green.opacity(0.45))
                 .flex()
@@ -141,14 +141,14 @@ pub fn render_zcode_ask_card(
                                 .text_size(px(14.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(p.text_primary)
-                                .child("ZCode 提问"),
+                                .child(rust_i18n::t!("agents.ask_resolved", agent = resolved_note.agent.as_str())),
                         ),
                 )
                 .child(
                     div()
                         .text_size(px(13.5))
                         .text_color(p.text_primary)
-                        .child(resolved_text.to_string()),
+                        .child(resolved_note.text.clone()),
                 );
             Some(card)
         }

@@ -7,7 +7,7 @@ use crate::system::config::{
     save_config, AppConfig, AppLanguage, HeadMouseMode, PauseBehavior, StemAction,
 };
 use crate::system::head_mouse::{HeadMouseCommand, HEAD_MOUSE};
-use crate::system::zcode_ask::{self, AskProgress, AskReply};
+use crate::system::zcode_ask::{self, AskProgress, AskReply, ResolvedNote};
 use crate::ui::UiEvent;
 use gpui_kit::component::ThemeMode;
 use std::collections::HashMap;
@@ -272,12 +272,17 @@ impl RustPodsController {
         value
     }
 
-    pub fn start_zcode_test(&self) -> tokio::sync::oneshot::Receiver<Result<AskReply, String>> {
+    pub fn start_agent_test(&self, agent_name: &str) -> tokio::sync::oneshot::Receiver<Result<AskReply, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let agent = agent_name.to_string();
         self.rt.spawn(async move {
-            let _ = tx.send(zcode_ask::run_test_question().await);
+            let _ = tx.send(zcode_ask::run_test_question(&agent).await);
         });
         rx
+    }
+
+    pub fn start_zcode_test(&self) -> tokio::sync::oneshot::Receiver<Result<AskReply, String>> {
+        self.start_agent_test("ZCode")
     }
 
     pub fn toggle_head_mouse(&self, enabled: bool) {
@@ -422,7 +427,7 @@ pub struct RustPodsState {
     pub is_connecting: bool,
     pub head_tracking: HeadTrackingViewState,
     pub zcode_progress: Option<AskProgress>,
-    pub zcode_resolved: Option<String>,
+    pub zcode_resolved: Option<ResolvedNote>,
     pub active_page: NavPage,
     pub theme_mode: ThemeMode,
     pub update_state: crate::system::updater::UpdateState,

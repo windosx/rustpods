@@ -1,10 +1,12 @@
 use crate::core::aacp::events::EarStatus;
+use crate::ui::popup::model_image_asset;
 use crate::ui::state::RustPodsState;
 use crate::ui::theme::{control_card, ApplePalette};
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::Icon;
+use gpui_kit::gpui::img;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, Anchor, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _,
@@ -29,6 +31,7 @@ pub fn render_hero_card(
     };
 
     let subtitle_text = format!("{} • {}", dev.capabilities.name, dev.mac_address);
+    let (asset_path, is_max) = model_image_asset(dev.model);
 
     let app_for_rename = app_state.clone();
     let input_for_rename = rename_input.clone();
@@ -45,19 +48,16 @@ pub fn render_hero_card(
         .gap(px(10.))
         .child(
             div()
-                .w(px(76.))
-                .h(px(76.))
-                .rounded(px(999.))
-                .bg(p.accent_blue.opacity(if p.is_dark { 0.16 } else { 0.12 }))
-                .border_1()
-                .border_color(p.accent_blue.opacity(0.28))
+                .w_full()
+                .h(px(if is_max { 140. } else { 120. }))
                 .flex()
                 .items_center()
                 .justify_center()
                 .child(
-                    Icon::new(gpui_kit::assets::IconName::Headphones)
-                        .size(px(38.))
-                        .text_color(p.accent_blue),
+                    img(asset_path)
+                        .w(px(if is_max { 130. } else { 240. }))
+                        .h(px(if is_max { 140. } else { 120. }))
+                        .opacity(if dev.is_connected { 1.0 } else { 0.75 }),
                 ),
         )
         .child(

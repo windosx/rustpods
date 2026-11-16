@@ -70,7 +70,7 @@ pub fn render_agents_page(
                                 agent_id,
                                 "Test in progress: nod to answer, or wait...".to_string(),
                             );
-                            let rx = s.controller.start_zcode_test();
+                            let rx = s.controller.start_agent_test(agent.display_name);
                             cx.notify();
 
                             cx.spawn(async move |this, cx| {
@@ -80,6 +80,9 @@ pub fn render_agents_page(
                                 let msg = match result {
                                     Ok(AskReply::Select { index, label }) => {
                                         format!("Test passed: selected #{} \"{}\"", index + 1, label)
+                                    }
+                                    Ok(AskReply::BatchSelect { selections }) => {
+                                        format!("Test passed: completed {} questions", selections.len())
                                     }
                                     Ok(AskReply::Pass) => {
                                         "Test completed: passed through".to_string()

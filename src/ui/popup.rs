@@ -37,6 +37,23 @@ pub fn model_animation_asset(model: AirPodsModel) -> (&'static str, bool) {
     }
 }
 
+pub fn model_image_asset(model: AirPodsModel) -> (&'static str, bool) {
+    match model {
+        AirPodsModel::AirPods1 => ("models/airpods_1.png", false),
+        AirPodsModel::AirPods2 => ("models/airpods_2.png", false),
+        AirPodsModel::AirPods3 => ("models/airpods_3.png", false),
+        AirPodsModel::AirPods4 | AirPodsModel::AirPods4Anc => ("models/airpods_4.png", false),
+        AirPodsModel::AirPodsPro1 => ("models/airpods_pro.png", false),
+        AirPodsModel::AirPodsPro2Lightning | AirPodsModel::AirPodsPro2UsbC => {
+            ("models/airpods_pro_2.png", false)
+        }
+        AirPodsModel::AirPodsMax | AirPodsModel::AirPodsMaxUsbC => {
+            ("models/airpods_max.png", true)
+        }
+        AirPodsModel::Unknown(_) => ("models/airpods_3.png", false),
+    }
+}
+
 pub struct CasePopupWindow {
     app_state: Entity<RustPodsState>,
     started_at: Instant,

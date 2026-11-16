@@ -8,7 +8,7 @@
 //! ships first; Codex and friends slot in as new entries without touching the
 //! UI or the answering engine.
 
-use crate::system::zcode_ask;
+use crate::system::{codex_ask, zcode_ask};
 use std::sync::LazyLock;
 
 /// Whether an agent's hook is wired into that agent's configuration.
@@ -69,23 +69,16 @@ fn zcode_hook() -> AgentHook {
     }
 }
 
-/// Placeholder so the settings page already shows the intent; picking an
-/// actual Codex integration point (its config has no PreToolUse-style hook
-/// today) is deliberately deferred until there is one to wire.
 fn codex_hook() -> AgentHook {
     AgentHook {
         id: "codex",
         display_name: "Codex",
-        description: "暂未提供接入点",
-        available: false,
-        install: unsupported,
-        uninstall: unsupported,
-        status: || HookInstallStatus::NotInstalled,
+        description: "点头回答 Codex / ChatGPT 的选择题",
+        available: true,
+        install: codex_ask::install_hook,
+        uninstall: codex_ask::uninstall_hook,
+        status: codex_ask::hook_status,
     }
-}
-
-fn unsupported() -> Result<(), String> {
-    Err("该智能体的接入尚未实现".to_string())
 }
 
 #[cfg(test)]
@@ -99,9 +92,7 @@ mod tests {
         assert_eq!(agents[0].id, "zcode");
         assert!(agents[0].available);
         assert_eq!(agents[1].id, "codex");
-        assert!(!agents[1].available);
-        // Placeholders must not pretend to install.
-        assert!(agents[1].install().is_err());
+        assert!(agents[1].available);
     }
 
     #[test]

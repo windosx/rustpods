@@ -185,17 +185,25 @@ impl Render for AskPopupWindow {
                                             .text_size(px(14.5))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(p.text_primary)
-                                            .child(if is_resolved_only {
-                                                rust_i18n::t!("agents.ask_resolved")
-                                            } else {
-                                                rust_i18n::t!("agents.ask_title")
+                                            .child({
+                                                let agent_name = progress
+                                                    .as_ref()
+                                                    .map(|p| p.agent.as_str())
+                                                    .or_else(|| resolved.as_ref().map(|r| r.agent.as_str()))
+                                                    .filter(|s| !s.is_empty())
+                                                    .unwrap_or("Agent");
+                                                if is_resolved_only {
+                                                    rust_i18n::t!("agents.ask_resolved", agent = agent_name)
+                                                } else {
+                                                    rust_i18n::t!("agents.ask_title", agent = agent_name)
+                                                }
                                             }),
                                     )
                                     .when_some(progress.as_ref(), |this, ask| {
                                         let count_text = if ask.count == 0 {
                                             rust_i18n::t!("agents.waiting_nod").to_string()
                                         } else {
-                                            format!("{}: {}", rust_i18n::t!("agents.nod_count"), ask.count)
+                                            rust_i18n::t!("agents.nod_count", count = ask.count).to_string()
                                         };
                                         this.child(
                                             div()
@@ -409,7 +417,7 @@ impl Render for AskPopupWindow {
                                     .text_size(px(13.5))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(p.accent_green)
-                                    .child(note.clone()),
+                                    .child(note.text.clone()),
                             )
                             .child(
                                 div()

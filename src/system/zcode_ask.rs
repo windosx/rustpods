@@ -74,9 +74,22 @@ pub struct HookQuestion {
     pub multi_select: bool,
 }
 
+fn default_agent_name() -> String {
+    "Agent".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookRequest {
     pub questions: Vec<HookQuestion>,
+    #[serde(default = "default_agent_name")]
+    pub agent: String,
+}
+
+/// One question selection from a multi-question batch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SingleSelection {
+    pub index: usize,
+    pub label: String,
 }
 
 /// RustPods → hook reply.
@@ -85,7 +98,9 @@ pub struct HookRequest {
 pub enum AskReply {
     /// The wearer nodded `index + 1` times; the label is the selected option.
     Select { index: usize, label: String },
-    /// Cancelled, timed out, or unanswerable: let ZCode ask normally.
+    /// Selected multiple questions in sequence.
+    BatchSelect { selections: Vec<SingleSelection> },
+    /// Cancelled, timed out, or unanswerable: let the agent ask normally.
     Pass,
 }
 
@@ -121,52 +136,136 @@ fn sanitize_payload_text(s: &str) -> String {
     out
 }
 
-pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
-    let questions = value
-        .get("tool_input")
-        .and_then(|t| t.get("questions"))
-        .or_else(|| value.get("questions"))?
-        .as_array()?;
-
-    let mut out = Vec::new();
-    for q in questions {
-        let options = match q.get("options") {
-            Some(serde_json::Value::Array(opts)) => {
-                let mut labels = Vec::new();
-                for o in opts {
-                    match o {
-                        serde_json::Value::String(s) => labels.push(sanitize_payload_text(s)),
-                        serde_json::Value::Object(_) => {
-                            labels.push(sanitize_payload_text(
-                                o.get("label")?.as_str()?,
-                            ));
-                        }
-                        _ => return None,
+fn parse_options_from(obj: &serde_json::Value) -> Option<Vec<String>> {
+    match obj.get("options") {
+        Some(serde_json::Value::Array(opts)) => {
+            let mut labels = Vec::new();
+            for o in opts {
+                match o {
+                    serde_json::Value::String(s) => labels.push(sanitize_payload_text(s)),
+                    serde_json::Value::Object(_) => {
+                        labels.push(sanitize_payload_text(o.get("label")?.as_str()?));
                     }
+                    _ => return None,
                 }
-                labels
             }
-            _ => Vec::new(),
-        };
-        out.push(HookQuestion {
-            question: sanitize_payload_text(
-                q.get("question")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default(),
-            ),
-            header: sanitize_payload_text(
-                q.get("header")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default(),
-            ),
-            options,
-            multi_select: q
-                .get("multiSelect")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            Some(labels)
+        }
+        _ => Some(Vec::new()),
+    }
+}
+
+pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
+    let mut tool_input_val: Option<serde_json::Value> = None;
+    if let Some(ti) = value.get("tool_input") {
+        if let Some(s) = ti.as_str() {
+            if let Ok(parsed) = serde_json::from_str(s) {
+                tool_input_val = Some(parsed);
+            }
+        } else if ti.is_object() {
+            tool_input_val = Some(ti.clone());
+        }
+    } else if let Some(args) = value.get("arguments") {
+        if let Some(s) = args.as_str() {
+            if let Ok(parsed) = serde_json::from_str(s) {
+                tool_input_val = Some(parsed);
+            }
+        } else if args.is_object() {
+            tool_input_val = Some(args.clone());
+        }
+    }
+    let tool_input = tool_input_val.as_ref().or_else(|| value.get("tool_input"));
+
+    let questions_array = tool_input
+        .and_then(|t| t.get("questions"))
+        .or_else(|| value.get("questions"))
+        .and_then(|q| q.as_array());
+
+    let tool_name = value
+        .get("tool_name")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    let agent = if let Some(a) = value
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        a.to_string()
+    } else if tool_name.contains("request_user_input") {
+        "Codex".to_string()
+    } else if tool_name.contains("AskUserQuestion") || tool_name.eq_ignore_ascii_case("askuserquestion") {
+        "ZCode".to_string()
+    } else {
+        "Agent".to_string()
+    };
+
+    if let Some(questions) = questions_array {
+        let mut out = Vec::new();
+        for q in questions {
+            let options = parse_options_from(q)?;
+            let q_str = q
+                .get("question")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| q.get("title").and_then(|v| v.as_str()))
+                .or_else(|| q.get("header").and_then(|v| v.as_str()))
+                .unwrap_or_default();
+            let header_str = q
+                .get("header")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| q.get("title").and_then(|v| v.as_str()))
+                .unwrap_or_default();
+            out.push(HookQuestion {
+                question: sanitize_payload_text(q_str),
+                header: sanitize_payload_text(header_str),
+                options,
+                multi_select: q
+                    .get("multiSelect")
+                    .or_else(|| q.get("multi_select"))
+                    .or_else(|| q.get("is_multi_select"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+        return Some(HookRequest {
+            questions: out,
+            agent,
         });
     }
-    Some(HookRequest { questions: out })
+
+    if let Some(ti) = tool_input {
+        let q_str_opt = ti
+            .get("question")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| ti.get("title").and_then(|v| v.as_str()));
+        if let Some(q_str) = q_str_opt {
+            let options = parse_options_from(ti)?;
+            let header_str = ti
+                .get("header")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| ti.get("title").and_then(|v| v.as_str()))
+                .unwrap_or_default();
+            return Some(HookRequest {
+                questions: vec![HookQuestion {
+                    question: sanitize_payload_text(q_str),
+                    header: sanitize_payload_text(header_str),
+                    options,
+                    multi_select: ti
+                        .get("multiSelect")
+                        .or_else(|| ti.get("multi_select"))
+                        .or_else(|| ti.get("is_multi_select"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                }],
+                agent,
+            });
+        }
+    }
+
+    None
 }
 
 /// Maps a committed nod count onto a reply. Nods within the option range pick
@@ -195,43 +294,15 @@ fn decision_for_commit(count: usize, options: &[String]) -> AskReply {
 /// is `ask`, which restores the normal ZCode question UI.
 fn hook_output_for(
     reply: &AskReply,
-    question: &str,
+    request: &HookRequest,
     tool_input: Option<&serde_json::Value>,
+    is_codex: bool,
 ) -> String {
     match reply {
         AskReply::Select { index, label } => {
-            // answers is keyed by the exact question text (M0e: answers =
-            // record<string>, validated non-blank; the native accept path
-            // writes {question: label}). Pull the raw strings from tool_input
-            // when available so sanitizing whitespace/newlines never mismatches
-            // the key in `questions[0]`.
-            let raw_q = tool_input
-                .and_then(|t| t.get("questions"))
-                .and_then(|qs| qs.get(0));
-            let answer_key = raw_q
-                .and_then(|q| q.get("question"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(question);
-            let answer_val = raw_q
-                .and_then(|q| q.get("options"))
-                .and_then(|opts| opts.get(*index))
-                .and_then(|opt| {
-                    opt.as_str()
-                        .or_else(|| opt.get("label").and_then(|l| l.as_str()))
-                })
-                .unwrap_or(label.as_str());
-            let answers = json!({ answer_key: answer_val });
-            let updated_input = match tool_input.and_then(|v| v.as_object()) {
-                Some(obj) => {
-                    let mut merged = obj.clone();
-                    merged.insert("answers".into(), answers);
-                    serde_json::Value::Object(merged)
-                }
-                None => json!({ "answers": answers }),
-            };
             let note = format!(
                 "【头部手势应答】用户点头 {} 次,选择第 {} 项「{}」。(RustPods 通过点头手势代答;\
-                 答案已写入工具输入的 answers 字段,直接继续即可;\
+                 答案已提供,直接继续即可;\
                  并在下一条回复的第一句向用户复述这个选择,例如「已按你的点头选择:第 {} 项「{}」。」)",
                 index + 1,
                 index + 1,
@@ -239,24 +310,149 @@ fn hook_output_for(
                 index + 1,
                 label
             );
-            json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": note,
-                    "additionalContext": note,
-                    "updatedInput": updated_input,
-                }
-            })
-            .to_string()
-        }
-        AskReply::Pass => json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "ask",
+            if is_codex {
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": note,
+                        "additionalContext": note,
+                    }
+                })
+                .to_string()
+            } else {
+                let raw_q = tool_input
+                    .and_then(|t| t.get("questions"))
+                    .and_then(|qs| qs.get(0));
+                let answer_key = raw_q
+                    .and_then(|q| q.get("question").or_else(|| q.get("title")))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| tool_input.and_then(|t| t.get("question")).and_then(|v| v.as_str()))
+                    .unwrap_or(request.questions.first().map(|q| q.question.as_str()).unwrap_or(""));
+                let answer_val = raw_q
+                    .and_then(|q| q.get("options"))
+                    .or_else(|| tool_input.and_then(|t| t.get("options")))
+                    .and_then(|opts| opts.get(*index))
+                    .and_then(|opt| {
+                        opt.as_str()
+                            .or_else(|| opt.get("label").and_then(|l| l.as_str()))
+                    })
+                    .unwrap_or(label.as_str());
+                let answers = json!({ answer_key: answer_val });
+                let updated_input = match tool_input.and_then(|v| v.as_object()) {
+                    Some(obj) => {
+                        let mut merged = obj.clone();
+                        merged.insert("answers".into(), answers);
+                        merged.insert("answer".into(), json!(answer_val));
+                        serde_json::Value::Object(merged)
+                    }
+                    None => json!({ "answers": answers, "answer": answer_val }),
+                };
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": note,
+                        "additionalContext": note,
+                        "updatedInput": updated_input,
+                    }
+                })
+                .to_string()
             }
-        })
-        .to_string(),
+        }
+        AskReply::BatchSelect { selections } => {
+            let mut note_items = Vec::new();
+            let mut answers_map = serde_json::Map::new();
+            let raw_qs = tool_input
+                .and_then(|t| t.get("questions"))
+                .and_then(|qs| qs.as_array());
+
+            for (i, sel) in selections.iter().enumerate() {
+                let q_info = request.questions.get(i);
+                let q_title = q_info
+                    .map(|q| {
+                        if !q.header.is_empty() {
+                            q.header.as_str()
+                        } else {
+                            q.question.as_str()
+                        }
+                    })
+                    .unwrap_or("问题");
+                note_items.push(format!("{}.「{}」选择第 {} 项「{}」", i + 1, q_title, sel.index + 1, sel.label));
+
+                let answer_key = raw_qs
+                    .and_then(|qs| qs.get(i))
+                    .and_then(|raw_q| {
+                        raw_q.get("question")
+                            .or_else(|| raw_q.get("title"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .unwrap_or(q_info.map(|q| q.question.as_str()).unwrap_or(""));
+                answers_map.insert(answer_key.to_string(), json!(sel.label));
+            }
+
+            let note = format!(
+                "【头部手势应答】用户点头完成了 {} 道选择题：{}。(RustPods 通过点头手势代答;\
+                 答案已提供,直接继续即可;\
+                 并在下一条回复的第一句向用户复述这些选择。)",
+                selections.len(),
+                note_items.join("；")
+            );
+
+            if is_codex {
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": note,
+                        "additionalContext": note,
+                    }
+                })
+                .to_string()
+            } else {
+                let answers = serde_json::Value::Object(answers_map);
+                let updated_input = match tool_input.and_then(|v| v.as_object()) {
+                    Some(obj) => {
+                        let mut merged = obj.clone();
+                        merged.insert("answers".into(), answers);
+                        if let Some(first) = selections.first() {
+                            merged.insert("answer".into(), json!(first.label));
+                        }
+                        serde_json::Value::Object(merged)
+                    }
+                    None => json!({ "answers": answers }),
+                };
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": note,
+                        "additionalContext": note,
+                        "updatedInput": updated_input,
+                    }
+                })
+                .to_string()
+            }
+        }
+        AskReply::Pass => {
+            if is_codex {
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                    }
+                })
+                .to_string()
+            } else {
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "ask",
+                    }
+                })
+                .to_string()
+            }
+        }
     }
 }
 
@@ -270,10 +466,18 @@ static NEXT_ASK_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, PartialEq)]
 pub struct AskProgress {
     pub id: u64,
+    pub agent: String,
     pub question: String,
     pub header: String,
     pub options: Vec<String>,
     pub count: usize,
+}
+
+/// What the UI shows briefly once a question has been answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedNote {
+    pub text: String,
+    pub agent: String,
 }
 
 struct PendingAsk {
@@ -289,7 +493,7 @@ struct PendingAsk {
 pub struct AskHub {
     pending: Mutex<Option<PendingAsk>>,
     progress: Mutex<Option<AskProgress>>,
-    resolved: Mutex<Option<(String, Instant)>>,
+    resolved: Mutex<Option<(ResolvedNote, Instant)>>,
     last_pose: Mutex<Option<Instant>>,
     notify: tokio::sync::Notify,
 }
@@ -365,16 +569,16 @@ impl AskHub {
 
     /// Programmatically select an option by index (e.g. from popup click).
     pub fn resolve_by_index(&self, index: usize) {
-        let (id, label) = {
+        let (id, label, agent) = {
             let progress = self.progress.lock().unwrap();
             let Some(p) = progress.as_ref() else { return };
             if index >= p.options.len() { return };
-            (p.id, p.options[index].clone())
+            (p.id, p.options[index].clone(), p.agent.clone())
         };
         if let Some(pending) = self.take_pending(id) {
             let note = format!("已选择第 {} 项「{}」", index + 1, label);
             let _ = pending.reply.send(AskReply::Select { index, label });
-            self.mark_resolved(note);
+            self.mark_resolved(note, agent);
             self.clear_progress(id);
         }
     }
@@ -398,18 +602,18 @@ impl AskHub {
     }
 
     /// Marks a choice as made, so the UI can confirm it briefly.
-    pub fn mark_resolved(&self, text: String) {
-        *self.resolved.lock().unwrap() = Some((text, Instant::now()));
+    pub fn mark_resolved(&self, text: String, agent: String) {
+        *self.resolved.lock().unwrap() = Some((ResolvedNote { text, agent }, Instant::now()));
         self.notify.notify_waiters();
     }
 
     /// The confirmation text, if one was made recently enough to still show.
-    pub fn resolved_note(&self) -> Option<String> {
+    pub fn resolved_note(&self) -> Option<ResolvedNote> {
         let resolved = self.resolved.lock().unwrap();
         resolved
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
-            .map(|(text, _)| text.clone())
+            .map(|(note, _)| note.clone())
     }
 
     /// Records that a pose sample just arrived.
@@ -557,25 +761,35 @@ async fn ask_from_stream(stream: &mut tokio::net::UnixStream) -> Option<AskReply
     if buf.is_empty() {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_slice(&buf).ok()?;
-    let request = parse_questions(&value)?;
+    let request: HookRequest = if let Ok(req) = serde_json::from_slice::<HookRequest>(&buf) {
+        if req.questions.is_empty() {
+            let value: serde_json::Value = serde_json::from_slice(&buf).ok()?;
+            parse_questions(&value)?
+        } else {
+            req
+        }
+    } else {
+        let value: serde_json::Value = serde_json::from_slice(&buf).ok()?;
+        parse_questions(&value)?
+    };
     Some(ask_core(request).await)
 }
 
 /// The shared question pipeline: validate, gate, register, wait for the
 /// gesture task. Both the socket handler and the settings page's test button
 /// come through here, so a test exercises exactly what a live question does.
+/// Supports answering multiple single-select questions in sequence.
 async fn ask_core(request: HookRequest) -> AskReply {
-    // Only single-select questions with options can be nodded at; everything
-    // else (multi-select, multi-question calls) goes straight back.
-    if request.questions.len() != 1 {
+    if request.questions.is_empty() {
         return AskReply::Pass;
     }
-    let Some(q) = request.questions.into_iter().next() else {
-        return AskReply::Pass;
-    };
-    if q.multi_select || q.options.is_empty() {
-        return AskReply::Pass;
+    // Only single-select questions with options can be nodded at; anything else
+    // (multi-select or open-ended questions) goes straight back to the agent UI.
+    for q in &request.questions {
+        if q.multi_select || q.options.is_empty() {
+            info!("Question batch passed through: contains multi_select or empty options");
+            return AskReply::Pass;
+        }
     }
 
     // The wearer is not streaming (buds off, not connected): do not pretend a
@@ -591,50 +805,93 @@ async fn ask_core(request: HookRequest) -> AskReply {
         return AskReply::Pass;
     }
 
-    let id = NEXT_ASK_ID.fetch_add(1, Ordering::SeqCst);
-    let progress = AskProgress {
-        id,
-        question: q.question.clone(),
-        header: q.header.clone(),
-        options: q.options.clone(),
-        count: 0,
-    };
-    let (tx, rx) = oneshot::channel();
-    if !ASK_HUB.register(progress, tx) {
-        return AskReply::Pass;
-    }
-    info!(
-        "Question pending: {:?} with {} options (id {}, sensitivity {})",
-        q.question,
-        q.options.len(),
-        id,
-        crate::core::nod_counter::sensitivity()
-    );
+    let total = request.questions.len();
+    let mut selections = Vec::new();
 
-    match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-        Ok(Ok(reply)) => {
-            info!("Question {} resolved: {:?}", id, reply);
-            ASK_HUB.clear_progress(id);
-            reply
+    for (idx, q) in request.questions.into_iter().enumerate() {
+        if idx > 0 {
+            // Brief pause between questions to let the head stabilize to neutral posture.
+            tokio::time::sleep(Duration::from_millis(600)).await;
         }
-        // Timeout, or the pose task vanished without answering. `abandon`
-        // clears the registration itself so the next question can register.
-        // Whether the pose stream was still alive at the end distinguishes
-        // "the wearer never gestured" from "gestures could not be seen".
-        _ => {
-            warn!(
-                "Question {} timed out; passing through (tracking_fresh={})",
-                id,
-                ASK_HUB.tracking_fresh()
-            );
-            ASK_HUB.abandon(id);
-            AskReply::Pass
+
+        let id = NEXT_ASK_ID.fetch_add(1, Ordering::SeqCst);
+        let header = if total > 1 {
+            if q.header.is_empty() {
+                format!("[{}/{}]", idx + 1, total)
+            } else {
+                format!("[{}/{}] {}", idx + 1, total, q.header)
+            }
+        } else {
+            q.header.clone()
+        };
+
+        let progress = AskProgress {
+            id,
+            agent: request.agent.clone(),
+            question: q.question.clone(),
+            header,
+            options: q.options.clone(),
+            count: 0,
+        };
+        let (tx, rx) = oneshot::channel();
+        if !ASK_HUB.register(progress, tx) {
+            return AskReply::Pass;
         }
+        info!(
+            "Question pending [{}/{}]: {:?} with {} options (id {}, sensitivity {})",
+            idx + 1,
+            total,
+            q.question,
+            q.options.len(),
+            id,
+            crate::core::nod_counter::sensitivity()
+        );
+
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(AskReply::Select { index, label })) => {
+                info!(
+                    "Question [{}/{}] {} resolved: option {} ({:?})",
+                    idx + 1,
+                    total,
+                    id,
+                    index + 1,
+                    label
+                );
+                ASK_HUB.clear_progress(id);
+                selections.push(SingleSelection { index, label });
+            }
+            Ok(Ok(_)) => {
+                info!("Question [{}/{}] {} passed or cancelled", idx + 1, total, id);
+                ASK_HUB.clear_progress(id);
+                return AskReply::Pass;
+            }
+            _ => {
+                warn!(
+                    "Question [{}/{}] {} timed out; passing through (tracking_fresh={})",
+                    idx + 1,
+                    total,
+                    id,
+                    ASK_HUB.tracking_fresh()
+                );
+                ASK_HUB.abandon(id);
+                return AskReply::Pass;
+            }
+        }
+    }
+
+    if selections.len() == 1 {
+        let first = selections.remove(0);
+        AskReply::Select {
+            index: first.index,
+            label: first.label,
+        }
+    } else {
+        AskReply::BatchSelect { selections }
     }
 }
 
 /// The sample question the test button and the CLI simulator use.
-fn sample_question_request() -> HookRequest {
+pub fn sample_question_request(agent: &str) -> HookRequest {
     HookRequest {
         questions: vec![HookQuestion {
             question: "模拟提问:这是一个用于测试点头应答的示例问题".into(),
@@ -642,14 +899,19 @@ fn sample_question_request() -> HookRequest {
             options: vec!["第一个选项".into(), "第二个选项".into(), "第三个选项".into()],
             multi_select: false,
         }],
+        agent: if agent.trim().is_empty() {
+            "Agent".into()
+        } else {
+            agent.into()
+        },
     }
 }
 
 /// Pushes the sample question through the real answering pipeline from inside
 /// the process. Returns the decision once the wearer nods, cancels, or the
 /// question passes through (not worn, not installed, timed out).
-pub async fn run_test_question() -> Result<AskReply, String> {
-    Ok(ask_core(sample_question_request()).await)
+pub async fn run_test_question(agent: &str) -> Result<AskReply, String> {
+    Ok(ask_core(sample_question_request(agent)).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -764,13 +1026,21 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
 /// Delivers a decision for the pending question, if it is still ours to
 /// answer, and tidies the shared state.
 fn resolve_question(id: u64, reply: AskReply) {
+    let agent_name = ASK_HUB
+        .progress_snapshot()
+        .map(|p| p.agent)
+        .unwrap_or_else(|| "Agent".to_string());
     let note = match &reply {
         AskReply::Select { index, label } => format!("✓ 已选择第 {} 项「{}」", index + 1, label),
-        AskReply::Pass => "已取消,请在 ZCode 中手动作答".to_string(),
+        AskReply::BatchSelect { selections } => {
+            let last = selections.last().map(|s| s.label.as_str()).unwrap_or("");
+            format!("✓ 全部完成「{}」", last)
+        }
+        AskReply::Pass => format!("已取消,请在 {} 中手动作答", agent_name),
     };
     if let Some(pending) = ASK_HUB.take_pending(id) {
         if pending.reply.send(reply).is_ok() {
-            ASK_HUB.mark_resolved(note.clone());
+            ASK_HUB.mark_resolved(note, agent_name);
         } else {
             // The server timed out first and already answered pass-through:
             // the choice is moot, so the card must not claim it was applied.
@@ -783,13 +1053,13 @@ fn resolve_question(id: u64, reply: AskReply) {
 }
 
 // ---------------------------------------------------------------------------
-// Hook process (`rustpods --zcode-ask-hook`)
+// Hook process (`rustpods --zcode-ask-hook` or `rustpods --codex-ask-hook`)
 // ---------------------------------------------------------------------------
 
-/// Entry point of the ZCode hook command.
+/// Entry point of the agent hook command.
 ///
 /// Reads the hook payload from stdin, asks RustPods for a decision, and prints
-/// the hook output JSON. Any failure exits 0 with no output, which ZCode
+/// the hook output JSON. Any failure exits 0 with no output, which the host agent
 /// treats as "hook passed, carry on normally".
 pub async fn run_hook_mode() -> i32 {
     let payload = match read_stdin_with_timeout().await {
@@ -799,27 +1069,46 @@ pub async fn run_hook_mode() -> i32 {
     let value: serde_json::Value = match serde_json::from_str(&payload) {
         Ok(value) => value,
         Err(e) => {
-            debug!("zcode-ask-hook: unreadable payload: {}", e);
+            debug!("ask-hook: unreadable payload: {}", e);
             return 0;
         }
     };
     let Some(request) = parse_questions(&value) else {
         return 0;
     };
-    if request.questions.len() != 1 {
-        // Nothing gesturable here; the normal UI handles it.
+    if request.questions.is_empty() {
         return 0;
     }
 
+    let tool_name = value
+        .get("tool_name")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    let is_codex = std::env::args().any(|a| a == crate::system::codex_ask::HOOK_ARG_MARKER)
+        || tool_name.contains("request_user_input");
+    let is_zcode = std::env::args().any(|a| a == crate::system::zcode_ask::HOOK_ARG_MARKER)
+        || tool_name.contains("AskUserQuestion")
+        || tool_name.eq_ignore_ascii_case("askuserquestion");
+
+    let mut request = request;
+    if is_codex {
+        request.agent = "Codex".to_string();
+    } else if is_zcode {
+        request.agent = "ZCode".to_string();
+    } else if request.agent.is_empty() || request.agent == "Agent" {
+        request.agent = "Agent".to_string();
+    }
+
     debug!(
-        "zcode-ask-hook: forwarding a question with {} options",
-        request.questions[0].options.len()
+        "ask-hook: forwarding {} question(s) (is_codex={})",
+        request.questions.len(),
+        is_codex
     );
 
     let mut stream = match tokio::time::timeout(HOOK_CONNECT_TIMEOUT, tokio::net::UnixStream::connect(socket_path())).await {
         Ok(Ok(stream)) => stream,
         _ => {
-            debug!("zcode-ask-hook: RustPods socket not reachable; passing through");
+            debug!("ask-hook: RustPods socket not reachable; passing through");
             return 0;
         }
     };
@@ -840,7 +1129,7 @@ pub async fn run_hook_mode() -> i32 {
     };
     match tokio::time::timeout(HOOK_REPLY_TIMEOUT, read_reply).await {
         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
-            warn!("zcode-ask-hook: no reply from RustPods; passing through");
+            warn!("ask-hook: no reply from RustPods; passing through");
             return 0;
         }
         Ok(Ok(_)) => {}
@@ -849,7 +1138,7 @@ pub async fn run_hook_mode() -> i32 {
     let reply: AskReply = match serde_json::from_slice(&buf) {
         Ok(reply) => reply,
         Err(e) => {
-            warn!("zcode-ask-hook: undecipherable reply: {}", e);
+            warn!("ask-hook: undecipherable reply: {}", e);
             return 0;
         }
     };
@@ -859,7 +1148,7 @@ pub async fn run_hook_mode() -> i32 {
         .or_else(|| value.get("questions").map(|_| &value));
     println!(
         "{}",
-        hook_output_for(&reply, &request.questions[0].question, tool_input)
+        hook_output_for(&reply, &request, tool_input, is_codex)
     );
     0
 }
@@ -1142,7 +1431,7 @@ pub fn uninstall_hook() -> Result<(), String> {
 /// Pushes a sample question through the socket, for testing the gesture path
 /// without ZCode or Bluetooth.
 pub async fn run_simulate() -> i32 {
-    let request = sample_question_request();
+    let request = sample_question_request("Agent");
 
     let mut stream = match tokio::net::UnixStream::connect(socket_path()).await {
         Ok(stream) => stream,
@@ -1265,6 +1554,96 @@ mod tests {
     }
 
     #[test]
+    fn parse_questions_accepts_codex_single_question_shape() {
+        let payload: Value = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "ask_question",
+            "tool_input": {
+                "question": "Which language?",
+                "options": ["Rust", "Python", "Go"],
+                "is_multi_select": false
+            }
+        });
+        let req = parse_questions(&payload).unwrap();
+        assert_eq!(req.questions.len(), 1);
+        assert_eq!(req.questions[0].question, "Which language?");
+        assert_eq!(req.questions[0].options, vec!["Rust", "Python", "Go"]);
+        assert!(!req.questions[0].multi_select);
+    }
+
+    #[test]
+    fn parse_questions_accepts_codex_request_user_input_async_with_title() {
+        let payload: Value = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "request_user_input_async",
+            "tool_input": {
+                "questions": [{
+                    "title": "如果现在有一小时空闲，你最想怎么放松？",
+                    "options": ["听音乐", "看电影或剧", "出去走走", "和朋友聊天"]
+                }]
+            }
+        });
+        let req = parse_questions(&payload).unwrap();
+        assert_eq!(req.questions.len(), 1);
+        assert_eq!(req.agent, "Codex");
+        assert_eq!(req.questions[0].question, "如果现在有一小时空闲，你最想怎么放松？");
+        assert_eq!(req.questions[0].header, "如果现在有一小时空闲，你最想怎么放松？");
+        assert_eq!(req.questions[0].options.len(), 4);
+    }
+
+    #[test]
+    fn parse_questions_accepts_multi_questions() {
+        let payload: Value = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {
+                "questions": [
+                    {
+                        "question": "Q1",
+                        "header": "H1",
+                        "options": ["A1", "A2"]
+                    },
+                    {
+                        "question": "Q2",
+                        "header": "H2",
+                        "options": ["B1", "B2"]
+                    }
+                ]
+            }
+        });
+        let req = parse_questions(&payload).unwrap();
+        assert_eq!(req.questions.len(), 2);
+        assert_eq!(req.agent, "ZCode");
+        assert_eq!(req.questions[0].question, "Q1");
+        assert_eq!(req.questions[1].question, "Q2");
+    }
+
+    #[test]
+    fn parse_questions_preserves_agent_field() {
+        let payload: Value = serde_json::json!({
+            "questions": [{
+                "question": "Q?",
+                "header": "H",
+                "options": ["1", "2"]
+            }],
+            "agent": "Codex"
+        });
+        let req = parse_questions(&payload).unwrap();
+        assert_eq!(req.agent, "Codex");
+
+        let zcode_payload: Value = serde_json::json!({
+            "questions": [{
+                "question": "Q?",
+                "header": "H",
+                "options": ["1", "2"]
+            }],
+            "agent": "ZCode"
+        });
+        let zreq = parse_questions(&zcode_payload).unwrap();
+        assert_eq!(zreq.agent, "ZCode");
+    }
+
+    #[test]
     fn hook_output_carries_the_choice_in_updated_answers() {
         let tool_input: Value = serde_json::json!({
             "questions": [{
@@ -1278,10 +1657,12 @@ mod tests {
                 "multiSelect": false
             }]
         });
+        let req = parse_questions(&tool_input).unwrap();
         let out = hook_output_for(
             &AskReply::Select { index: 2, label: "第三个".into() },
-            "选哪个?",
+            &req,
             Some(&tool_input),
+            false,
         );
         let parsed: Value = serde_json::from_str(&out).unwrap();
         let hook_out = &parsed["hookSpecificOutput"];
@@ -1300,8 +1681,71 @@ mod tests {
         assert_eq!(hook_out["updatedInput"]["questions"], tool_input["questions"]);
         assert_eq!(hook_out["updatedInput"]["answers"]["选哪个?"], "第三个");
 
-        let out = hook_output_for(&AskReply::Pass, "q", Some(&tool_input));
+        let out = hook_output_for(&AskReply::Pass, &req, Some(&tool_input), false);
         assert!(out.contains("\"permissionDecision\":\"ask\""), "{out}");
+    }
+
+    #[test]
+    fn hook_output_for_codex_denies_tool_with_reason() {
+        let tool_input: Value = serde_json::json!({
+            "questions": [{
+                "title": "Which music?",
+                "options": ["Rock", "Jazz", "Classical"]
+            }]
+        });
+        let req = parse_questions(&tool_input).unwrap();
+        let out = hook_output_for(
+            &AskReply::Select { index: 0, label: "Rock".into() },
+            &req,
+            Some(&tool_input),
+            true, // is_codex
+        );
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let hook_out = &parsed["hookSpecificOutput"];
+        assert_eq!(hook_out["permissionDecision"], "deny");
+        assert!(hook_out["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("选择第 1 项「Rock」"));
+
+        let out_pass = hook_output_for(&AskReply::Pass, &req, Some(&tool_input), true);
+        let parsed_pass: Value = serde_json::from_str(&out_pass).unwrap();
+        assert_eq!(parsed_pass["hookSpecificOutput"]["permissionDecision"], "allow");
+    }
+
+    #[test]
+    fn hook_output_for_multi_questions_zcode() {
+        let tool_input: Value = serde_json::json!({
+            "questions": [
+                {
+                    "question": "Q1?",
+                    "header": "H1",
+                    "options": [{"label": "A"}, {"label": "B"}]
+                },
+                {
+                    "question": "Q2?",
+                    "header": "H2",
+                    "options": [{"label": "C"}, {"label": "D"}]
+                }
+            ]
+        });
+        let req = parse_questions(&tool_input).unwrap();
+        let out = hook_output_for(
+            &AskReply::BatchSelect {
+                selections: vec![
+                    SingleSelection { index: 0, label: "A".into() },
+                    SingleSelection { index: 1, label: "D".into() },
+                ],
+            },
+            &req,
+            Some(&tool_input),
+            false,
+        );
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let hook_out = &parsed["hookSpecificOutput"];
+        assert_eq!(hook_out["permissionDecision"], "allow");
+        assert_eq!(hook_out["updatedInput"]["answers"]["Q1?"], "A");
+        assert_eq!(hook_out["updatedInput"]["answers"]["Q2?"], "D");
     }
 
     #[test]
@@ -1310,6 +1754,15 @@ mod tests {
         let text = serde_json::to_string(&select).unwrap();
         assert!(text.contains("\"event\":\"select\""), "{text}");
         assert_eq!(serde_json::from_str::<AskReply>(&text).unwrap(), select);
+
+        let batch = AskReply::BatchSelect {
+            selections: vec![
+                SingleSelection { index: 0, label: "A".into() },
+                SingleSelection { index: 1, label: "B".into() },
+            ],
+        };
+        let batch_text = serde_json::to_string(&batch).unwrap();
+        assert_eq!(serde_json::from_str::<AskReply>(&batch_text).unwrap(), batch);
 
         let pass_text = serde_json::to_string(&AskReply::Pass).unwrap();
         assert_eq!(pass_text, "{\"event\":\"pass\"}");

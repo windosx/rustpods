@@ -275,6 +275,12 @@ impl AacpManager {
         tracker.active && tracker.is_calibrated()
     }
 
+    /// True if head tracking is actively receiving samples right now (within 1.5s).
+    pub async fn is_head_tracking_streaming(&self) -> bool {
+        let tracker = self.head_tracker.lock().await;
+        tracker.is_streaming()
+    }
+
     /// Measured sample rate of the attitude stream, if it is running.
     pub async fn head_tracking_rate_hz(&self) -> Option<f32> {
         self.head_tracker.lock().await.sample_rate_hz()
@@ -435,6 +441,8 @@ impl AacpManager {
         let ear_cache = Arc::clone(&self.ear_status);
         let remotes = Arc::clone(&self.remotes);
         let self_head_status = Arc::clone(&self.head_status);
+        let spatial = Arc::clone(&self.spatial);
+        let generation = Arc::clone(&self.remotehid_generation);
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; AACP_RECEIVE_MTU as usize];
@@ -514,6 +522,25 @@ impl AacpManager {
                                 // the handshake, before anything subscribes to
                                 // the tap, so a broadcast alone would lose it.
                                 record_advertisement(&remotes, packet).await;
+                                // If the accessory re-announced its services (e.g. on a primary-bud switch),
+                                // the accessory cancels the existing motion stream. If spatial audio wants
+                                // head tracking, re-arm the motion stream immediately on the announced device.
+                                if spatial.lock().await.wants_head_tracking()
+                                    && let Some(motion) = remotes.lock().await.motion_device().cloned()
+                                {
+                                    let mut gen_guard = generation.lock().await;
+                                    let rearm_packet = remotehid::make_set_interval(
+                                        gen_guard.next(),
+                                        motion.device,
+                                        session::DEFAULT_INTERVAL_US,
+                                    );
+                                    drop(gen_guard);
+                                    info!(
+                                        "Re-announcement on {} (device {}): immediately re-arming motion stream",
+                                        motion.service, motion.device
+                                    );
+                                    let _ = seq_packet_recv.send(&rearm_packet).await;
+                                }
                                 continue;
                             }
                             // Short frames on this descriptor are descriptor
@@ -689,6 +716,113 @@ impl AacpManager {
             let _ = head_feed.send(None);
             let _ = event_tx.send(AacpEvent::Disconnected);
             warn!("AACP receive loop exited, sent Disconnected event");
+        });
+
+        // Spawn head-tracking stream watchdog to continuously monitor sample flow
+        // and automatically re-arm the accessory if the stream stalls (e.g. on bud switch).
+        let seq_packet_watchdog = Arc::downgrade(&seq_packet);
+        let spatial_watchdog = Arc::clone(&self.spatial);
+        let ear_cache_watchdog = Arc::clone(&self.ear_status);
+        let tracker_watchdog = Arc::clone(&self.head_tracker);
+        let remotes_watchdog = Arc::clone(&self.remotes);
+        let generation_watchdog = Arc::clone(&self.remotehid_generation);
+        let send_tx_watchdog = Arc::clone(&self.send_tx);
+        let epoch_watchdog = Arc::clone(&self.conn_epoch);
+        let rtb_tx_watchdog = self.rtb_acp_tx.clone();
+        let status_watchdog = Arc::clone(&self.head_status);
+        let starting_watchdog = Arc::clone(&self.head_tracking_starting);
+
+        tokio::spawn(async move {
+            let mut stall_count: u32 = 0;
+            // Initial grace period for connection handshake and start_head_tracking to complete.
+            tokio::time::sleep(Duration::from_secs(4)).await;
+
+            loop {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+
+                // Stop if session is superseded or socket is dropped
+                let Some(_seq) = seq_packet_watchdog.upgrade() else {
+                    break;
+                };
+                if epoch_watchdog.load(Ordering::SeqCst) != epoch {
+                    break;
+                }
+
+                // Only supervise while head-tracked spatial audio is requested
+                let wants_tracking = spatial_watchdog.lock().await.wants_head_tracking();
+                if !wants_tracking {
+                    stall_count = 0;
+                    continue;
+                }
+
+                // If earbuds are confirmed out of ear, sensors are powered down; do not re-arm
+                let ear_now = *ear_cache_watchdog.lock().await;
+                let blocked = ear_now.is_some_and(|(l, r)| {
+                    l != EarStatus::InEar || r != EarStatus::InEar
+                });
+                if blocked {
+                    stall_count = 0;
+                    continue;
+                }
+
+                // Check whether samples are actively streaming (<1.5s ago)
+                let is_streaming = tracker_watchdog.lock().await.is_streaming();
+                if is_streaming {
+                    stall_count = 0;
+                    continue;
+                }
+
+                stall_count += 1;
+                debug!("Head tracking stream stall detected (stall_count={})", stall_count);
+
+                // Attempt to re-arm motion reporting via SetReport on the announced motion device
+                let motion = remotes_watchdog.lock().await.motion_device().cloned();
+                if let Some(motion) = motion {
+                    let packet = {
+                        let mut gen_guard = generation_watchdog.lock().await;
+                        remotehid::make_set_interval(
+                            gen_guard.next(),
+                            motion.device,
+                            session::DEFAULT_INTERVAL_US,
+                        )
+                    };
+                    info!(
+                        "Stream watchdog: re-arming motion stream on {} (device {})",
+                        motion.service, motion.device
+                    );
+                    let sender = send_tx_watchdog.lock().await.clone();
+                    if let Some(tx) = sender {
+                        let _ = tx.send(packet).await;
+                    }
+                } else if stall_count >= 3 {
+                    // Motion device not yet registered or persistent stall: re-trigger negotiation
+                    if !starting_watchdog.swap(true, Ordering::SeqCst) {
+                        let sender = send_tx_watchdog.lock().await.clone();
+                        if let Some(sender) = sender {
+                            let frames = rtb_tx_watchdog.subscribe();
+                            let tracker_c = Arc::clone(&tracker_watchdog);
+                            let status_c = Arc::clone(&status_watchdog);
+                            let remotes_c = Arc::clone(&remotes_watchdog);
+                            let gen_c = Arc::clone(&generation_watchdog);
+                            let starting_c = Arc::clone(&starting_watchdog);
+                            tokio::spawn(async move {
+                                struct Guard(Arc<AtomicBool>);
+                                impl Drop for Guard {
+                                    fn drop(&mut self) {
+                                        self.0.store(false, Ordering::SeqCst);
+                                    }
+                                }
+                                let _guard = Guard(starting_c);
+                                let _ = drive_remote_hid(sender, frames, tracker_c, None, status_c, remotes_c, gen_c).await;
+                            });
+                        } else {
+                            starting_watchdog.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    stall_count = 0;
+                }
+            }
+            debug!("Head tracking stream watchdog terminated");
         });
 
         // Initialize handshake sequence
@@ -1003,7 +1137,7 @@ impl AacpManager {
             }
             let _guard = Guard(starting);
 
-            if tracker.lock().await.samples_seen() > 0 {
+            if tracker.lock().await.is_streaming() {
                 debug!("Head tracking already streaming");
                 return;
             }
@@ -1021,6 +1155,37 @@ impl AacpManager {
         });
 
         Ok(())
+    }
+
+    /// Re-arms the motion stream by sending a SetReport with the sample interval
+    /// to the announced motion device, or starts full negotiation if no device is known yet.
+    pub async fn rearm_motion_stream(&self) -> Result<(), String> {
+        if !self.is_connected().await {
+            return Err("AACP socket not connected".to_string());
+        }
+
+        let motion = {
+            let remotes = self.remotes.lock().await;
+            remotes.motion_device().cloned()
+        };
+
+        if let Some(motion) = motion {
+            let packet = {
+                let mut generation = self.remotehid_generation.lock().await;
+                remotehid::make_set_interval(
+                    generation.next(),
+                    motion.device,
+                    session::DEFAULT_INTERVAL_US,
+                )
+            };
+            info!(
+                "Re-arming motion stream on {} (device {})",
+                motion.service, motion.device
+            );
+            self.send_raw(packet).await
+        } else {
+            self.start_head_tracking().await
+        }
     }
 
     pub async fn stop_head_tracking(&self) -> Result<(), String> {
