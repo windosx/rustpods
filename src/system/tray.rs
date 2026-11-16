@@ -91,7 +91,7 @@ impl Tray for RustPodsTray {
             // Must return empty string so the desktop status bar renders icon_pixmap (circular battery)
             "".to_string()
         } else {
-            "audio-headphones".to_string()
+            "io.github.rustpods.RustPods".to_string()
         }
     }
 
@@ -144,7 +144,7 @@ impl Tray for RustPodsTray {
             };
 
             ToolTip {
-                icon_name: "audio-headphones".to_string(),
+                icon_name: "io.github.rustpods.RustPods".to_string(),
                 icon_pixmap: vec![],
                 title: format!("{} (AirPods){}", state.name, charge_sym),
                 description: rust_i18n::t!(
@@ -157,7 +157,7 @@ impl Tray for RustPodsTray {
             }
         } else {
             ToolTip {
-                icon_name: "audio-headphones".to_string(),
+                icon_name: "io.github.rustpods.RustPods".to_string(),
                 icon_pixmap: vec![],
                 title: "RustPods".to_string(),
                 description: "未连接 AirPods".to_string(),

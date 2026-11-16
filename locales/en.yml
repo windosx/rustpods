@@ -188,6 +188,8 @@ preferences:
   mac: "Bluetooth MAC Address"
   firmware: "Firmware Version"
   serial: "Serial Number"
+  about_title: "About & Version"
+  about_summary: "AirPods Control Center and System Services for Linux (Wayland / X11)"
 
 popup:
   headphones: "AirPods"

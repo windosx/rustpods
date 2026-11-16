@@ -800,9 +800,9 @@ impl Render for MainWindow {
                             .items_center()
                             .gap(px(8.))
                             .child(
-                                Icon::new(gpui_kit::assets::IconName::Headphones)
-                                    .size(px(14.))
-                                    .text_color(p.accent_blue),
+                                gpui_kit::gpui::img("icons/rustpods_32.png")
+                                    .size(px(16.))
+                                    .rounded(px(3.)),
                             )
                             .child(
                                 div()

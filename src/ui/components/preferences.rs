@@ -281,4 +281,54 @@ pub fn render_preferences_page(
                     true,
                 )),
         )
+        .child(section_header(p, &rust_i18n::t!("preferences.about_title"), None))
+        .child(
+            grouped_card(p).child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(16.))
+                    .px(px(18.))
+                    .py(px(16.))
+                    .child(
+                        gpui_kit::gpui::img("icons/rustpods.png")
+                            .size(px(48.))
+                            .rounded(px(10.)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .flex_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .text_size(px(15.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(p.text_primary)
+                                            .child("RustPods"),
+                                    )
+                                    .child(
+                                        Tag::success()
+                                            .outline()
+                                            .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(p.text_secondary)
+                                    .child(rust_i18n::t!("preferences.about_summary")),
+                            ),
+                    ),
+            ),
+        )
 }

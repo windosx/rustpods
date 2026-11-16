@@ -67,6 +67,8 @@ const ANIM_AIRPODS_4: &[u8] = include_bytes!("../../assets/animations/airpods_4.
 const ANIM_AIRPODS_PRO: &[u8] = include_bytes!("../../assets/animations/airpods_pro.webp");
 const ANIM_AIRPODS_PRO_2: &[u8] = include_bytes!("../../assets/animations/airpods_pro_2.webp");
 const ANIM_AIRPODS_MAX: &[u8] = include_bytes!("../../assets/animations/airpods_max.webp");
+const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/icons/hicolor/128x128/apps/rustpods.png");
+const APP_ICON_PNG_32: &[u8] = include_bytes!("../../assets/icons/hicolor/32x32/apps/rustpods.png");
 
 impl AssetSource for CompositeAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
@@ -78,6 +80,8 @@ impl AssetSource for CompositeAssets {
             "animations/airpods_pro.webp" => Some(ANIM_AIRPODS_PRO),
             "animations/airpods_pro_2.webp" => Some(ANIM_AIRPODS_PRO_2),
             "animations/airpods_max.webp" => Some(ANIM_AIRPODS_MAX),
+            "icons/rustpods.png" => Some(APP_ICON_PNG),
+            "icons/rustpods_32.png" => Some(APP_ICON_PNG_32),
             _ => None,
         };
         if let Some(bytes) = embedded {

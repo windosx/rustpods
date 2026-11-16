@@ -188,6 +188,8 @@ preferences:
   mac: "蓝牙物理地址 (MAC)"
   firmware: "固件版本"
   serial: "硬件序列号"
+  about_title: "关于与版本"
+  about_summary: "专为 Linux (Wayland / X11) 打造的 AirPods 高级控制中心与系统服务"
 
 popup:
   headphones: "头戴耳机"
