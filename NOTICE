@@ -1,0 +1,68 @@
+RustPods
+Copyright (C) 2026 windosx
+
+RustPods is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License as published by the Free Software
+Foundation, version 3. See LICENSE.
+
+This notice lists third-party works that RustPods is derived from or includes.
+Each portion remains under its original license, as described below.
+
+--------------------------------------------------------------------------------
+MousePods
+https://github.com/starman-tech/mousepods
+Copyright Matteo Gaudioso
+Licensed under the Apache License, Version 2.0.
+
+Derived portions:
+  - src/core/head_tracking.rs: attitude integration, gravity reference frame,
+    and gyro-bias estimation, following MousePods' MotionEngine.step.
+  - src/system/head_mouse/: head-mouse dynamics and pointer behaviour informed
+    by MousePods' Linux head-mouse implementation.
+  - src/core/aacp/remotehid.rs and src/core/aacp/rtbuddy.rs: Apple RemoteHID
+    (HID over AACP) framing and sensor bring-up, following MousePods'
+    docs/REMOTEHID-PROTOCOL.md and capture scripts, including the
+    request_all_descriptors sequence and the L2CAP receive MTU requirement.
+
+A copy of the Apache License 2.0 is available at:
+https://www.apache.org/licenses/LICENSE-2.0
+
+The MousePods author asks users of this work to tell him about it: open an issue
+at https://github.com/starman-tech/mousepods/issues or mention @starman-tech.
+For academic citation, use:
+https://github.com/starman-tech/mousepods/blob/main/CITATION.cff
+
+--------------------------------------------------------------------------------
+LibrePods
+https://github.com/kavishdevar/librepods
+Licensed under the GNU Affero General Public License v3.0.
+
+Referenced portions:
+  - src/core/head_tracking.rs: the nod/shake gesture detector is a port of
+    LibrePods' GestureDetector; the SensorV2 sample layout follows LibrePods'
+    parser and the published AAP definitions.
+  - AACP command/event definitions and L2CAP transport behaviour used as a
+    reference implementation.
+
+--------------------------------------------------------------------------------
+airpods-posture
+https://github.com/anilsrml/airpods-posture
+Licensed under the GNU General Public License v3.0.
+
+Referenced for the AirPods 4 sensor payload marker and marker-relative field
+offsets in src/core/head_tracking.rs.
+
+A copy of the GNU General Public License v3.0 is available at:
+https://www.gnu.org/licenses/gpl-3.0.html
+
+--------------------------------------------------------------------------------
+AirPodsDesktop
+https://github.com/SpriteOvO/AirPodsDesktop
+Licensed under the GNU General Public License v3.0.
+
+The 360-degree device animations in assets/animations/ are converted from the
+chroma-keyed AVI assets distributed with AirPodsDesktop. See
+assets/animations/README.md.
+
+A copy of the GNU General Public License v3.0 is available at:
+https://www.gnu.org/licenses/gpl-3.0.html

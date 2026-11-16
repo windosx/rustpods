@@ -1,0 +1,20 @@
+[Desktop Entry]
+Name=RustPods
+GenericName=AirPods Control Center
+GenericName[zh_CN]=AirPods 控制中心
+Comment=AirPods Control Center and System Services for Linux
+Comment[zh_CN]=Linux 环境下的 AirPods 高级控制中心与系统服务
+Exec=rustpods
+Icon=io.github.rustpods.RustPods
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Utility;Settings;HardwareSettings;
+StartupNotify=true
+StartupWMClass=io.github.rustpods.RustPods
+Keywords=AirPods;Apple;Bluetooth;Headphones;Spatial;Audio;
+Actions=NoGui;
+
+[Desktop Action NoGui]
+Name=Start in Background
+Name[zh_CN]=后台启动（仅托盘）
+Exec=rustpods --no-gui
