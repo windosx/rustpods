@@ -35,6 +35,7 @@ pub fn render_hero_card(
     let app_for_connect = app_state.clone();
     let input_for_open = rename_input.clone();
     let current_name = dev.name.clone();
+    let is_connecting = state.is_connecting;
 
     control_card(p)
         .py(px(22.))
@@ -153,9 +154,20 @@ pub fn render_hero_card(
                         Button::new("hero-connect-btn")
                             .primary()
                             .rounded(ButtonRounded::Size(px(999.)))
-                            .label(rust_i18n::t!("hero.connect_btn"))
+                            .loading(is_connecting)
+                            .label(if is_connecting {
+                                rust_i18n::t!("hero.connecting")
+                            } else {
+                                rust_i18n::t!("hero.connect_btn")
+                            })
                             .on_click(move |_, _, cx| {
-                                app_for_connect.read(cx).controller.connect();
+                                app_for_connect.update(cx, |s, cx| {
+                                    if !s.is_connecting && !s.device.is_connected {
+                                        s.is_connecting = true;
+                                        s.controller.connect();
+                                        cx.notify();
+                                    }
+                                });
                             }),
                     )
                 }),

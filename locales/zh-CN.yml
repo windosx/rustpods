@@ -22,6 +22,7 @@ hero:
   rename_btn: "重命名 AirPods"
   save: "保存"
   connect_btn: "点击连接"
+  connecting: "连接中..."
 
 battery:
   left: "左耳 (Left)"

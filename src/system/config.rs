@@ -462,6 +462,8 @@ mod tests {
         assert_eq!(rust_i18n::t!("head_mouse.title", locale = "en"), "Head Pose Mouse");
         assert_eq!(rust_i18n::t!("preferences.language", locale = "zh-CN"), "界面语言 (Language)");
         assert_eq!(rust_i18n::t!("preferences.language", locale = "en"), "Language");
+        assert_eq!(rust_i18n::t!("hero.connecting", locale = "zh-CN"), "连接中...");
+        assert_eq!(rust_i18n::t!("hero.connecting", locale = "en"), "Connecting...");
     }
 
     #[test]

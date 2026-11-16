@@ -321,21 +321,8 @@ async fn parse_proximity_message(
         }
 
         if !state.is_connected {
-            if left_in_ear {
-                state.left_in_ear = EarStatus::InEar;
-            } else if is_this_pod_in_case && primary_left {
-                state.left_in_ear = EarStatus::InCase;
-            } else {
-                state.left_in_ear = EarStatus::OutOfEar;
-            }
-
-            if right_in_ear {
-                state.right_in_ear = EarStatus::InEar;
-            } else if is_this_pod_in_case && !primary_left {
-                state.right_in_ear = EarStatus::InCase;
-            } else {
-                state.right_in_ear = EarStatus::OutOfEar;
-            }
+            state.left_in_ear = EarStatus::Disconnected;
+            state.right_in_ear = EarStatus::Disconnected;
         }
 
         let wearing_any = aacp_wearing || left_in_ear || right_in_ear;

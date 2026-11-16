@@ -22,6 +22,7 @@ hero:
   rename_btn: "Rename AirPods"
   save: "Save"
   connect_btn: "Connect"
+  connecting: "Connecting..."
 
 battery:
   left: "Left Ear"

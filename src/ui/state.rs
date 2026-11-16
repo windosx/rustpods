@@ -91,10 +91,14 @@ impl RustPodsController {
 
     pub fn connect(&self) {
         let dev_state = self.device_state.clone();
+        let tx = self.ui_tx.clone();
         self.rt.spawn(async move {
             let mac = {
                 let guard = dev_state.read().await;
-                guard.as_ref().map(|s| s.mac_address.clone())
+                guard
+                    .as_ref()
+                    .map(|s| s.mac_address.clone())
+                    .filter(|m| m != "00:00:00:00:00:00")
             };
             let mac_addr = match mac {
                 Some(m) => Some(m),
@@ -110,14 +114,24 @@ impl RustPodsController {
                     }
                 }
             };
-            if let Some(mac_addr) = mac_addr {
-                info!("Triggering connect to {}", mac_addr);
-                let _ = tokio::process::Command::new("bluetoothctl")
-                    .arg("connect")
-                    .arg(&mac_addr)
-                    .output()
-                    .await;
+            let Some(mac_addr) = mac_addr else {
+                let _ = tx.send(UiEvent::ConnectAttemptFinished);
+                return;
+            };
+            info!("Triggering connect to {}", mac_addr);
+            let ok = tokio::process::Command::new("bluetoothctl")
+                .arg("connect")
+                .arg(&mac_addr)
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                // Give the Bluetooth daemon poll cycle time to observe the connection
+                // and emit ConnectedChanged(true) before clearing the loading state.
+                tokio::time::sleep(std::time::Duration::from_secs(7)).await;
             }
+            let _ = tx.send(UiEvent::ConnectAttemptFinished);
         });
     }
 
@@ -370,6 +384,7 @@ impl RustPodsController {
 /// Reactive application state observed by any open `MainWindow`.
 pub struct RustPodsState {
     pub device: AirPodsDeviceState,
+    pub is_connecting: bool,
     pub head_tracking: HeadTrackingViewState,
     pub zcode_progress: Option<AskProgress>,
     pub zcode_resolved: Option<String>,
@@ -392,6 +407,7 @@ impl RustPodsState {
         );
         Self {
             device,
+            is_connecting: false,
             head_tracking: HeadTrackingViewState::default(),
             zcode_progress: None,
             zcode_resolved: None,

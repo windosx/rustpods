@@ -30,6 +30,7 @@ use window::{window_options, MainWindow};
 pub enum UiEvent {
     DeviceStateUpdated(AirPodsDeviceState),
     ConnectedChanged(bool),
+    ConnectAttemptFinished,
     OpenWindow,
     CaseLidOpened,
     CaseLidClosed,
@@ -279,6 +280,9 @@ fn bootstrap_gui(
                 match evt {
                     UiEvent::DeviceStateUpdated(new_dev) => {
                         state_ev.update(cx, |s, cx| {
+                            if new_dev.is_connected {
+                                s.is_connecting = false;
+                            }
                             s.device = new_dev;
                             cx.notify();
                         });
@@ -288,6 +292,12 @@ fn bootstrap_gui(
                             if let Some(h) = guard.as_ref() {
                                 h.update(|_| {}).await;
                             }
+                        });
+                    }
+                    UiEvent::ConnectAttemptFinished => {
+                        state_ev.update(cx, |s, cx| {
+                            s.is_connecting = false;
+                            cx.notify();
                         });
                     }
                     UiEvent::OpenWindow => {
@@ -308,7 +318,13 @@ fn bootstrap_gui(
                     UiEvent::ConnectedChanged(connected) => {
                         state_ev.update(cx, |s, cx| {
                             s.device.is_connected = connected;
-                            if !connected {
+                            if connected {
+                                s.is_connecting = false;
+                            } else {
+                                s.device.left_in_ear =
+                                    crate::core::aacp::events::EarStatus::Disconnected;
+                                s.device.right_in_ear =
+                                    crate::core::aacp::events::EarStatus::Disconnected;
                                 s.head_tracking.pose = None;
                                 s.head_tracking.calibrated = false;
                                 s.head_tracking.rate_hz = None;

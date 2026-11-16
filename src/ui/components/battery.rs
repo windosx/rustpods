@@ -20,6 +20,7 @@ pub fn render_battery_card(state: &AirPodsDeviceState, p: &ApplePalette) -> impl
             state.battery_left_charging,
             state.left_in_ear,
             false,
+            state.is_connected,
             p,
         ))
         .child(render_single_battery_column(
@@ -28,6 +29,7 @@ pub fn render_battery_card(state: &AirPodsDeviceState, p: &ApplePalette) -> impl
             state.battery_right_charging,
             state.right_in_ear,
             false,
+            state.is_connected,
             p,
         ))
         .child(render_single_battery_column(
@@ -36,6 +38,7 @@ pub fn render_battery_card(state: &AirPodsDeviceState, p: &ApplePalette) -> impl
             state.battery_case_charging,
             EarStatus::InCase,
             true,
+            state.is_connected,
             p,
         ))
 }
@@ -46,10 +49,11 @@ fn render_single_battery_column(
     charging: bool,
     ear_status: EarStatus,
     is_case: bool,
+    is_connected: bool,
     p: &ApplePalette,
 ) -> impl IntoElement {
     let pct_str = format_center_text(level_opt);
-    let status_str = format_status_string(level_opt, charging, ear_status, is_case);
+    let status_str = format_status_string(level_opt, charging, ear_status, is_case, is_connected);
     let ring_color = ring_color_for(level_opt, charging, p);
     let track_color = p.track_bg;
     let status_color = if charging {
@@ -238,6 +242,7 @@ fn format_status_string(
     charging: bool,
     ear_status: EarStatus,
     is_case: bool,
+    is_connected: bool,
 ) -> String {
     if level.is_none() {
         return if is_case {
@@ -246,22 +251,142 @@ fn format_status_string(
             rust_i18n::t!("battery.waiting_connection").to_string()
         };
     }
-    let charge_str = if charging {
-        rust_i18n::t!("battery.charging")
-    } else {
-        rust_i18n::t!("battery.in_use")
-    };
-    if is_case {
-        charge_str.to_string()
-    } else {
-        let ear_str = match ear_status {
-            EarStatus::InEar => rust_i18n::t!("battery.worn"),
-            EarStatus::OutOfEar => rust_i18n::t!("battery.unworn"),
-            EarStatus::InCase => rust_i18n::t!("battery.in_case_status"),
-            EarStatus::Disconnected => rust_i18n::t!("battery.disconnected_status"),
+
+    if !is_connected {
+        return if charging {
+            if is_case {
+                rust_i18n::t!("battery.charging").to_string()
+            } else {
+                format!(
+                    "{} • {}",
+                    rust_i18n::t!("battery.charging"),
+                    rust_i18n::t!("battery.disconnected_status")
+                )
+            }
+        } else {
+            rust_i18n::t!("battery.disconnected_status").to_string()
         };
-        format!("{} • {}", charge_str, ear_str)
+    }
+
+    if is_case {
+        return if charging {
+            rust_i18n::t!("battery.charging").to_string()
+        } else {
+            rust_i18n::t!("battery.in_use").to_string()
+        };
+    }
+
+    match ear_status {
+        EarStatus::Disconnected => {
+            if charging {
+                format!(
+                    "{} • {}",
+                    rust_i18n::t!("battery.charging"),
+                    rust_i18n::t!("battery.disconnected_status")
+                )
+            } else {
+                rust_i18n::t!("battery.disconnected_status").to_string()
+            }
+        }
+        EarStatus::InCase => {
+            if charging {
+                format!(
+                    "{} • {}",
+                    rust_i18n::t!("battery.charging"),
+                    rust_i18n::t!("battery.in_case_status")
+                )
+            } else {
+                rust_i18n::t!("battery.in_case_status").to_string()
+            }
+        }
+        EarStatus::InEar => {
+            let charge_str = if charging {
+                rust_i18n::t!("battery.charging")
+            } else {
+                rust_i18n::t!("battery.in_use")
+            };
+            format!("{} • {}", charge_str, rust_i18n::t!("battery.worn"))
+        }
+        EarStatus::OutOfEar => {
+            let charge_str = if charging {
+                rust_i18n::t!("battery.charging")
+            } else {
+                rust_i18n::t!("battery.in_use")
+            };
+            format!("{} • {}", charge_str, rust_i18n::t!("battery.unworn"))
+        }
     }
 }
 
 use gpui_kit::prelude::FluentBuilder as _;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_device_never_shows_in_use_or_worn() {
+        let s = format_status_string(Some(85), false, EarStatus::InEar, false, false);
+        assert_eq!(s, rust_i18n::t!("battery.disconnected_status"));
+
+        let s_charging = format_status_string(Some(85), true, EarStatus::InCase, false, false);
+        assert_eq!(
+            s_charging,
+            format!(
+                "{} • {}",
+                rust_i18n::t!("battery.charging"),
+                rust_i18n::t!("battery.disconnected_status")
+            )
+        );
+
+        let s_case = format_status_string(Some(90), false, EarStatus::InCase, true, false);
+        assert_eq!(s_case, rust_i18n::t!("battery.disconnected_status"));
+
+        let s_none = format_status_string(None, false, EarStatus::Disconnected, false, false);
+        assert_eq!(s_none, rust_i18n::t!("battery.waiting_connection"));
+    }
+
+    #[test]
+    fn connected_device_formats_ear_and_case_states_properly() {
+        let worn = format_status_string(Some(80), false, EarStatus::InEar, false, true);
+        assert_eq!(
+            worn,
+            format!(
+                "{} • {}",
+                rust_i18n::t!("battery.in_use"),
+                rust_i18n::t!("battery.worn")
+            )
+        );
+
+        let unworn = format_status_string(Some(80), false, EarStatus::OutOfEar, false, true);
+        assert_eq!(
+            unworn,
+            format!(
+                "{} • {}",
+                rust_i18n::t!("battery.in_use"),
+                rust_i18n::t!("battery.unworn")
+            )
+        );
+
+        let in_case_full = format_status_string(Some(100), false, EarStatus::InCase, false, true);
+        assert_eq!(in_case_full, rust_i18n::t!("battery.in_case_status"));
+
+        let in_case_charging =
+            format_status_string(Some(60), true, EarStatus::InCase, false, true);
+        assert_eq!(
+            in_case_charging,
+            format!(
+                "{} • {}",
+                rust_i18n::t!("battery.charging"),
+                rust_i18n::t!("battery.in_case_status")
+            )
+        );
+
+        let single_disconnected =
+            format_status_string(Some(80), false, EarStatus::Disconnected, false, true);
+        assert_eq!(
+            single_disconnected,
+            rust_i18n::t!("battery.disconnected_status")
+        );
+    }
+}
