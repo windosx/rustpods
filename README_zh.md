@@ -268,7 +268,7 @@ cargo clippy --all-targets
 RustPods 建立在早期逆向工程与开源项目的成果之上：
 
 - **[LibrePods](https://github.com/kavishdevar/librepods)**（AGPL-3.0）—— AACP 命令与事件编码、L2CAP 传输模型和手势检测。RustPods 的手势检测器移植自 LibrePods 的 `GestureDetector`。
-- **[MousePods](https://github.com/starman-tech/mousepods)**，作者 Matteo Gaudioso（[@starman-tech](https://github.com/starman-tech)），Apache-2.0 —— 首个公开的 Apple RemoteHID（HID over AACP）文档，以及 RustPods 姿态解算与空鼠动力学所遵循的 `MotionEngine` 数学。**如果你也基于这些工作开发，请告知作者：开一个 issue 或提及 @starman-tech。** 学术用途请通过 MousePods 的 [CITATION.cff](https://github.com/starman-tech/mousepods/blob/main/CITATION.cff) 引用。
+- **[MousePods](https://github.com/starman-tech/mousepods)**，作者 Matteo Gaudioso（[@starman-tech](https://github.com/starman-tech)），Apache-2.0 —— 首个公开的 Apple RemoteHID（HID over AACP）文档，以及 RustPods 姿态解算与空鼠动力学所遵循的 `MotionEngine` 数学。**如果你也基于这些工作开发，请告知作者：开一个 issue 或提及 @starman-tech。** 学术用途请通过 MousePods 的 [CITATION.cff](https://github.com/starman-tech/mousepods/blob/main/CITATION.cff) 引用。RustPods 的告知记录见 [starman-tech/mousepods#20](https://github.com/starman-tech/mousepods/issues/20)。
 - **[anilsrml/airpods-posture](https://github.com/anilsrml/airpods-posture)** —— 较新 AirPods 固件的传感器载荷布局，包括 AirPods 4 使用的标记相对偏移。
 - **[SpriteOvO/AirPodsDesktop](https://github.com/SpriteOvO/AirPodsDesktop)**（GPL-3.0）—— `assets/animations` 下的 360° AirPods 动画由其色键动画素材转换而来。
 
