@@ -8,8 +8,9 @@ pub const GITHUB_API_LATEST_RELEASE: &str =
     "https://api.github.com/repos/windosx/rustpods/releases/latest";
 
 /// Status of update check.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum UpdateState {
+    #[default]
     Idle,
     Checking,
     UpToDate {
@@ -23,12 +24,6 @@ pub enum UpdateState {
         is_package_managed: bool,
     },
     Error(String),
-}
-
-impl Default for UpdateState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 #[derive(Debug, Deserialize)]
