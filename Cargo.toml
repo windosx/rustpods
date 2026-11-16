@@ -6,7 +6,6 @@ description = "AirPods Control Center and System Services for Linux"
 authors = ["windosx <windosx@github.com>"]
 license = "AGPL-3.0-only"
 repository = "https://github.com/windosx/rustpods"
-homepage = "https://github.com/windosx/rustpods"
 readme = "README.md"
 keywords = ["airpods", "apple", "bluetooth", "spatial-audio", "head-tracking"]
 categories = ["multimedia::audio", "gui", "hardware-support"]
