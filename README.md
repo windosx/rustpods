@@ -106,40 +106,80 @@ cargo build --release --no-default-features
 
 The GUI, tray, AACP stack, and head-pose mouse still work; only the head-tracked audio output is unavailable.
 
-## Build
+## Installation
+
+### Method 1: Package Managers & Prebuilt Releases (Recommended)
+
+#### Arch Linux (AUR)
+```bash
+yay -S rustpods-bin   # Prebuilt binary package (recommended, fast)
+# Or build from source:
+yay -S rustpods
+```
+
+#### Debian / Ubuntu (.deb)
+Download the latest `.deb` package from [Releases](https://github.com/windosx/rustpods/releases):
+```bash
+sudo apt install ./rustpods_*_amd64.deb
+```
+
+#### Fedora / openSUSE (.rpm)
+Download the latest `.rpm` package from [Releases](https://github.com/windosx/rustpods/releases):
+```bash
+sudo dnf install ./rustpods-*.x86_64.rpm
+```
+
+#### Universal Release Tarball
+Download `rustpods-v*-linux-x86_64.tar.gz` from [Releases](https://github.com/windosx/rustpods/releases):
+```bash
+tar -xzf rustpods-v*-linux-x86_64.tar.gz
+cd rustpods-v*-linux-x86_64
+sudo ./install.sh        # System-wide install (recommended: configures udev & systemd)
+# Or install to ~/.local without root:
+./install.sh             # Installs to ~/.local
+```
+
+### Method 2: Build and Install from Source
 
 ```bash
 git clone https://github.com/windosx/rustpods.git
 cd rustpods
 cargo build --release
+
+# Install system-wide or to ~/.local using the installer:
+sudo ./contrib/scripts/install.sh   # Installs to /usr/local
+# Or
+./contrib/scripts/install.sh        # Installs to ~/.local
 ```
 
-The binary is written to `target/release/rustpods`.
+> [!TIP]
+> **Passwordless Head Mouse Permission**: Installing via a package manager or `sudo ./install.sh` automatically installs `/etc/udev/rules.d/70-rustpods.rules`, granting the active desktop user access to `/dev/uinput` via systemd `uaccess`. You won't be prompted for root or Polkit authentication when activating the Head Mouse.
 
-## Install
+### Background Daemon & Autostart (systemd)
 
-Copy the binary and desktop files into your user prefix:
+RustPods provides a systemd user service unit. After installation, enable the background tray daemon with:
 
 ```bash
-install -Dm755 target/release/rustpods ~/.local/bin/rustpods
-
-install -Dm644 contrib/io.github.rustpods.RustPods.desktop \
-  ~/.local/share/applications/io.github.rustpods.RustPods.desktop
-
-install -Dm644 assets/icons/hicolor/scalable/apps/rustpods.svg \
-  ~/.local/share/icons/hicolor/scalable/apps/io.github.rustpods.RustPods.svg
-
-# Optional: install the PNG sizes for panels that do not load SVGs.
-for size in 16 24 32 48 64 128 256 512 1024; do
-  install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/rustpods.png" \
-    "$HOME/.local/share/icons/hicolor/${size}x${size}/apps/io.github.rustpods.RustPods.png"
-done
-
-update-desktop-database ~/.local/share/applications 2>/dev/null || true
-gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
+systemctl --user enable --now rustpods
 ```
 
-Make sure `~/.local/bin` is on `PATH`.
+### Checking for Updates & Updater
+
+- **GUI**: Navigate to **Preferences** -> **About & Version**, and click **Check for Updates**;
+- **CLI Check**:
+  ```bash
+  rustpods --check-update
+  ```
+- **In-place Online Upgrade** (for Tarball / manual script users):
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/windosx/rustpods/master/contrib/scripts/update.sh | bash
+  # Or run the built-in update command:
+  rustpods --update
+  ```
+  > [!NOTE]
+  > If your installation is managed by a system package manager (AUR / DEB / RPM), RustPods protects system package database integrity by prompting you to update via your package manager (e.g. `yay -S rustpods-bin`) instead of overwriting files in `/usr/bin`.
+
+To uninstall, run `sudo ./uninstall.sh` (or `contrib/scripts/uninstall.sh`).
 
 ## Usage
 

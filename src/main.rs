@@ -18,6 +18,12 @@ struct Cli {
     #[arg(short, long, help = "Enable debug logging")]
     debug: bool,
 
+    #[arg(long, help = "Check if a newer version of RustPods is available")]
+    check_update: bool,
+
+    #[arg(long, help = "Download and install the latest version of RustPods")]
+    update: bool,
+
     #[arg(long, help = "Run in headless daemon mode without GUI")]
     no_gui: bool,
 
@@ -264,6 +270,66 @@ fn main() {
         .expect("Failed to initialize Tokio runtime");
 
     let _guard = rt.enter();
+
+    if cli.check_update {
+        rt.block_on(async {
+            println!("Checking for updates...");
+            match system::updater::check_for_update().await {
+                Ok(Some((latest, url, _))) => {
+                    println!(
+                        "A new version of RustPods is available: v{} (current: v{})",
+                        latest,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    println!("Release URL: {}", url);
+                    if system::updater::is_package_managed() {
+                        println!("Note: This installation appears to be managed by a system package manager (e.g. pacman, dpkg, rpm). Please update using your package manager.");
+                    } else {
+                        println!("Run 'rustpods --update' to download and install this update.");
+                    }
+                }
+                Ok(None) => {
+                    println!(
+                        "RustPods is already up to date (v{}).",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error checking for updates: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+        return;
+    }
+
+    if cli.update {
+        let is_pkg = system::updater::is_package_managed();
+        if is_pkg {
+            eprintln!("Error: This binary is located in a system package directory (/usr/bin).");
+            eprintln!("To prevent package database corruption, please update using your package manager (e.g. yay, apt, dnf).");
+            std::process::exit(1);
+        }
+        println!("Triggering RustPods in-place update...");
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("curl -fsSL https://raw.githubusercontent.com/windosx/rustpods/master/contrib/scripts/update.sh | bash")
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("Update complete.");
+                return;
+            }
+            Ok(s) => {
+                eprintln!("Update exited with status: {:?}", s.code());
+                std::process::exit(s.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!("Failed to run update script: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     if let Some(target) = cli.head_tracking_test.clone() {
         // The diagnostic drives the same AACP link as a running GUI or

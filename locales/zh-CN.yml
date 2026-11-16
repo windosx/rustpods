@@ -190,6 +190,14 @@ preferences:
   serial: "硬件序列号"
   about_title: "关于与版本"
   about_summary: "专为 Linux (Wayland / X11) 打造的 AirPods 高级控制中心与系统服务"
+  check_update: "检查更新"
+  checking_update: "正在检查更新..."
+  up_to_date: "当前已是最新版本"
+  update_available: "发现新版本"
+  view_release_notes: "查看更新说明"
+  update_via_package_manager: "由系统包管理器托管，请使用 yay / apt / dnf 更新"
+  update_via_script: "可运行 update.sh 或一键命令升级"
+  update_failed: "检查更新失败"
 
 popup:
   headphones: "头戴耳机"

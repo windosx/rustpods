@@ -35,6 +35,7 @@ pub enum UiEvent {
     CaseLidOpened,
     CaseLidClosed,
     HeadGesture(crate::core::head_tracking::HeadGesture),
+    UpdateStateChanged(crate::system::updater::UpdateState),
     /// Requests a graceful application shutdown, so every Drop (notably the
     /// HRTF client restoring the default audio sink) runs before exit.
     Quit,
@@ -371,6 +372,12 @@ fn bootstrap_gui(
                             });
                         })
                         .detach();
+                    }
+                    UiEvent::UpdateStateChanged(update_st) => {
+                        state_ev.update(cx, |s, cx| {
+                            s.update_state = update_st;
+                            cx.notify();
+                        });
                     }
                     UiEvent::Quit => {
                         cx.update(|cx| cx.quit());

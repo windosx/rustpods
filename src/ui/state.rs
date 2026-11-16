@@ -379,6 +379,41 @@ impl RustPodsController {
         rust_i18n::set_locale(loc);
         gpui_kit::component::set_locale(loc);
     }
+
+    pub fn check_for_updates(&self) {
+        let tx = self.ui_tx.clone();
+        let _ = tx.send(UiEvent::UpdateStateChanged(
+            crate::system::updater::UpdateState::Checking,
+        ));
+        self.rt.spawn(async move {
+            match crate::system::updater::check_for_update().await {
+                Ok(Some((latest, url, changelog))) => {
+                    let is_pkg = crate::system::updater::is_package_managed();
+                    let _ = tx.send(UiEvent::UpdateStateChanged(
+                        crate::system::updater::UpdateState::UpdateAvailable {
+                            current_version: env!("CARGO_PKG_VERSION").to_string(),
+                            latest_version: latest,
+                            release_url: url,
+                            changelog,
+                            is_package_managed: is_pkg,
+                        },
+                    ));
+                }
+                Ok(None) => {
+                    let _ = tx.send(UiEvent::UpdateStateChanged(
+                        crate::system::updater::UpdateState::UpToDate {
+                            version: env!("CARGO_PKG_VERSION").to_string(),
+                        },
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiEvent::UpdateStateChanged(
+                        crate::system::updater::UpdateState::Error(e),
+                    ));
+                }
+            }
+        });
+    }
 }
 
 /// Reactive application state observed by any open `MainWindow`.
@@ -390,6 +425,7 @@ pub struct RustPodsState {
     pub zcode_resolved: Option<String>,
     pub active_page: NavPage,
     pub theme_mode: ThemeMode,
+    pub update_state: crate::system::updater::UpdateState,
     pub agent_notes: HashMap<&'static str, String>,
     pub agent_testing: HashMap<&'static str, bool>,
     pub controller: RustPodsController,
@@ -413,6 +449,7 @@ impl RustPodsState {
             zcode_resolved: None,
             active_page: NavPage::Overview,
             theme_mode,
+            update_state: crate::system::updater::UpdateState::default(),
             agent_notes: HashMap::new(),
             agent_testing: HashMap::new(),
             controller,

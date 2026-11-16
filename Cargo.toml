@@ -2,6 +2,14 @@
 name = "rustpods"
 version = "0.1.0"
 edition = "2024"
+description = "AirPods Control Center and System Services for Linux"
+authors = ["windosx <windosx@github.com>"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/windosx/rustpods"
+homepage = "https://github.com/windosx/rustpods"
+readme = "README.md"
+keywords = ["airpods", "apple", "bluetooth", "spatial-audio", "head-tracking"]
+categories = ["multimedia::audio", "gui", "hardware-support"]
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
@@ -48,3 +56,60 @@ required-features = ["audio-follow"]
 [[example]]
 name = "verify_hrtf_client"
 required-features = ["audio-follow"]
+
+[package.metadata.deb]
+maintainer = "windosx <windosx@github.com>"
+copyright = "2026, windosx <windosx@github.com>"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+RustPods is an AirPods Control Center and system service for Linux.
+It provides GPU-accelerated control center UI, head-tracked spatial audio,
+head-pose virtual mouse cursor, and open-case battery popups."""
+depends = "$auto, libpipewire-0.3-0, bluez (>= 5.60)"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/rustpods", "usr/bin/rustpods", "755"],
+    ["contrib/io.github.rustpods.RustPods.desktop", "usr/share/applications/io.github.rustpods.RustPods.desktop", "644"],
+    ["contrib/systemd/rustpods.service", "usr/lib/systemd/user/rustpods.service", "644"],
+    ["contrib/udev/70-rustpods.rules", "usr/lib/udev/rules.d/70-rustpods.rules", "644"],
+    ["contrib/pipewire/99-rustpods-hrtf.conf", "usr/share/rustpods/pipewire/99-rustpods-hrtf.conf", "644"],
+    ["assets/icons/hicolor/scalable/apps/rustpods.svg", "usr/share/icons/hicolor/scalable/apps/io.github.rustpods.RustPods.svg", "644"],
+    ["assets/icons/hicolor/16x16/apps/rustpods.png", "usr/share/icons/hicolor/16x16/apps/io.github.rustpods.RustPods.png", "644"],
+    ["assets/icons/hicolor/24x24/apps/rustpods.png", "usr/share/icons/hicolor/24x24/apps/io.github.rustpods.RustPods.png", "644"],
+    ["assets/icons/hicolor/32x32/apps/rustpods.png", "usr/share/icons/hicolor/32x32/apps/io.github.rustpods.RustPods.png", "644"],
+    ["assets/icons/hicolor/48x48/apps/rustpods.png", "usr/share/icons/hicolor/48x48/apps/io.github.rustpods.RustPods.png", "644"],
+    ["assets/icons/hicolor/64x64/apps/rustpods.png", "usr/share/icons/hicolor/64x64/apps/io.github.rustpods.RustPods.png", "644"],
+    ["assets/icons/hicolor/128x128/apps/rustpods.png", "usr/share/icons/hicolor/128x128/apps/io.github.rustpods.RustPods.png", "644"],
+    ["assets/icons/hicolor/256x256/apps/rustpods.png", "usr/share/icons/hicolor/256x256/apps/io.github.rustpods.RustPods.png", "644"],
+    ["assets/icons/hicolor/512x512/apps/rustpods.png", "usr/share/icons/hicolor/512x512/apps/io.github.rustpods.RustPods.png", "644"],
+    ["assets/icons/hicolor/1024x1024/apps/rustpods.png", "usr/share/icons/hicolor/1024x1024/apps/io.github.rustpods.RustPods.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+license = "AGPL-3.0-only"
+summary = "AirPods Control Center and System Services for Linux"
+assets = [
+    { source = "target/release/rustpods", dest = "/usr/bin/rustpods", mode = "755" },
+    { source = "contrib/io.github.rustpods.RustPods.desktop", dest = "/usr/share/applications/io.github.rustpods.RustPods.desktop", mode = "644" },
+    { source = "contrib/systemd/rustpods.service", dest = "/usr/lib/systemd/user/rustpods.service", mode = "644" },
+    { source = "contrib/udev/70-rustpods.rules", dest = "/usr/lib/udev/rules.d/70-rustpods.rules", mode = "644" },
+    { source = "contrib/pipewire/99-rustpods-hrtf.conf", dest = "/usr/share/rustpods/pipewire/99-rustpods-hrtf.conf", mode = "644" },
+    { source = "assets/icons/hicolor/scalable/apps/rustpods.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.rustpods.RustPods.svg", mode = "644" },
+    { source = "assets/icons/hicolor/16x16/apps/rustpods.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.rustpods.RustPods.png", mode = "644" },
+    { source = "assets/icons/hicolor/24x24/apps/rustpods.png", dest = "/usr/share/icons/hicolor/24x24/apps/io.github.rustpods.RustPods.png", mode = "644" },
+    { source = "assets/icons/hicolor/32x32/apps/rustpods.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.rustpods.RustPods.png", mode = "644" },
+    { source = "assets/icons/hicolor/48x48/apps/rustpods.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.rustpods.RustPods.png", mode = "644" },
+    { source = "assets/icons/hicolor/64x64/apps/rustpods.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.rustpods.RustPods.png", mode = "644" },
+    { source = "assets/icons/hicolor/128x128/apps/rustpods.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.rustpods.RustPods.png", mode = "644" },
+    { source = "assets/icons/hicolor/256x256/apps/rustpods.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.rustpods.RustPods.png", mode = "644" },
+    { source = "assets/icons/hicolor/512x512/apps/rustpods.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.rustpods.RustPods.png", mode = "644" },
+    { source = "assets/icons/hicolor/1024x1024/apps/rustpods.png", dest = "/usr/share/icons/hicolor/1024x1024/apps/io.github.rustpods.RustPods.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+pipewire-libs = "*"
+bluez = ">= 5.60"
+dbus-libs = "*"
+libxkbcommon = "*"
+

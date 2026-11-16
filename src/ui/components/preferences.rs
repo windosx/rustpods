@@ -1,4 +1,5 @@
 use crate::system::config::AppLanguage;
+use crate::system::updater::{open_browser, UpdateState};
 use crate::ui::state::RustPodsState;
 use crate::ui::theme::{apply_apple_theme, grouped_card, section_header, setting_row, ApplePalette};
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants as _};
@@ -282,7 +283,126 @@ pub fn render_preferences_page(
                 )),
         )
         .child(section_header(p, &rust_i18n::t!("preferences.about_title"), None))
-        .child(
+        .child({
+            let update_control = match &state.update_state {
+                UpdateState::Idle => {
+                    let app_check = app_state.clone();
+                    div()
+                        .child(
+                            Button::new("check-update-btn")
+                                .ghost()
+                                .compact()
+                                .rounded(ButtonRounded::Size(px(999.)))
+                                .label(rust_i18n::t!("preferences.check_update"))
+                                .on_click(move |_, _, cx| {
+                                    app_check.read(cx).controller.check_for_updates();
+                                }),
+                        )
+                        .into_any_element()
+                }
+                UpdateState::Checking => div()
+                    .text_size(px(12.))
+                    .text_color(p.text_secondary)
+                    .child(rust_i18n::t!("preferences.checking_update"))
+                    .into_any_element(),
+                UpdateState::UpToDate { .. } => {
+                    let app_check = app_state.clone();
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            Tag::success()
+                                .outline()
+                                .child(rust_i18n::t!("preferences.up_to_date")),
+                        )
+                        .child(
+                            Button::new("recheck-update-btn")
+                                .ghost()
+                                .compact()
+                                .rounded(ButtonRounded::Size(px(999.)))
+                                .label(rust_i18n::t!("preferences.check_update"))
+                                .on_click(move |_, _, cx| {
+                                    app_check.read(cx).controller.check_for_updates();
+                                }),
+                        )
+                        .into_any_element()
+                }
+                UpdateState::UpdateAvailable {
+                    latest_version,
+                    release_url,
+                    is_package_managed,
+                    ..
+                } => {
+                    let rel_url = release_url.clone();
+                    let is_pkg = *is_package_managed;
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .items_end()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    Tag::warning()
+                                        .outline()
+                                        .child(format!("{}: v{}", rust_i18n::t!("preferences.update_available"), latest_version)),
+                                )
+                                .child(
+                                    Button::new("view-release-btn")
+                                        .primary()
+                                        .compact()
+                                        .rounded(ButtonRounded::Size(px(999.)))
+                                        .label(rust_i18n::t!("preferences.view_release_notes"))
+                                        .on_click(move |_, _, _| {
+                                            let _ = open_browser(&rel_url);
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(p.text_secondary)
+                                .child(if is_pkg {
+                                    rust_i18n::t!("preferences.update_via_package_manager")
+                                } else {
+                                    rust_i18n::t!("preferences.update_via_script")
+                                }),
+                        )
+                        .into_any_element()
+                }
+                UpdateState::Error(err) => {
+                    let app_check = app_state.clone();
+                    let err_text = err.clone();
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            Tag::danger()
+                                .outline()
+                                .child(format!("{}: {}", rust_i18n::t!("preferences.update_failed"), err_text)),
+                        )
+                        .child(
+                            Button::new("retry-update-btn")
+                                .ghost()
+                                .compact()
+                                .rounded(ButtonRounded::Size(px(999.)))
+                                .label(rust_i18n::t!("preferences.check_update"))
+                                .on_click(move |_, _, cx| {
+                                    app_check.read(cx).controller.check_for_updates();
+                                }),
+                        )
+                        .into_any_element()
+                }
+            };
+
             grouped_card(p).child(
                 div()
                     .w_full()
@@ -328,7 +448,8 @@ pub fn render_preferences_page(
                                     .text_color(p.text_secondary)
                                     .child(rust_i18n::t!("preferences.about_summary")),
                             ),
-                    ),
-            ),
-        )
+                    )
+                    .child(update_control),
+            )
+        })
 }

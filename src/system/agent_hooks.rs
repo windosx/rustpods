@@ -107,10 +107,10 @@ mod tests {
     #[test]
     fn zcode_status_reflects_this_machines_config() {
         // The real config may or may not carry the hook; the call must not
-        // panic either way, and this machine has the hook installed.
+        // panic either way.
         match registered_agents()[0].status() {
             HookInstallStatus::Installed(cmd) => assert!(cmd.contains("rustpods")),
-            other => panic!("expected the hook to be installed on this machine, got {other:?}"),
+            HookInstallStatus::NotInstalled | HookInstallStatus::ConfigUnreadable(_) => {}
         }
     }
 }

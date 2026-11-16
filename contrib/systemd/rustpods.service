@@ -1,0 +1,15 @@
+[Unit]
+Description=RustPods AirPods Background Service
+Documentation=https://github.com/windosx/rustpods
+After=bluetooth.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rustpods --no-gui
+Restart=on-failure
+RestartSec=3s
+Slice=app-graphical.slice
+
+[Install]
+WantedBy=graphical-session.target default.target

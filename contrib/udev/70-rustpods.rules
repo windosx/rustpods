@@ -1,0 +1,8 @@
+# RustPods udev rule for head-pose virtual mouse (/dev/uinput).
+#
+# Grants read/write access to the currently active seat/desktop user via systemd uaccess.
+# This eliminates the need for sudo or polkit privilege escalation when enabling the Head Mouse.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+
+# Fallback: allow write access to members of the 'input' group on systems without systemd-logind.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

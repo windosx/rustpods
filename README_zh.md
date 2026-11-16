@@ -106,40 +106,80 @@ cargo build --release --no-default-features
 
 界面、托盘、AACP 协议栈和姿态鼠标仍然可用，仅头部追踪音频输出不可用。
 
-## 编译
+## 安装
+
+### 方式一：包管理器与预编译安装（推荐）
+
+#### Arch Linux (AUR)
+```bash
+yay -S rustpods-bin   # 预编译二进制包（推荐，无需本地编译）
+# 或从源码编译：
+yay -S rustpods
+```
+
+#### Debian / Ubuntu (.deb)
+从 [Releases 页面](https://github.com/windosx/rustpods/releases) 下载最新的 `.deb` 文件：
+```bash
+sudo apt install ./rustpods_*_amd64.deb
+```
+
+#### Fedora / openSUSE (.rpm)
+从 [Releases 页面](https://github.com/windosx/rustpods/releases) 下载最新的 `.rpm` 文件：
+```bash
+sudo dnf install ./rustpods-*.x86_64.rpm
+```
+
+#### 通用 Release 归档包 (Tarball)
+从 [Releases 页面](https://github.com/windosx/rustpods/releases) 下载 `rustpods-v*-linux-x86_64.tar.gz`：
+```bash
+tar -xzf rustpods-v*-linux-x86_64.tar.gz
+cd rustpods-v*-linux-x86_64
+sudo ./install.sh        # 系统级安装（推荐，自动配置 udev 权限与服务）
+# 或免 root 用户目录安装：
+./install.sh             # 安装到 ~/.local
+```
+
+### 方式二：从源码编译安装
 
 ```bash
 git clone https://github.com/windosx/rustpods.git
 cd rustpods
 cargo build --release
+
+# 使用自带安装脚本一键安装到系统或 ~/.local：
+sudo ./contrib/scripts/install.sh   # 安装到 /usr/local
+# 或
+./contrib/scripts/install.sh        # 安装到 ~/.local
 ```
 
-产物位于 `target/release/rustpods`。
+> [!TIP]
+> **头部姿态鼠标免密权限**：通过包管理器或 `sudo ./install.sh` 安装会自动部署 `/etc/udev/rules.d/70-rustpods.rules`，登录桌面的当前用户自动获得 `/dev/uinput` 访问权限，使用头部姿态鼠标无需输入 root 密码或通过 Polkit 弹窗授权。
 
-## 安装
+### 后台常驻与开机自启 (systemd)
 
-把二进制和桌面文件安装到用户目录：
+RustPods 提供了用户级 systemd 服务单元。安装后可通过以下命令启用托盘常驻守护进程：
 
 ```bash
-install -Dm755 target/release/rustpods ~/.local/bin/rustpods
-
-install -Dm644 contrib/io.github.rustpods.RustPods.desktop \
-  ~/.local/share/applications/io.github.rustpods.RustPods.desktop
-
-install -Dm644 assets/icons/hicolor/scalable/apps/rustpods.svg \
-  ~/.local/share/icons/hicolor/scalable/apps/io.github.rustpods.RustPods.svg
-
-# 可选：为不加载 SVG 的面板安装 PNG 尺寸。
-for size in 16 24 32 48 64 128 256 512 1024; do
-  install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/rustpods.png" \
-    "$HOME/.local/share/icons/hicolor/${size}x${size}/apps/io.github.rustpods.RustPods.png"
-done
-
-update-desktop-database ~/.local/share/applications 2>/dev/null || true
-gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
+systemctl --user enable --now rustpods
 ```
 
-确保 `~/.local/bin` 在 `PATH` 中。
+### 版本更新与 Updater
+
+- **图形界面**：进入 **偏好设置** -> **关于与版本**，点击 **检查更新**。若有新版本，点击可直接查看发行说明；
+- **终端检查更新**：
+  ```bash
+  rustpods --check-update
+  ```
+- **独立安装一键在线升级**（适用于 Tarball / 脚本安装用户）：
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/windosx/rustpods/master/contrib/scripts/update.sh | bash
+  # 或执行内置自更新命令：
+  rustpods --update
+  ```
+  > [!NOTE]
+  > 若当前版本由包管理器（AUR / DEB / RPM）托管，RustPods 会自动阻止自更新以防止破坏系统包数据库，并提示使用对应的包管理器命令进行升级（如 `yay -S rustpods-bin`）。
+
+若需卸载，运行 `sudo ./uninstall.sh`（或 `contrib/scripts/uninstall.sh`）即可清理全部文件。
 
 ## 使用
 

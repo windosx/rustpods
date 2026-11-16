@@ -6,4 +6,5 @@ pub mod head_mouse;
 pub mod le_monitor;
 pub mod mpris;
 pub mod tray;
+pub mod updater;
 pub mod zcode_ask;

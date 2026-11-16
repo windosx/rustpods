@@ -1,0 +1,40 @@
+# Maintainer: windosx <windosx@github.com>
+pkgname=rustpods-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="AirPods Control Center and System Services for Linux (Prebuilt binary)"
+arch=('x86_64')
+url="https://github.com/windosx/rustpods"
+license=('AGPL-3.0-only')
+depends=('pipewire' 'libpipewire-0.3.so' 'bluez' 'libxkbcommon' 'libxkbcommon-x11')
+optdepends=(
+    'pipewire-module-filter-chain-sofa: For head-tracked spatial audio'
+)
+provides=('rustpods')
+conflicts=('rustpods')
+source=("${url}/releases/download/v${pkgver}/rustpods-v${pkgver}-linux-${arch}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "${srcdir}/rustpods-v${pkgver}-linux-${arch}"
+
+    install -Dm755 rustpods "${pkgdir}/usr/bin/rustpods"
+    install -Dm644 contrib/io.github.rustpods.RustPods.desktop "${pkgdir}/usr/share/applications/io.github.rustpods.RustPods.desktop"
+    install -Dm644 contrib/systemd/rustpods.service "${pkgdir}/usr/lib/systemd/user/rustpods.service"
+    install -Dm644 contrib/udev/70-rustpods.rules "${pkgdir}/usr/lib/udev/rules.d/70-rustpods.rules"
+    install -Dm644 contrib/pipewire/99-rustpods-hrtf.conf "${pkgdir}/usr/share/rustpods/pipewire/99-rustpods-hrtf.conf"
+
+    # Icons
+    install -Dm644 assets/icons/hicolor/scalable/apps/rustpods.svg \
+        "${pkgdir}/usr/share/icons/hicolor/scalable/apps/io.github.rustpods.RustPods.svg"
+    for size in 16 24 32 48 64 128 256 512 1024; do
+        if [ -f "assets/icons/hicolor/${size}x${size}/apps/rustpods.png" ]; then
+            install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/rustpods.png" \
+                "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/io.github.rustpods.RustPods.png"
+        fi
+    done
+
+    # Licenses
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 NOTICE "${pkgdir}/usr/share/licenses/${pkgname}/NOTICE"
+}

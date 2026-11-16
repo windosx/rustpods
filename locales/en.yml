@@ -190,6 +190,14 @@ preferences:
   serial: "Serial Number"
   about_title: "About & Version"
   about_summary: "AirPods Control Center and System Services for Linux (Wayland / X11)"
+  check_update: "Check for Updates"
+  checking_update: "Checking for updates..."
+  up_to_date: "You are on the latest version"
+  update_available: "New version available"
+  view_release_notes: "View Release Notes"
+  update_via_package_manager: "Managed by package manager; update via yay / apt / dnf"
+  update_via_script: "Run update.sh or one-line command to upgrade"
+  update_failed: "Failed to check for updates"
 
 popup:
   headphones: "AirPods"

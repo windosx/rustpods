@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            libclang-dev \
+            libpipewire-0.3-dev \
+            pkg-config \
+            libdbus-1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libudev-dev
+
+      - name: Install packaging tools (cargo-binstall, cargo-deb, cargo-generate-rpm)
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall -y --no-confirm cargo-deb cargo-generate-rpm
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --all-features
+
+      - name: Strip release binary
+        run: strip target/release/rustpods
+
+      - name: Package Tarball
+        run: |
+          ./contrib/scripts/package-tarball.sh "${{ steps.get_version.outputs.VERSION }}" "x86_64"
+
+      - name: Build DEB package
+        run: |
+          cargo deb --no-build
+
+      - name: Build RPM package
+        run: |
+          cargo generate-rpm
+
+      - name: Collect release artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp dist/*.tar.gz release-artifacts/
+          cp target/debian/*.deb release-artifacts/
+          cp target/generate-rpm/*.rpm release-artifacts/
+          cd release-artifacts
+          sha256sum * > SHA256SUMS
+          ls -la
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.TAG }}
+          name: RustPods ${{ steps.get_version.outputs.TAG }}
+          files: release-artifacts/*
+          draft: false
+          prerelease: ${{ contains(steps.get_version.outputs.TAG, '-') }}
+          generate_release_notes: true
