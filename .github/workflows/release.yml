@@ -50,7 +50,10 @@ jobs:
             libdbus-1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
-            libudev-dev
+            libudev-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libasound2-dev
 
       - name: Install packaging tools (cargo-binstall, cargo-deb, cargo-generate-rpm)
         run: |
