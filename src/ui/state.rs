@@ -410,6 +410,7 @@ impl RustPodsController {
                             release_url: url,
                             changelog,
                             is_package_managed: is_pkg,
+                            can_self_update: crate::system::updater::can_self_update(),
                         },
                     ));
                 }
@@ -427,6 +428,62 @@ impl RustPodsController {
                 }
             }
         });
+    }
+
+    /// Downloads and installs the pending release in the background. The
+    /// installer is the same `rustpods --update` path the CLI uses, so the
+    /// package-manager guard and checksum handling stay in one place.
+    pub fn install_update(&self, latest_version: String) {
+        let tx = self.ui_tx.clone();
+        let _ = tx.send(UiEvent::UpdateStateChanged(
+            crate::system::updater::UpdateState::Installing {
+                latest_version: latest_version.clone(),
+            },
+        ));
+        self.rt.spawn(async move {
+            match crate::system::updater::install_update().await {
+                Ok(()) => {
+                    let _ = tx.send(UiEvent::UpdateStateChanged(
+                        crate::system::updater::UpdateState::Updated {
+                            version: latest_version,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiEvent::UpdateStateChanged(
+                        crate::system::updater::UpdateState::Error(e),
+                    ));
+                }
+            }
+        });
+    }
+
+    /// Relaunches the freshly installed binary after this process releases the
+    /// single-instance lock. A detached shell waits for the current PID to
+    /// disappear and then execs the installed path, so the new process starts
+    /// with the lock already free.
+    pub fn restart_app(&self) {
+        let exe = crate::system::updater::restart_binary_path();
+        let pid = std::process::id().to_string();
+        let exe = exe.to_string_lossy().into_owned();
+        let spawned = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec \"$2\"",
+                "rustpods-restart",
+                &pid,
+                &exe,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok();
+        if spawned {
+            let _ = self.ui_tx.send(UiEvent::Quit);
+        } else {
+            tracing::warn!("Failed to spawn the RustPods restart helper");
+        }
     }
 }
 

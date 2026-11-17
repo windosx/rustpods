@@ -472,6 +472,16 @@ mod tests {
         assert_eq!(rust_i18n::t!("preferences.language", locale = "en"), "Language");
         assert_eq!(rust_i18n::t!("hero.connecting", locale = "zh-CN"), "连接中...");
         assert_eq!(rust_i18n::t!("hero.connecting", locale = "en"), "Connecting...");
+        assert_eq!(rust_i18n::t!("preferences.update_now", locale = "zh-CN"), "立即升级");
+        assert_eq!(rust_i18n::t!("preferences.update_now", locale = "en"), "Update Now");
+        assert_eq!(
+            rust_i18n::t!("preferences.update_complete", version = "0.2.0", locale = "zh-CN"),
+            "已升级到 v0.2.0，重启后生效"
+        );
+        assert_eq!(
+            rust_i18n::t!("preferences.update_complete", version = "0.2.0", locale = "en"),
+            "Updated to v0.2.0; restart to apply"
+        );
     }
 
     #[test]

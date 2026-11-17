@@ -304,6 +304,11 @@ pub fn render_preferences_page(
                 UpdateState::Idle => {
                     let app_check = app_state.clone();
                     div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
                         .child(
                             Button::new("check-update-btn")
                                 .ghost()
@@ -326,6 +331,7 @@ pub fn render_preferences_page(
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .items_center()
                         .gap(px(8.))
                         .child(
@@ -349,45 +355,121 @@ pub fn render_preferences_page(
                     latest_version,
                     release_url,
                     is_package_managed,
+                    can_self_update,
                     ..
                 } => {
                     let rel_url = release_url.clone();
+                    let latest = latest_version.clone();
                     let is_pkg = *is_package_managed;
+                    let can_self = *can_self_update;
+                    let app_install = app_state.clone();
+                    let hint = if is_pkg {
+                        rust_i18n::t!("preferences.update_via_package_manager")
+                    } else if can_self {
+                        rust_i18n::t!("preferences.update_ready_hint")
+                    } else {
+                        rust_i18n::t!("preferences.update_via_script")
+                    };
+
+                    let mut actions = div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            Tag::warning().outline().child(format!(
+                                "{}: v{}",
+                                rust_i18n::t!("preferences.update_available"),
+                                latest
+                            )),
+                        );
+                    if can_self {
+                        actions = actions.child(
+                            Button::new("install-update-btn")
+                                .primary()
+                                .compact()
+                                .rounded(ButtonRounded::Size(px(999.)))
+                                .label(rust_i18n::t!("preferences.update_now"))
+                                .on_click(move |_, _, cx| {
+                                    app_install
+                                        .read(cx)
+                                        .controller
+                                        .install_update(latest.clone());
+                                }),
+                        );
+                    }
+                    actions = actions.child(
+                        Button::new("view-release-btn")
+                            .ghost()
+                            .compact()
+                            .rounded(ButtonRounded::Size(px(999.)))
+                            .label(rust_i18n::t!("preferences.view_release_notes"))
+                            .on_click(move |_, _, _| {
+                                let _ = open_browser(&rel_url);
+                            }),
+                    );
+
                     div()
+                        .w_full()
+                        .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap(px(4.))
-                        .items_end()
+                        .gap(px(6.))
+                        .child(actions)
                         .child(
                             div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(
-                                    Tag::warning()
-                                        .outline()
-                                        .child(format!("{}: v{}", rust_i18n::t!("preferences.update_available"), latest_version)),
-                                )
-                                .child(
-                                    Button::new("view-release-btn")
-                                        .primary()
-                                        .compact()
-                                        .rounded(ButtonRounded::Size(px(999.)))
-                                        .label(rust_i18n::t!("preferences.view_release_notes"))
-                                        .on_click(move |_, _, _| {
-                                            let _ = open_browser(&rel_url);
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
+                                .w_full()
+                                .min_w_0()
                                 .text_size(px(11.))
                                 .text_color(p.text_secondary)
-                                .child(if is_pkg {
-                                    rust_i18n::t!("preferences.update_via_package_manager")
-                                } else {
-                                    rust_i18n::t!("preferences.update_via_script")
+                                .child(hint),
+                        )
+                        .into_any_element()
+                }
+                UpdateState::Installing { latest_version } => div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        Tag::warning().outline().child(format!(
+                            "{}: v{}",
+                            rust_i18n::t!("preferences.updating"),
+                            latest_version
+                        )),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_size(px(11.))
+                            .text_color(p.text_secondary)
+                            .child(rust_i18n::t!("preferences.updating_hint")),
+                    )
+                    .into_any_element(),
+                UpdateState::Updated { version } => {
+                    let app_restart = app_state.clone();
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(Tag::success().outline().child(
+                            rust_i18n::t!("preferences.update_complete", version = version),
+                        ))
+                        .child(
+                            Button::new("restart-app-btn")
+                                .primary()
+                                .compact()
+                                .rounded(ButtonRounded::Size(px(999.)))
+                                .label(rust_i18n::t!("preferences.restart_now"))
+                                .on_click(move |_, _, cx| {
+                                    app_restart.read(cx).controller.restart_app();
                                 }),
                         )
                         .into_any_element()
@@ -396,24 +478,41 @@ pub fn render_preferences_page(
                     let app_check = app_state.clone();
                     let err_text = err.clone();
                     div()
+                        .w_full()
+                        .min_w_0()
                         .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.))
+                        .flex_col()
+                        .gap(px(6.))
                         .child(
-                            Tag::danger()
-                                .outline()
-                                .child(format!("{}: {}", rust_i18n::t!("preferences.update_failed"), err_text)),
+                            div()
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    Tag::danger()
+                                        .outline()
+                                        .child(rust_i18n::t!("preferences.update_failed")),
+                                )
+                                .child(
+                                    Button::new("retry-update-btn")
+                                        .ghost()
+                                        .compact()
+                                        .rounded(ButtonRounded::Size(px(999.)))
+                                        .label(rust_i18n::t!("preferences.check_update"))
+                                        .on_click(move |_, _, cx| {
+                                            app_check.read(cx).controller.check_for_updates();
+                                        }),
+                                ),
                         )
                         .child(
-                            Button::new("retry-update-btn")
-                                .ghost()
-                                .compact()
-                                .rounded(ButtonRounded::Size(px(999.)))
-                                .label(rust_i18n::t!("preferences.check_update"))
-                                .on_click(move |_, _, cx| {
-                                    app_check.read(cx).controller.check_for_updates();
-                                }),
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_size(px(11.))
+                                .text_color(p.accent_red)
+                                .child(err_text),
                         )
                         .into_any_element()
                 }
@@ -422,50 +521,64 @@ pub fn render_preferences_page(
             grouped_card(p).child(
                 div()
                     .w_full()
+                    .min_w_0()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(16.))
+                    .flex_col()
+                    .gap(px(12.))
                     .px(px(18.))
                     .py(px(16.))
                     .child(
-                        gpui_kit::gpui::img("icons/rustpods.png")
-                            .size(px(48.))
-                            .rounded(px(10.)),
-                    )
-                    .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .flex_1()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(16.))
                             .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .child(
-                                        div()
-                                            .text_size(px(15.))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(p.text_primary)
-                                            .child("RustPods"),
-                                    )
-                                    .child(
-                                        Tag::success()
-                                            .outline()
-                                            .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
-                                    ),
+                                gpui_kit::gpui::img("icons/rustpods.png")
+                                    .size(px(48.))
+                                    .rounded(px(10.)),
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.))
-                                    .text_color(p.text_secondary)
-                                    .child(rust_i18n::t!("preferences.about_summary")),
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .flex_wrap()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .text_size(px(15.))
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(p.text_primary)
+                                                    .child("RustPods"),
+                                            )
+                                            .child(
+                                                Tag::success().outline().child(format!(
+                                                    "v{}",
+                                                    env!("CARGO_PKG_VERSION")
+                                                )),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .text_size(px(12.))
+                                            .text_color(p.text_secondary)
+                                            .child(rust_i18n::t!("preferences.about_summary")),
+                                    ),
                             ),
                     )
-                    .child(update_control),
+                    .child(div().w_full().min_w_0().child(update_control)),
             )
         })
 }
