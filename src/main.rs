@@ -13,7 +13,11 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
-#[command(name = "rustpods", about = "Linux AirPods Control & macOS Parity Experience")]
+#[command(
+    name = "rustpods",
+    version,
+    about = "Linux AirPods Control & macOS Parity Experience"
+)]
 struct Cli {
     #[arg(short, long, help = "Enable debug logging")]
     debug: bool,
@@ -1190,4 +1194,19 @@ async fn prepare_connection(target: &str) -> Option<Arc<core::aacp::AacpManager>
     });
 
     Some(aacp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// `contrib/scripts/update.sh` reads the installed version from
+    /// `rustpods --version`; without this flag its up-to-date short-circuit is
+    /// dead code and every update re-downloads the release.
+    #[test]
+    fn cli_exposes_version_for_the_updater() {
+        let command = Cli::command();
+        assert_eq!(command.get_version(), Some(env!("CARGO_PKG_VERSION")));
+    }
 }
