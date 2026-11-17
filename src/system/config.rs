@@ -145,6 +145,12 @@ pub struct AppConfig {
     /// AirPods case lid is opened nearby.
     #[serde(default = "default_true")]
     pub case_popup_enabled: bool,
+    /// Run a background BLE scan for the AirPods case proximity advertisement
+    /// (lid-open popups and battery updates while disconnected). This is the
+    /// escape hatch for machines where background scanning disturbs other
+    /// Bluetooth input devices' automatic reconnection.
+    #[serde(default = "default_true")]
+    pub ble_scan_enabled: bool,
     /// Cached Apple Proximity IRK (16 bytes, lowercase hex) for verifying BLE
     /// Resolvable Private Addresses when the case lid opens before Classic BT connects.
     #[serde(default)]
@@ -218,6 +224,7 @@ impl Default for AppConfig {
             head_gesture_answers_enabled: true,
             gesture_sensitivity: 3,
             case_popup_enabled: true,
+            ble_scan_enabled: true,
             proximity_irk: None,
             proximity_enc_key: None,
             head_mouse_enabled: false,
@@ -424,6 +431,7 @@ mod tests {
             close_to_tray: false,
             head_gesture_answers_enabled: false,
             case_popup_enabled: false,
+            ble_scan_enabled: false,
             proximity_irk: Some("0123456789abcdef0123456789abcdef".to_string()),
             proximity_enc_key: Some("fedcba9876543210fedcba9876543210".to_string()),
             head_mouse_enabled: true,
@@ -485,6 +493,7 @@ mod tests {
         let (loaded, outcome) = load_config_from(&path);
         assert_eq!(outcome, ConfigLoad::Loaded);
         assert!(!loaded.head_mouse_enabled);
+        assert!(loaded.ble_scan_enabled, "missing field must default to on");
         assert_eq!(loaded.head_mouse_speed, 20.0);
         assert_eq!(loaded.head_mouse_accel, 1.0);
         assert_eq!(loaded.head_mouse_smoothing, 0.35);

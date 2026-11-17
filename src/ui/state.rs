@@ -252,6 +252,15 @@ impl RustPodsController {
         }
     }
 
+    /// Enables/disables the background BLE proximity scan. The scanner polls
+    /// the flag, so the change takes effect without restarting the daemon.
+    pub fn toggle_ble_scan(&self, enabled: bool) {
+        if let Ok(mut c) = self.config.write() {
+            c.ble_scan_enabled = enabled;
+            save_config(&c);
+        }
+    }
+
     pub fn preview_case_popup(&self) {
         let _ = self.ui_tx.send(UiEvent::CaseLidOpened);
     }

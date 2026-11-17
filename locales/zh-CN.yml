@@ -177,6 +177,8 @@ preferences:
   close_to_tray_desc: "保持后台蓝牙状态监控与快捷联动，不退出后台守护程序"
   case_popup: "开盖时显示 iOS 风格弹窗"
   case_popup_desc: "在电脑附近打开 AirPods 充电盒盖时，右上角浮动显示动画卡片"
+  ble_scan: "后台扫描 AirPods 开盖广播"
+  ble_scan_desc: "AirPods 未连接时扫描充电盒广播；若影响其他蓝牙键鼠自动回连，可关闭此项（连接期间始终暂停扫描）"
   preview_popup: "预览弹窗"
   tray_feature: "圆形电量动态托盘"
   tray_feature_desc: "支持 StatusNotifierItem 规范，动态绘制双耳最低电量进度圈"

@@ -177,6 +177,8 @@ preferences:
   close_to_tray_desc: "Keep Bluetooth monitoring and tray icon active when window is closed"
   case_popup: "Show Case Lid Popup"
   case_popup_desc: "Float iOS-style card on top right when AirPods case is opened nearby"
+  ble_scan: "Scan for AirPods Case Advertising"
+  ble_scan_desc: "Scan while AirPods are disconnected; disable this if background scanning interferes with other Bluetooth input devices reconnecting (scanning is always paused while connected)"
   preview_popup: "Preview Popup"
   tray_feature: "Circular Battery Tray"
   tray_feature_desc: "Live circular battery icon compatible with StatusNotifierItem"

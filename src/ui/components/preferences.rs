@@ -20,6 +20,7 @@ pub fn render_preferences_page(
     let dev = &state.device;
     let app_tray = app_state.clone();
     let app_popup = app_state.clone();
+    let app_ble_scan = app_state.clone();
     let app_preview = app_state.clone();
     let app_theme_light = app_state.clone();
     let app_theme_dark = app_state.clone();
@@ -216,6 +217,21 @@ pub fn render_preferences_page(
                                     });
                                 }),
                         ),
+                    true,
+                ))
+                .child(setting_row(
+                    p,
+                    &rust_i18n::t!("preferences.ble_scan"),
+                    Some(&rust_i18n::t!("preferences.ble_scan_desc")),
+                    Switch::new("ble-scan-switch")
+                        .checked(cfg.ble_scan_enabled)
+                        .on_change(move |checked, _, cx| {
+                            let val = *checked;
+                            app_ble_scan.update(cx, |s, cx| {
+                                s.controller.toggle_ble_scan(val);
+                                cx.notify();
+                            });
+                        }),
                     true,
                 ))
                 .child(setting_row(
