@@ -47,7 +47,7 @@ pub fn render_agents_page(
             }
         };
 
-        let app_test = app_state.clone();
+        let app_test_perm = app_state.clone();
         let app_install = app_state.clone();
         let agent_id = agent.id;
 
@@ -57,20 +57,24 @@ pub fn render_agents_page(
             .items_center()
             .gap(px(8.))
             .child(
-                Button::new(("agent-test", idx))
+                Button::new(("agent-test-perm", idx))
                     .secondary()
                     .compact()
                     .rounded(ButtonRounded::Size(px(999.)))
                     .loading(is_testing)
-                    .label(if is_testing { rust_i18n::t!("agents.testing") } else { rust_i18n::t!("agents.test") })
+                    .label(if is_testing {
+                        rust_i18n::t!("agents.testing")
+                    } else {
+                        rust_i18n::t!("agents.test")
+                    })
                     .on_click(move |_, _, cx| {
-                        app_test.update(cx, |s, cx| {
+                        app_test_perm.update(cx, |s, cx| {
                             s.agent_testing.insert(agent_id, true);
                             s.agent_notes.insert(
                                 agent_id,
-                                "Test in progress: nod to answer, or wait...".to_string(),
+                                "Permission test: nod to allow, shake to deny...".to_string(),
                             );
-                            let rx = s.controller.start_agent_test(agent.display_name);
+                            let rx = s.controller.start_agent_permission_test(agent.display_name);
                             cx.notify();
 
                             cx.spawn(async move |this, cx| {
@@ -78,15 +82,16 @@ pub fn render_agents_page(
                                     return;
                                 };
                                 let msg = match result {
-                                    Ok(AskReply::Select { index, label }) => {
-                                        format!("Test passed: selected #{} \"{}\"", index + 1, label)
+                                    Ok(AskReply::Allow) => {
+                                        "Test passed: nodded to allow permission".to_string()
                                     }
-                                    Ok(AskReply::BatchSelect { selections }) => {
-                                        format!("Test passed: completed {} questions", selections.len())
+                                    Ok(AskReply::Deny) => {
+                                        "Test passed: shook head to deny permission".to_string()
                                     }
                                     Ok(AskReply::Pass) => {
-                                        "Test completed: passed through".to_string()
+                                        "Test completed: passed through to terminal".to_string()
                                     }
+                                    Ok(other) => format!("Test result: {:?}", other),
                                     Err(e) => format!("Test failed: {}", e),
                                 };
                                 let _ = this.update(cx, |s, cx| {
@@ -173,19 +178,19 @@ pub fn render_agents_page(
                         .child(rust_i18n::t!("agents.desc")),
                 ),
         )
-        .child(section_header(p, &rust_i18n::t!("agents.nod_answers"), None))
+        .child(section_header(p, &rust_i18n::t!("agents.permission_answers"), None))
         .child(
             grouped_card(p)
                 .child(setting_row(
                     p,
-                    &rust_i18n::t!("agents.nod_answers"),
-                    Some(&rust_i18n::t!("agents.nod_answers_desc")),
-                    Switch::new("head-gesture-answers-switch")
-                        .checked(cfg.head_gesture_answers_enabled)
+                    &rust_i18n::t!("agents.permission_answers"),
+                    Some(&rust_i18n::t!("agents.permission_answers_desc")),
+                    Switch::new("gesture-permission-answers-switch")
+                        .checked(cfg.gesture_permission_answers_enabled)
                         .on_change(move |checked, _, cx| {
                             let val = *checked;
                             app_toggle.update(cx, |s, cx| {
-                                s.controller.toggle_head_gesture_answers(val);
+                                s.controller.toggle_gesture_permission_answers(val);
                                 cx.notify();
                             });
                         }),
@@ -201,7 +206,7 @@ pub fn render_agents_page(
         )
         .child(section_header(
             p,
-            &rust_i18n::t!("agents.title"),
+            &rust_i18n::t!("agents.hook_title"),
             None,
         ))
         .child(agents_group)

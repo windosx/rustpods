@@ -1,26 +1,25 @@
-//! Answers ZCode `AskUserQuestion` prompts by counting head nods.
+//! Approves sensitive agent tool permissions hands-free via head gestures.
 //!
-//! ZCode Desktop renders its question panel as a mouse-driven widget with no
-//! keyboard handling, so injecting keystrokes cannot select an option. What
-//! ZCode *does* offer is a `PreToolUse` hook that receives the full question
-//! payload and may block the tool while it runs. This module is both ends of
-//! that channel:
+//! Desktop AI agents (like ZCode, Codex) frequently prompt for user permission
+//! before executing sensitive tools (such as terminal commands via `Bash`,
+//! file edits via `Write` or `edit_file`). RustPods provides a `PreToolUse` hook
+//! that receives permission prompts and lets the wearer approve or deny them
+//! using natural head gestures:
 //!
-//! * `rustpods --zcode-ask-hook` is the hook command. It reads the hook JSON
-//!   from stdin, forwards the question over a Unix socket to the running
-//!   RustPods instance, and translates the reply into hook output. Every
-//!   failure path falls back to "ask", which leaves the normal question UI in
-//!   place - a broken gesture channel must never wedge ZCode.
+//! * **Nod** (点头) -> **Allow** (允许执行)
+//! * **Shake head** (摇头) -> **Deny** (拒绝执行)
+//! * **Timeout or Close** -> **Pass** (回退至终端原生提示)
+//!
+//! This module implements both ends of that channel:
+//!
+//! * `rustpods --zcode-ask-hook` / `rustpods --codex-ask-hook` is the hook command.
+//!   It reads the hook JSON from stdin, forwards the request over a Unix socket
+//!   to the running RustPods daemon, and translates the reply into hook output.
+//!   Every failure path falls back to "ask" / "pass" without blocking.
 //! * [`run_socket_server`] runs inside RustPods (GUI or `--no-gui` daemon). It
-//!   registers the question in the [`ASK_HUB`], which surfaces it as the ask
-//!   card in the UI, and waits for [`run_question_answers`] - the tokio task
-//!   feeding head poses to the
-//!   [`NodCounter`](crate::core::nod_counter::NodCounter) - to resolve it.
-//!
-//! The answer travels back as a `deny` decision whose reason carries the
-//! choice, which the agent reads as the user's answer. Shaking the head,
-//! nodding past the option count, or simply doing nothing for a couple of
-//! minutes passes through, and ZCode shows its normal question UI.
+//!   registers the permission request in the [`ASK_HUB`], which surfaces the
+//!   floating permission card in the UI, and waits for [`run_question_answers`]
+//!   to resolve it.
 
 use crate::core::nod_counter::{NodCounter, NodEvent};
 use crate::core::head_tracking::HeadPose;
@@ -78,9 +77,21 @@ fn default_agent_name() -> String {
     "Agent".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PermissionPrompt {
+    pub tool_name: String,
+    #[serde(default)]
+    pub command_or_arg: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HookRequest {
+    #[serde(default)]
     pub questions: Vec<HookQuestion>,
+    #[serde(default)]
+    pub permission: Option<PermissionPrompt>,
     #[serde(default = "default_agent_name")]
     pub agent: String,
 }
@@ -100,6 +111,10 @@ pub enum AskReply {
     Select { index: usize, label: String },
     /// Selected multiple questions in sequence.
     BatchSelect { selections: Vec<SingleSelection> },
+    /// User nodded to allow tool execution.
+    Allow,
+    /// User shook head to deny tool execution.
+    Deny,
     /// Cancelled, timed out, or unanswerable: let the agent ask normally.
     Pass,
 }
@@ -230,6 +245,7 @@ pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
         }
         return Some(HookRequest {
             questions: out,
+            permission: None,
             agent,
         });
     }
@@ -260,9 +276,59 @@ pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
                 }],
+                permission: None,
                 agent,
             });
         }
+    }
+
+    let tool_name = value
+        .get("tool_name")
+        .or_else(|| value.get("tool"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+
+    if !tool_name.is_empty()
+        && !tool_name.eq_ignore_ascii_case("askuserquestion")
+        && !tool_name.contains("request_user_input")
+        && !tool_name.contains("ask_question")
+    {
+        let command_or_arg = if let Some(cmd) = tool_input
+            .and_then(|t| t.get("command").or_else(|| t.get("cmd")))
+            .and_then(|v| v.as_str())
+        {
+            cmd.to_string()
+        } else if let Some(path) = tool_input
+            .and_then(|t| t.get("file_path").or_else(|| t.get("path")))
+            .and_then(|v| v.as_str())
+        {
+            path.to_string()
+        } else if let Some(q) = tool_input
+            .and_then(|t| t.get("query").or_else(|| t.get("prompt")))
+            .and_then(|v| v.as_str())
+        {
+            q.to_string()
+        } else if let Some(ti) = tool_input {
+            let s = serde_json::to_string(ti).unwrap_or_default();
+            if s.len() > 140 {
+                format!("{}…", &s[..140])
+            } else {
+                s
+            }
+        } else {
+            String::new()
+        };
+
+        let description = format!("请求执行「{}」", tool_name);
+        return Some(HookRequest {
+            questions: Vec::new(),
+            permission: Some(PermissionPrompt {
+                tool_name: tool_name.to_string(),
+                command_or_arg: sanitize_payload_text(&command_or_arg),
+                description,
+            }),
+            agent,
+        });
     }
 
     None
@@ -271,6 +337,7 @@ pub fn parse_questions(value: &serde_json::Value) -> Option<HookRequest> {
 /// Maps a committed nod count onto a reply. Nods within the option range pick
 /// that option; one nod past the end means the wearer wants "Other" or would
 /// rather answer by hand; anything more is treated as a mistake.
+#[allow(dead_code)]
 fn decision_for_commit(count: usize, options: &[String]) -> AskReply {
     match count {
         n if n >= 1 && n <= options.len() => AskReply::Select {
@@ -434,8 +501,56 @@ fn hook_output_for(
                 .to_string()
             }
         }
+        AskReply::Allow => {
+            let tool_name = request
+                .permission
+                .as_ref()
+                .map(|p| p.tool_name.as_str())
+                .unwrap_or("工具");
+            let note = format!(
+                "【头部手势应答】用户点头确认，允许执行「{}」。(RustPods 通过点头手势授权)",
+                tool_name
+            );
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": note,
+                    "additionalContext": note,
+                }
+            })
+            .to_string()
+        }
+        AskReply::Deny => {
+            let tool_name = request
+                .permission
+                .as_ref()
+                .map(|p| p.tool_name.as_str())
+                .unwrap_or("工具");
+            let note = format!(
+                "【头部手势应答】用户摇头拒绝执行「{}」。(RustPods 通过摇头手势拒绝; 请向用户汇报操作已被取消并询问下一步建议)",
+                tool_name
+            );
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": note,
+                    "additionalContext": note,
+                }
+            })
+            .to_string()
+        }
         AskReply::Pass => {
-            if is_codex {
+            if request.permission.is_some() {
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "ask",
+                    }
+                })
+                .to_string()
+            } else if is_codex {
                 json!({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
@@ -462,7 +577,7 @@ fn hook_output_for(
 
 static NEXT_ASK_ID: AtomicU64 = AtomicU64::new(1);
 
-/// What the UI card shows while a question is pending.
+/// What the UI card shows while a question or permission is pending.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AskProgress {
     pub id: u64,
@@ -471,6 +586,8 @@ pub struct AskProgress {
     pub header: String,
     pub options: Vec<String>,
     pub count: usize,
+    pub permission: Option<PermissionPrompt>,
+    pub decision_preview: Option<bool>,
 }
 
 /// What the UI shows briefly once a question has been answered.
@@ -545,6 +662,7 @@ impl AskHub {
     }
 
     /// Records a nod count for the UI.
+    #[allow(dead_code)]
     fn set_count(&self, id: u64, count: usize) {
         let mut progress = self.progress.lock().unwrap();
         if let Some(p) = progress.as_mut()
@@ -568,6 +686,7 @@ impl AskHub {
     }
 
     /// Programmatically select an option by index (e.g. from popup click).
+    #[allow(dead_code)]
     pub fn resolve_by_index(&self, index: usize) {
         let (id, label, agent) = {
             let progress = self.progress.lock().unwrap();
@@ -580,6 +699,41 @@ impl AskHub {
             let _ = pending.reply.send(AskReply::Select { index, label });
             self.mark_resolved(note, agent);
             self.clear_progress(id);
+        }
+    }
+
+    /// Programmatically resolve a permission inquiry (e.g. from popup button click or gesture).
+    pub fn resolve_permission(&self, allow: bool) {
+        let (id, tool_name, agent) = {
+            let progress = self.progress.lock().unwrap();
+            let Some(p) = progress.as_ref() else { return };
+            let tool = p
+                .permission
+                .as_ref()
+                .map(|perm| perm.tool_name.clone())
+                .unwrap_or_else(|| "工具".into());
+            (p.id, tool, p.agent.clone())
+        };
+        if let Some(pending) = self.take_pending(id) {
+            let (reply, note) = if allow {
+                (AskReply::Allow, format!("已允许执行「{}」", tool_name))
+            } else {
+                (AskReply::Deny, format!("已拒绝执行「{}」", tool_name))
+            };
+            let _ = pending.reply.send(reply);
+            self.mark_resolved(note, agent);
+            self.clear_progress(id);
+        }
+    }
+
+    /// Records a decision preview (allow/deny) for immediate UI feedback.
+    pub fn set_decision_preview(&self, id: u64, allow: bool) {
+        let mut progress = self.progress.lock().unwrap();
+        if let Some(p) = progress.as_mut()
+            && p.id == id
+        {
+            p.decision_preview = Some(allow);
+            self.notify.notify_waiters();
         }
     }
 
@@ -762,7 +916,7 @@ async fn ask_from_stream(stream: &mut tokio::net::UnixStream) -> Option<AskReply
         return None;
     }
     let request: HookRequest = if let Ok(req) = serde_json::from_slice::<HookRequest>(&buf) {
-        if req.questions.is_empty() {
+        if req.questions.is_empty() && req.permission.is_none() {
             let value: serde_json::Value = serde_json::from_slice(&buf).ok()?;
             parse_questions(&value)?
         } else {
@@ -775,118 +929,68 @@ async fn ask_from_stream(stream: &mut tokio::net::UnixStream) -> Option<AskReply
     Some(ask_core(request).await)
 }
 
-/// The shared question pipeline: validate, gate, register, wait for the
+/// The shared permission pipeline: validate, gate, register, wait for the
 /// gesture task. Both the socket handler and the settings page's test button
-/// come through here, so a test exercises exactly what a live question does.
-/// Supports answering multiple single-select questions in sequence.
+/// come through here, so a test exercises exactly what a live permission does.
 async fn ask_core(request: HookRequest) -> AskReply {
-    if request.questions.is_empty() {
+    // Only sensitive tool permissions are answered via head gestures;
+    // general questions pass through directly to the terminal / native UI.
+    let Some(perm) = request.permission else {
         return AskReply::Pass;
-    }
-    // Only single-select questions with options can be nodded at; anything else
-    // (multi-select or open-ended questions) goes straight back to the agent UI.
-    for q in &request.questions {
-        if q.multi_select || q.options.is_empty() {
-            info!("Question batch passed through: contains multi_select or empty options");
-            return AskReply::Pass;
-        }
-    }
+    };
 
     // The wearer is not streaming (buds off, not connected): do not pretend a
-    // gesture is coming, hand the question to the normal UI immediately.
+    // gesture is coming, hand the permission request to the normal UI immediately.
     if !ASK_HUB.tracking_fresh() {
-        info!("Question passed through: head tracking is not active");
+        info!("Permission request passed through: head tracking is not active");
         return AskReply::Pass;
     }
 
+    let cfg = crate::system::config::load_config();
     // Feature toggle lives in the config file; re-reading it here means the
     // switch takes effect without a restart.
-    if !crate::system::config::load_config().head_gesture_answers_enabled {
+    if !cfg.gesture_permission_answers_enabled || !cfg.head_gesture_answers_enabled {
+        info!("Permission request passed through: gesture permission answers disabled in config");
         return AskReply::Pass;
     }
 
-    let total = request.questions.len();
-    let mut selections = Vec::new();
-
-    for (idx, q) in request.questions.into_iter().enumerate() {
-        if idx > 0 {
-            // Brief pause between questions to let the head stabilize to neutral posture.
-            tokio::time::sleep(Duration::from_millis(600)).await;
-        }
-
-        let id = NEXT_ASK_ID.fetch_add(1, Ordering::SeqCst);
-        let header = if total > 1 {
-            if q.header.is_empty() {
-                format!("[{}/{}]", idx + 1, total)
-            } else {
-                format!("[{}/{}] {}", idx + 1, total, q.header)
-            }
-        } else {
-            q.header.clone()
-        };
-
-        let progress = AskProgress {
-            id,
-            agent: request.agent.clone(),
-            question: q.question.clone(),
-            header,
-            options: q.options.clone(),
-            count: 0,
-        };
-        let (tx, rx) = oneshot::channel();
-        if !ASK_HUB.register(progress, tx) {
-            return AskReply::Pass;
-        }
-        info!(
-            "Question pending [{}/{}]: {:?} with {} options (id {}, sensitivity {})",
-            idx + 1,
-            total,
-            q.question,
-            q.options.len(),
-            id,
-            crate::core::nod_counter::sensitivity()
-        );
-
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(AskReply::Select { index, label })) => {
-                info!(
-                    "Question [{}/{}] {} resolved: option {} ({:?})",
-                    idx + 1,
-                    total,
-                    id,
-                    index + 1,
-                    label
-                );
-                ASK_HUB.clear_progress(id);
-                selections.push(SingleSelection { index, label });
-            }
-            Ok(Ok(_)) => {
-                info!("Question [{}/{}] {} passed or cancelled", idx + 1, total, id);
-                ASK_HUB.clear_progress(id);
-                return AskReply::Pass;
-            }
-            _ => {
-                warn!(
-                    "Question [{}/{}] {} timed out; passing through (tracking_fresh={})",
-                    idx + 1,
-                    total,
-                    id,
-                    ASK_HUB.tracking_fresh()
-                );
-                ASK_HUB.abandon(id);
-                return AskReply::Pass;
-            }
-        }
+    let id = NEXT_ASK_ID.fetch_add(1, Ordering::SeqCst);
+    let progress = AskProgress {
+        id,
+        agent: request.agent.clone(),
+        question: perm.description.clone(),
+        header: perm.tool_name.clone(),
+        options: vec!["允许".into(), "拒绝".into()],
+        count: 0,
+        permission: Some(perm.clone()),
+        decision_preview: None,
+    };
+    let (tx, rx) = oneshot::channel();
+    if !ASK_HUB.register(progress, tx) {
+        return AskReply::Pass;
     }
+    info!(
+        "Permission pending: tool {:?} (id {}, sensitivity {})",
+        perm.tool_name,
+        id,
+        crate::core::nod_counter::sensitivity()
+    );
 
-    if selections.len() == 1 {
-        let first = selections.remove(0);
-        AskReply::Select {
-            index: first.index,
-            label: first.label,
+    match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        Ok(Ok(reply)) => {
+            info!("Permission {} resolved: {:?}", id, reply);
+            ASK_HUB.clear_progress(id);
+            reply
         }
-    } else {
-        AskReply::BatchSelect { selections }
+        _ => {
+            warn!(
+                "Permission {} timed out; passing through (tracking_fresh={})",
+                id,
+                ASK_HUB.tracking_fresh()
+            );
+            ASK_HUB.abandon(id);
+            AskReply::Pass
+        }
     }
 }
 
@@ -899,6 +1003,7 @@ pub fn sample_question_request(agent: &str) -> HookRequest {
             options: vec!["第一个选项".into(), "第二个选项".into(), "第三个选项".into()],
             multi_select: false,
         }],
+        permission: None,
         agent: if agent.trim().is_empty() {
             "Agent".into()
         } else {
@@ -907,11 +1012,33 @@ pub fn sample_question_request(agent: &str) -> HookRequest {
     }
 }
 
-/// Pushes the sample question through the real answering pipeline from inside
-/// the process. Returns the decision once the wearer nods, cancels, or the
-/// question passes through (not worn, not installed, timed out).
+/// The sample permission request the test button and CLI simulator use.
+pub fn sample_permission_request(agent: &str) -> HookRequest {
+    HookRequest {
+        questions: Vec::new(),
+        permission: Some(PermissionPrompt {
+            tool_name: "Bash".into(),
+            command_or_arg: "cargo test --workspace".into(),
+            description: "请求执行命令「cargo test --workspace」".into(),
+        }),
+        agent: if agent.trim().is_empty() {
+            "Agent".into()
+        } else {
+            agent.into()
+        },
+    }
+}
+
+/// Pushes the sample permission request through the real answering pipeline from inside
+/// the process. Returns the decision once the wearer nods, shakes, cancels, or the
+/// permission passes through (not worn, not installed, timed out).
 pub async fn run_test_question(agent: &str) -> Result<AskReply, String> {
-    Ok(ask_core(sample_question_request(agent)).await)
+    run_test_permission(agent).await
+}
+
+/// Pushes the sample permission request through the real answering pipeline.
+pub async fn run_test_permission(agent: &str) -> Result<AskReply, String> {
+    Ok(ask_core(sample_permission_request(agent)).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,13 +1133,16 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
         };
 
         let reply = match event {
-            NodEvent::Counted(n) => {
-                ASK_HUB.set_count(progress.id, n);
-                info!("Nod count {} for question {}", n, progress.id);
-                continue;
+            NodEvent::Counted(_) | NodEvent::Commit(_) => {
+                info!("Nod detected for permission request {}", progress.id);
+                ASK_HUB.set_decision_preview(progress.id, true);
+                AskReply::Allow
             }
-            NodEvent::Cancelled => AskReply::Pass,
-            NodEvent::Commit(n) => decision_for_commit(n, &progress.options),
+            NodEvent::Shaken | NodEvent::Cancelled => {
+                info!("Head shake/turn detected for permission request {}", progress.id);
+                ASK_HUB.set_decision_preview(progress.id, false);
+                AskReply::Deny
+            }
         };
 
         resolve_question(progress.id, reply);
@@ -1026,17 +1156,25 @@ pub async fn run_question_answers(mut pose_rx: watch::Receiver<Option<HeadPose>>
 /// Delivers a decision for the pending question, if it is still ours to
 /// answer, and tidies the shared state.
 fn resolve_question(id: u64, reply: AskReply) {
-    let agent_name = ASK_HUB
+    let (agent_name, perm) = ASK_HUB
         .progress_snapshot()
-        .map(|p| p.agent)
-        .unwrap_or_else(|| "Agent".to_string());
+        .map(|p| (p.agent, p.permission))
+        .unwrap_or_else(|| ("Agent".to_string(), None));
     let note = match &reply {
         AskReply::Select { index, label } => format!("✓ 已选择第 {} 项「{}」", index + 1, label),
         AskReply::BatchSelect { selections } => {
             let last = selections.last().map(|s| s.label.as_str()).unwrap_or("");
             format!("✓ 全部完成「{}」", last)
         }
-        AskReply::Pass => format!("已取消,请在 {} 中手动作答", agent_name),
+        AskReply::Allow => {
+            let tool = perm.as_ref().map(|p| p.tool_name.as_str()).unwrap_or("工具");
+            format!("✓ 已允许执行「{}」", tool)
+        }
+        AskReply::Deny => {
+            let tool = perm.as_ref().map(|p| p.tool_name.as_str()).unwrap_or("工具");
+            format!("✗ 已拒绝执行「{}」", tool)
+        }
+        AskReply::Pass => format!("已取消,请在 {} 中手动操作", agent_name),
     };
     if let Some(pending) = ASK_HUB.take_pending(id) {
         if pending.reply.send(reply).is_ok() {
@@ -1076,7 +1214,8 @@ pub async fn run_hook_mode() -> i32 {
     let Some(request) = parse_questions(&value) else {
         return 0;
     };
-    if request.questions.is_empty() {
+    if request.permission.is_none() {
+        // Only tool permissions are answered by gestures; questions pass through directly
         return 0;
     }
 
@@ -1100,8 +1239,9 @@ pub async fn run_hook_mode() -> i32 {
     }
 
     debug!(
-        "ask-hook: forwarding {} question(s) (is_codex={})",
+        "ask-hook: forwarding request (questions={}, has_permission={}, is_codex={})",
         request.questions.len(),
+        request.permission.is_some(),
         is_codex
     );
 
@@ -1195,6 +1335,10 @@ fn canonical_hook_entry(command: &str) -> serde_json::Value {
     }])
 }
 
+/// Matcher string targeting sensitive permission tools in ZCode.
+pub const HOOK_MATCHER: &str =
+    "Bash|Write|FileEdit|edit_file|execute_command";
+
 /// Merges our PreToolUse hook entry into a ZCode config document.
 ///
 /// Returns whether anything changed, so repeated installs are no-ops, and an
@@ -1244,15 +1388,19 @@ pub fn install_hook_into(config: &mut serde_json::Value, command: &str) -> Resul
 
     let canonical = canonical_hook_entry(command);
     if let Some(existing) = pre.iter_mut().find(|e| entry_is_ours(e)) {
-        if existing.get("hooks") == Some(&canonical) {
-            return Ok(changed);
+        if existing.get("matcher").and_then(|m| m.as_str()) != Some(HOOK_MATCHER) {
+            existing["matcher"] = json!(HOOK_MATCHER);
+            changed = true;
         }
-        existing["hooks"] = canonical;
-        return Ok(true);
+        if existing.get("hooks") != Some(&canonical) {
+            existing["hooks"] = canonical;
+            changed = true;
+        }
+        return Ok(changed);
     }
 
     pre.push(json!({
-        "matcher": "AskUserQuestion",
+        "matcher": HOOK_MATCHER,
         "hooks": canonical,
     }));
     Ok(true)
@@ -1304,21 +1452,33 @@ fn hook_command_path() -> Result<String, String> {
 /// installed entry, not duplicate it.
 const HOOK_ARG_MARKER: &str = "--zcode-ask-hook";
 
-/// Whether a PreToolUse entry is ours (AskUserQuestion matcher + our marker).
+/// Whether a PreToolUse entry is ours (matching our matcher and marker).
 fn entry_is_ours(entry: &serde_json::Value) -> bool {
-    entry.get("matcher").and_then(|m| m.as_str()) == Some("AskUserQuestion")
-        && entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_some_and(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("args")
-                        .and_then(|a| a.as_array())
-                        .is_some_and(|args| {
-                            args.iter().any(|a| a.as_str() == Some(HOOK_ARG_MARKER))
-                        })
-                })
+    let is_matcher = entry
+        .get("matcher")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| {
+            m == HOOK_MATCHER
+                || m == "AskUserQuestion"
+                || m.contains("AskUserQuestion")
+                || m.contains("Bash")
+        });
+    let has_marker = entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("args")
+                    .and_then(|a| a.as_array())
+                    .is_some_and(|args| {
+                        args.iter().any(|a| a.as_str() == Some(HOOK_ARG_MARKER))
+                    })
+                    || h.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.contains(HOOK_ARG_MARKER))
             })
+        });
+    is_matcher && has_marker
 }
 
 /// The command of our hook inside an entry we own.
@@ -1428,10 +1588,15 @@ pub fn uninstall_hook() -> Result<(), String> {
 // Simulation (`rustpods --zcode-ask-simulate`)
 // ---------------------------------------------------------------------------
 
-/// Pushes a sample question through the socket, for testing the gesture path
+/// Pushes a sample permission request through the socket, for testing the gesture path
 /// without ZCode or Bluetooth.
 pub async fn run_simulate() -> i32 {
-    let request = sample_question_request("Agent");
+    run_permission_simulate().await
+}
+
+/// Sends a sample permission request to the running RustPods daemon.
+pub async fn run_permission_simulate() -> i32 {
+    let request = sample_permission_request("Agent");
 
     let mut stream = match tokio::net::UnixStream::connect(socket_path()).await {
         Ok(stream) => stream,
@@ -1447,7 +1612,7 @@ pub async fn run_simulate() -> i32 {
     let mut line = serde_json::to_string(&request).expect("serialise sample");
     line.push('\n');
     if let Err(e) = stream.write_all(line.as_bytes()).await {
-        error!("Could not send the sample question: {}", e);
+        error!("Could not send the sample permission request: {}", e);
         return 1;
     }
 
@@ -1459,7 +1624,7 @@ pub async fn run_simulate() -> i32 {
     match tokio::time::timeout(HOOK_REPLY_TIMEOUT, read_reply).await {
         Ok(Ok(_)) => match serde_json::from_slice::<AskReply>(&buf) {
             Ok(reply) => {
-                info!("Simulated question resolved: {:?}", reply);
+                info!("Simulated permission request resolved: {:?}", reply);
                 0
             }
             Err(e) => {
@@ -1778,7 +1943,7 @@ mod tests {
         assert!(install_hook_into(&mut config, "/opt/rustpods").unwrap());
         let pre = config["hooks"]["events"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 1);
-        assert_eq!(pre[0]["matcher"], "AskUserQuestion");
+        assert_eq!(pre[0]["matcher"], HOOK_MATCHER);
         // A `command` hook carrying `args` is dropped outright by ZCode, so
         // the installed shape must be a `process` hook.
         assert_eq!(pre[0]["hooks"][0]["type"], "process");
@@ -1944,5 +2109,63 @@ mod tests {
 
         assert!(uninstall_hook_from(&mut config));
         assert!(config.get("hooks").is_none());
+    }
+
+    #[test]
+    fn parse_questions_extracts_bash_permission_prompt() {
+        let payload: Value = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "cargo test --all"
+            }
+        });
+        let req = parse_questions(&payload).expect("should parse bash permission prompt");
+        assert!(req.questions.is_empty());
+        let perm = req.permission.expect("permission prompt should be extracted");
+        assert_eq!(perm.tool_name, "Bash");
+        assert_eq!(perm.command_or_arg, "cargo test --all");
+    }
+
+    #[test]
+    fn parse_questions_extracts_file_write_permission_prompt() {
+        let payload: Value = serde_json::json!({
+            "tool_name": "write_file",
+            "tool_input": {
+                "path": "/etc/hosts",
+                "content": "127.0.0.1 localhost"
+            }
+        });
+        let req = parse_questions(&payload).expect("should parse write_file permission prompt");
+        let perm = req.permission.expect("permission prompt should be extracted");
+        assert_eq!(perm.tool_name, "write_file");
+        assert_eq!(perm.command_or_arg, "/etc/hosts");
+    }
+
+    #[test]
+    fn hook_output_for_permission_allow_and_deny() {
+        let req = sample_permission_request("ZCode");
+
+        let out_allow = hook_output_for(&AskReply::Allow, &req, None, false);
+        let val_allow: Value = serde_json::from_str(&out_allow).unwrap();
+        assert_eq!(val_allow["hookSpecificOutput"]["permissionDecision"], "allow");
+
+        let out_deny = hook_output_for(&AskReply::Deny, &req, None, false);
+        let val_deny: Value = serde_json::from_str(&out_deny).unwrap();
+        assert_eq!(val_deny["hookSpecificOutput"]["permissionDecision"], "deny");
+
+        let out_pass = hook_output_for(&AskReply::Pass, &req, None, false);
+        let val_pass: Value = serde_json::from_str(&out_pass).unwrap();
+        assert_eq!(val_pass["hookSpecificOutput"]["permissionDecision"], "ask");
+    }
+
+    #[test]
+    fn sample_permission_request_roundtrip() {
+        let req = sample_permission_request("Codex");
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: HookRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.agent, "Codex");
+        let perm = decoded.permission.unwrap();
+        assert_eq!(perm.tool_name, "Bash");
+        assert_eq!(perm.command_or_arg, "cargo test --workspace");
     }
 }

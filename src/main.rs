@@ -117,6 +117,13 @@ struct Cli {
         help = "Send a sample question to the running RustPods to exercise the nod-answer path"
     )]
     zcode_ask_simulate: bool,
+
+    #[arg(
+        long,
+        hide = true,
+        help = "Send a sample permission request to the running RustPods to exercise the gesture permission answer path"
+    )]
+    zcode_permission_simulate: bool,
 }
 
 /// Exclusive per-session lock, held for the lifetime of the process.
@@ -432,6 +439,10 @@ fn main() {
     }
     if cli.zcode_ask_simulate {
         let code = rt.block_on(system::zcode_ask::run_simulate());
+        std::process::exit(code);
+    }
+    if cli.zcode_permission_simulate {
+        let code = rt.block_on(system::zcode_ask::run_permission_simulate());
         std::process::exit(code);
     }
 

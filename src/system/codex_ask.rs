@@ -1,4 +1,4 @@
-//! Answers Codex / ChatGPT `ask_question` / `AskUserQuestion` prompts by counting head nods.
+//! Approves Codex / ChatGPT tool execution permissions via head gestures (nod to allow, shake to deny).
 //!
 //! Codex discovers hooks from `~/.codex/hooks.json` or inline tables in
 //! `~/.codex/config.toml` (see https://learn.chatgpt.com/docs/hooks).
@@ -19,9 +19,9 @@ pub fn codex_hooks_json_path() -> PathBuf {
 /// The argv marker that identifies our hook entry in Codex configuration.
 pub const HOOK_ARG_MARKER: &str = "--codex-ask-hook";
 
-/// Matcher string targeting question tools in Codex / MCP.
+/// Matcher string targeting sensitive permission tools in Codex / MCP.
 pub const HOOK_MATCHER: &str =
-    "request_user_input|request_user_input_async|AskUserQuestion|ask_question|ask_user_question";
+    "Bash|execute_command|write_file|edit_file";
 
 /// Canonical hook entry for Codex `hooks.json`.
 fn canonical_hook_entry(command: &str) -> serde_json::Value {
@@ -34,7 +34,7 @@ fn canonical_hook_entry(command: &str) -> serde_json::Value {
         "type": "command",
         "command": full_command,
         "timeout": 180,
-        "statusMessage": "等待头部手势作答..."
+        "statusMessage": "等待头部手势审批 (点头允许 / 摇头拒绝)..."
     }])
 }
 
@@ -116,6 +116,7 @@ fn entry_is_ours(entry: &serde_json::Value) -> bool {
             || m.contains("request_user_input")
             || m.contains("AskUserQuestion")
             || m.contains("ask_question")
+            || m.contains("Bash")
     });
     let has_marker = entry
         .get("hooks")

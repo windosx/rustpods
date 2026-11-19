@@ -81,7 +81,7 @@ const MAX_DT: f32 = 0.25;
 /// baseline is forbidden to move.
 const BASELINE_WINDOW_SWING: f32 = 2.0;
 /// Length of that recent-motion window, in seconds.
-const BASELINE_WINDOW: f32 = 0.5;
+const BASELINE_WINDOW: f32 = 0.6;
 /// A return stroke counts once the head has climbed this far back from the
 /// dip's lowest point, as a fraction of the dip depth below baseline.
 /// 0.35 allows crisp, prompt detection as soon as the upward rebound starts.
@@ -110,6 +110,16 @@ pub enum NodEvent {
     Commit(usize),
     /// A head shake (or large turn) cancelled the pending count.
     Cancelled,
+    /// A distinct head shake (alternating left-right turn) without a pending nod count.
+    Shaken,
+}
+
+/// State of an alternating head shake gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShakePhase {
+    None,
+    TurnedLeft,
+    TurnedRight,
 }
 
 /// Counts nod cycles on the pitch axis. Feed it every pose sample while a
@@ -140,9 +150,9 @@ pub struct NodCounter {
     pitch_swing: f32,
     /// Recent yaw motion magnitude, decays exponentially.
     yaw_swing: f32,
-    /// Ring of recent `(time, pitch)` samples for the baseline gate's
-    /// peak-to-peak test; older than [`BASELINE_WINDOW`] falls off.
-    window: Vec<(f32, f32)>,
+    /// Ring of recent `(time, pitch, yaw)` samples for the baseline gate's
+    /// peak-to-peak test and head shake recognition; older than [`BASELINE_WINDOW`] falls off.
+    window: Vec<(f32, f32, f32)>,
     /// Running clock, seconds since construction.
     clock: f32,
     /// Lowest pitch reached since the current dip armed; the count
@@ -161,6 +171,12 @@ pub struct NodCounter {
     count: usize,
     /// Seconds since the last counted nod.
     since_count: f32,
+    /// Seconds since the last emitted head shake event.
+    since_shake: f32,
+    /// Pending direction of an alternating head shake.
+    shake_phase: ShakePhase,
+    /// Time elapsed in the current shake phase.
+    shake_timer: f32,
     /// Deepest pitch excursion below the baseline since the last
     /// [`Self::take_telemetry`]. A 1 Hz heartbeat would otherwise miss a
     /// 300 ms nod entirely, and "nods never count" is undiagnosable without
@@ -207,6 +223,9 @@ impl NodCounter {
             // first nod may arm immediately - otherwise a wearer answering
             // right away loses the nod that crosses within the first 150 ms.
             since_count: MIN_NOD_INTERVAL,
+            since_shake: 0.5,
+            shake_phase: ShakePhase::None,
+            shake_timer: 0.0,
             tel_min_dev: 0.0,
             tel_max_yaw_dev: 0.0,
         }
@@ -229,6 +248,10 @@ impl NodCounter {
         self.peak = None;
         self.count = 0;
         self.since_count = MIN_NOD_INTERVAL;
+        self.since_shake = 0.5;
+        self.shake_phase = ShakePhase::None;
+        self.shake_timer = 0.0;
+        self.window.clear();
     }
 
     /// Feeds one sample while nothing is pending, keeping only the resting
@@ -295,6 +318,11 @@ impl NodCounter {
             self.peak = None;
         }
         self.since_count += dt;
+        self.since_shake += dt;
+        self.shake_timer += dt;
+        if self.shake_timer > 0.6 {
+            self.shake_phase = ShakePhase::None;
+        }
         self.clock += dt;
 
         let decay = (-dt / SWING_TAU).exp();
@@ -318,7 +346,6 @@ impl NodCounter {
 
         self.pitch_swing = self.pitch_swing.max((pitch_deg - baseline).abs());
         self.yaw_swing = self.yaw_swing.max((yaw_deg - yaw_ref).abs());
-        self.yaw_ref = Some(yaw_ref + (yaw_deg - yaw_ref) * BASELINE_RATE * dt);
 
         // A deliberate head turn while a count is pending means "dismiss":
         // cancel, and never let it half-count as a nod.
@@ -327,6 +354,7 @@ impl NodCounter {
             && self.yaw_swing > self.pitch_swing * YAW_CANCEL_RATIO
         {
             self.reset();
+            self.since_shake = 0.0;
             return Some(NodEvent::Cancelled);
         }
 
@@ -336,15 +364,58 @@ impl NodCounter {
         // gate read 0.2° *during* a live nod (the decay outruns the nod),
         // let the baseline chase the dip, and the return stroke never
         // reached the band it had dragged down with it.
-        self.window.push((self.clock, pitch_deg));
-        self.window.retain(|(t, _)| self.clock - t <= BASELINE_WINDOW);
-        let (w_min, w_max) = self
-            .window
-            .iter()
-            .fold((f32::MAX, f32::MIN), |(lo, hi), (_, p)| (lo.min(*p), hi.max(*p)));
+        self.window.push((self.clock, pitch_deg, yaw_deg));
+        self.window.retain(|(t, _, _)| self.clock - t <= BASELINE_WINDOW);
+        let (w_min, w_max, y_min, y_max) = self.window.iter().fold(
+            (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
+            |(p_lo, p_hi, y_lo, y_hi), (_, p, y)| {
+                (p_lo.min(*p), p_hi.max(*p), y_lo.min(*y), y_hi.max(*y))
+            },
+        );
         if self.count == 0 && w_max - w_min < BASELINE_WINDOW_SWING {
             self.baseline =
                 Some(baseline + (pitch_deg - baseline) * (BASELINE_RATE * dt).min(1.0));
+        }
+        if self.count == 0 && y_max - y_min < BASELINE_WINDOW_SWING {
+            self.yaw_ref =
+                Some(yaw_ref + (yaw_deg - yaw_ref) * (BASELINE_RATE * dt).min(1.0));
+        }
+
+        // Deliberate head shake without a pending nod count:
+        // Alternating yaw excursion across the resting yaw with yaw dominating pitch.
+        if self.count == 0 && !self.down && self.since_shake >= 0.4 {
+            let yaw_dev = yaw_deg - yaw_ref;
+            let thresh = self.yaw_cancel * 0.55;
+
+            match self.shake_phase {
+                ShakePhase::None => {
+                    if self.yaw_swing > self.pitch_swing * YAW_CANCEL_RATIO {
+                        if yaw_dev <= -thresh {
+                            self.shake_phase = ShakePhase::TurnedLeft;
+                            self.shake_timer = 0.0;
+                        } else if yaw_dev >= thresh {
+                            self.shake_phase = ShakePhase::TurnedRight;
+                            self.shake_timer = 0.0;
+                        }
+                    }
+                }
+                ShakePhase::TurnedLeft => {
+                    if yaw_dev >= thresh && self.yaw_swing > self.pitch_swing * YAW_CANCEL_RATIO {
+                        self.shake_phase = ShakePhase::None;
+                        self.since_shake = 0.0;
+                        self.window.clear();
+                        return Some(NodEvent::Shaken);
+                    }
+                }
+                ShakePhase::TurnedRight => {
+                    if yaw_dev <= -thresh && self.yaw_swing > self.pitch_swing * YAW_CANCEL_RATIO {
+                        self.shake_phase = ShakePhase::None;
+                        self.since_shake = 0.0;
+                        self.window.clear();
+                        return Some(NodEvent::Shaken);
+                    }
+                }
+            }
         }
 
         // Symmetric peak/dip hysteresis. A nod is a *relative* motion: the
@@ -867,6 +938,36 @@ mod tests {
         assert!(
             events.contains(&NodEvent::Commit(1)),
             "a sequence finished parked below the threshold must commit: {events:?}"
+        );
+    }
+
+    #[test]
+    fn shaking_head_without_prior_nod_emits_shaken() {
+        let mut counter = NodCounter::new();
+        // Settle at neutral resting yaw 0.0.
+        hold(&mut counter, 0.0, 0.5, 0.0);
+        // Shake head: turn left to -12°, then right to +12°, then back to 0°
+        let mut events = Vec::new();
+        events.extend(ramp(&mut counter, 0.0, 0.0, 0.15, -12.0));
+        events.extend(ramp(&mut counter, 0.0, 0.0, 0.20, 12.0));
+        events.extend(ramp(&mut counter, 0.0, 0.0, 0.15, 0.0));
+        assert!(
+            events.contains(&NodEvent::Shaken),
+            "alternating yaw swings must produce Shaken event: {events:?}"
+        );
+    }
+
+    #[test]
+    fn unidirectional_glance_does_not_emit_shaken() {
+        let mut counter = NodCounter::new();
+        hold(&mut counter, 0.0, 0.5, 0.0);
+        // Turn right to +15° and stay there (a glance, not a shake)
+        let mut events = Vec::new();
+        events.extend(ramp(&mut counter, 0.0, 0.0, 0.20, 15.0));
+        events.extend(hold(&mut counter, 0.0, 0.5, 15.0));
+        assert!(
+            !events.contains(&NodEvent::Shaken),
+            "unidirectional glance must not trigger Shaken: {events:?}"
         );
     }
 }

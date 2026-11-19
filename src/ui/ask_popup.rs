@@ -115,6 +115,10 @@ impl Render for AskPopupWindow {
         // empty case needs no handling at all - the UI loop in mod.rs closes
         // the popup once neither progress nor a fresh resolution exists.
         let is_resolved_only = progress.is_none() && resolved.is_some();
+        let is_denied = resolved
+            .as_ref()
+            .map(|r| r.text.starts_with('✗') || r.text.contains("拒绝"))
+            .unwrap_or(false);
         if is_resolved_only && !self.closing && !self.auto_close_scheduled {
             self.auto_close_scheduled = true;
             cx.spawn_in(window, async move |this, cx| {
@@ -142,7 +146,11 @@ impl Render for AskPopupWindow {
                     .bg(card_bg)
                     .border_1()
                     .border_color(if is_resolved_only {
-                        p.accent_green.opacity(0.35)
+                        if is_denied {
+                            p.accent_red.opacity(0.35)
+                        } else {
+                            p.accent_green.opacity(0.35)
+                        }
                     } else {
                         p.accent_blue.opacity(0.35)
                     })
@@ -169,13 +177,21 @@ impl Render for AskPopupWindow {
                                     .gap(px(8.))
                                     .child(
                                         Icon::new(if is_resolved_only {
-                                            gpui_kit::assets::IconName::Check
+                                            if is_denied {
+                                                gpui_kit::assets::IconName::X
+                                            } else {
+                                                gpui_kit::assets::IconName::Check
+                                            }
                                         } else {
                                             gpui_kit::assets::IconName::MessageCircleQuestionMark
                                         })
                                         .size(px(18.))
                                         .text_color(if is_resolved_only {
-                                            p.accent_green
+                                            if is_denied {
+                                                p.accent_red
+                                            } else {
+                                                p.accent_green
+                                            }
                                         } else {
                                             p.accent_blue
                                         }),
@@ -195,38 +211,40 @@ impl Render for AskPopupWindow {
                                                 if is_resolved_only {
                                                     rust_i18n::t!("agents.ask_resolved", agent = agent_name)
                                                 } else {
-                                                    rust_i18n::t!("agents.ask_title", agent = agent_name)
+                                                    rust_i18n::t!("agents.permission_title", agent = agent_name)
                                                 }
                                             }),
                                     )
                                     .when_some(progress.as_ref(), |this, ask| {
-                                        let count_text = if ask.count == 0 {
-                                            rust_i18n::t!("agents.waiting_nod").to_string()
+                                        let (status_text, is_active, active_color) = if ask.decision_preview == Some(true) {
+                                            (rust_i18n::t!("agents.nod_allowed").to_string(), true, p.accent_green)
+                                        } else if ask.decision_preview == Some(false) {
+                                            (rust_i18n::t!("agents.shake_denied").to_string(), true, p.accent_red)
                                         } else {
-                                            rust_i18n::t!("agents.nod_count", count = ask.count).to_string()
+                                            (rust_i18n::t!("agents.waiting_gesture").to_string(), false, p.accent_blue)
                                         };
                                         this.child(
                                             div()
                                                 .px(px(9.))
                                                 .py(px(3.))
                                                 .rounded(px(999.))
-                                                .bg(if ask.count > 0 {
-                                                    p.accent_blue.opacity(0.22)
+                                                .bg(if is_active {
+                                                    active_color.opacity(0.22)
                                                 } else {
                                                     p.pill_bg
                                                 })
                                                 .text_size(px(12.))
-                                                .font_weight(if ask.count > 0 {
+                                                .font_weight(if is_active {
                                                     FontWeight::BOLD
                                                 } else {
                                                     FontWeight::MEDIUM
                                                 })
-                                                .text_color(if ask.count > 0 {
-                                                    p.accent_blue
+                                                .text_color(if is_active {
+                                                    active_color
                                                 } else {
                                                     p.text_secondary
                                                 })
-                                                .child(count_text),
+                                                .child(status_text),
                                         )
                                     }),
                             )
@@ -256,148 +274,171 @@ impl Render for AskPopupWindow {
                     )
                     .when_some(progress.as_ref(), |this, ask| {
                         let view_opt = cx.entity().clone();
-                        this.child(
-                            div()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(p.text_primary)
-                                .child(ask.question.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(6.))
-                                .children(ask.options.iter().enumerate().map(|(i, label)| {
-                                    let is_selected = ask.count > 0 && i + 1 == ask.count;
-                                    let is_passed = ask.count > 0 && i + 1 < ask.count;
-                                    let view_opt_c = view_opt.clone();
-                                    div()
-                                        .id(("ask-option", i))
-                                        .cursor_pointer()
-                                        .px(px(12.))
-                                        .py(px(8.))
-                                        .rounded(px(10.))
-                                        .bg(if is_selected {
-                                            p.accent_blue.opacity(0.18)
-                                        } else if is_passed {
-                                            if p.is_dark {
-                                                gpui_kit::rgba(0xFFFFFF08).into()
-                                            } else {
-                                                gpui_kit::rgba(0x00000005).into()
-                                            }
-                                        } else if p.is_dark {
-                                            gpui_kit::rgba(0xFFFFFF0D).into()
-                                        } else {
-                                            gpui_kit::rgba(0x00000008).into()
-                                        })
-                                        .border_1()
-                                        .border_color(if is_selected {
-                                            p.accent_blue.opacity(0.65)
-                                        } else {
-                                            card_border.into()
-                                        })
-                                        .hover(|s| s.bg(p.accent_blue.opacity(0.14)))
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
-                                        .on_click(move |_, window, cx| {
-                                            ASK_HUB.resolve_by_index(i);
-                                            view_opt_c.update(cx, |v, cx| {
-                                                v.start_close(window, cx);
-                                            });
-                                        })
-                                        .child(
-                                            div()
-                                                .text_size(px(13.))
-                                                .font_weight(if is_selected {
-                                                    FontWeight::BOLD
-                                                } else {
-                                                    FontWeight::NORMAL
-                                                })
-                                                .text_color(if is_selected {
-                                                    p.accent_blue
-                                                } else if is_passed {
-                                                    p.text_secondary
-                                                } else {
-                                                    p.text_primary
-                                                })
-                                                .child(format!("{}. {}", i + 1, label)),
-                                        )
-                                        .when(is_selected, |this| {
-                                            this.child(
+                        if let Some(perm) = &ask.permission {
+                            let view_allow = view_opt.clone();
+                            let view_deny = view_opt.clone();
+                            let preview_allow = ask.decision_preview == Some(true);
+                            let preview_deny = ask.decision_preview == Some(false);
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .child(
                                                 div()
+                                                    .px(px(7.))
+                                                    .py(px(2.))
+                                                    .rounded(px(6.))
+                                                    .bg(p.accent_blue.opacity(0.18))
+                                                    .text_size(px(12.))
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(p.accent_blue)
+                                                    .child(perm.tool_name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.5))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(p.text_primary)
+                                                    .child(ask.question.clone()),
+                                            ),
+                                    )
+                                    .when(!perm.command_or_arg.is_empty(), |el| {
+                                        el.child(
+                                            div()
+                                                .px(px(10.))
+                                                .py(px(8.))
+                                                .rounded(px(8.))
+                                                .bg(if p.is_dark {
+                                                    gpui_kit::rgba(0xFFFFFF0A)
+                                                } else {
+                                                    gpui_kit::rgba(0x00000006)
+                                                })
+                                                .border_1()
+                                                .border_color(card_border)
+                                                .text_size(px(12.))
+                                                .text_color(p.text_secondary)
+                                                .child(perm.command_or_arg.clone()),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .pt(px(4.))
+                                            .child(
+                                                // Allow button / gesture indicator
+                                                div()
+                                                    .id("permission-allow-btn")
+                                                    .flex_1()
+                                                    .cursor_pointer()
+                                                    .px(px(12.))
+                                                    .py(px(10.))
+                                                    .rounded(px(12.))
+                                                    .bg(if preview_allow {
+                                                        p.accent_green.opacity(0.24)
+                                                    } else if p.is_dark {
+                                                        gpui_kit::rgba(0xFFFFFF0D).into()
+                                                    } else {
+                                                        gpui_kit::rgba(0x00000008).into()
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if preview_allow {
+                                                        p.accent_green.opacity(0.8)
+                                                    } else {
+                                                        card_border.into()
+                                                    })
+                                                    .hover(|s| s.bg(p.accent_green.opacity(0.18)))
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
-                                                    .gap(px(3.))
-                                                    .px(px(7.))
-                                                    .py(px(1.5))
-                                                    .rounded(px(999.))
-                                                    .bg(p.accent_blue.opacity(0.2))
-                                                    .text_size(px(11.))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(p.accent_blue)
+                                                    .justify_center()
+                                                    .gap(px(6.))
+                                                    .on_click(move |_, window, cx| {
+                                                        ASK_HUB.resolve_permission(true);
+                                                        view_allow.update(cx, |v, cx| {
+                                                            v.start_close(window, cx);
+                                                        });
+                                                    })
                                                     .child(
                                                         Icon::new(gpui_kit::assets::IconName::Check)
-                                                            .size(px(11.))
-                                                            .text_color(p.accent_blue),
+                                                            .size(px(15.))
+                                                            .text_color(p.accent_green),
                                                     )
-                                                    .child("待确认"),
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(13.))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(p.accent_green)
+                                                            .child(rust_i18n::t!("agents.permission_nod_allow")),
+                                                    ),
                                             )
-                                        })
-                                })),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_between()
-                                .pt(px(2.))
-                                .child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .text_color(if ask.count > 0 {
-                                            p.accent_blue
-                                        } else {
-                                            p.text_secondary
-                                        })
-                                        .child(if ask.count > 0 {
-                                            format!(
-                                                "已选第 {} 项 · 保持头部静止将自动提交 · 再次点头切换",
-                                                ask.count
-                                            )
-                                        } else {
-                                            "点头 1 次选择第 1 项 · 再次点头换下一项 · 也可点击选择".to_string()
-                                        }),
-                                )
-                                .when(ask.count > 0 && ask.count <= ask.options.len(), |this| {
-                                    let idx = ask.count - 1;
-                                    let view_c = view_opt.clone();
-                                    this.child(
-                                        div()
-                                            .id("ask-popup-confirm-now-btn")
-                                            .px(px(10.))
-                                            .py(px(3.))
-                                            .rounded(px(999.))
-                                            .bg(p.accent_blue)
-                                            .hover(|s| s.opacity(0.9))
-                                            .cursor_pointer()
-                                            .text_size(px(11.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(gpui_kit::white())
-                                            .on_click(move |_, window, cx| {
-                                                ASK_HUB.resolve_by_index(idx);
-                                                view_c.update(cx, |v, cx| {
-                                                    v.start_close(window, cx);
-                                                });
-                                            })
-                                            .child("立即确认"),
+                                            .child(
+                                                // Deny button / gesture indicator
+                                                div()
+                                                    .id("permission-deny-btn")
+                                                    .flex_1()
+                                                    .cursor_pointer()
+                                                    .px(px(12.))
+                                                    .py(px(10.))
+                                                    .rounded(px(12.))
+                                                    .bg(if preview_deny {
+                                                        p.accent_red.opacity(0.24)
+                                                    } else if p.is_dark {
+                                                        gpui_kit::rgba(0xFFFFFF0D).into()
+                                                    } else {
+                                                        gpui_kit::rgba(0x00000008).into()
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if preview_deny {
+                                                        p.accent_red.opacity(0.8)
+                                                    } else {
+                                                        card_border.into()
+                                                    })
+                                                    .hover(|s| s.bg(p.accent_red.opacity(0.18)))
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .gap(px(6.))
+                                                    .on_click(move |_, window, cx| {
+                                                        ASK_HUB.resolve_permission(false);
+                                                        view_deny.update(cx, |v, cx| {
+                                                            v.start_close(window, cx);
+                                                        });
+                                                    })
+                                                    .child(
+                                                        Icon::new(gpui_kit::assets::IconName::X)
+                                                            .size(px(15.))
+                                                            .text_color(p.accent_red),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(13.))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(p.accent_red)
+                                                            .child(rust_i18n::t!("agents.permission_shake_deny")),
+                                                    ),
+                                            ),
                                     )
-                                }),
-                        )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(p.text_secondary)
+                                            .child(rust_i18n::t!("agents.permission_footer_hint")),
+                                    ),
+                            )
+                        } else {
+                            this
+                        }
                     })
                     .when_some(
                         if progress.is_none() {
@@ -406,17 +447,23 @@ impl Render for AskPopupWindow {
                             None
                         },
                         |this, note| {
+                            let is_denied = note.text.starts_with('✗') || note.text.contains("拒绝");
+                            let color = if is_denied {
+                                p.accent_red
+                            } else {
+                                p.accent_green
+                            };
                             this.child(
                                 div()
                                     .py(px(8.))
                                     .px(px(12.))
                                     .rounded(px(10.))
-                                    .bg(p.accent_green.opacity(0.12))
+                                    .bg(color.opacity(0.12))
                                     .border_1()
-                                    .border_color(p.accent_green.opacity(0.3))
+                                    .border_color(color.opacity(0.3))
                                     .text_size(px(13.5))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(p.accent_green)
+                                    .text_color(color)
                                     .child(note.text.clone()),
                             )
                             .child(
