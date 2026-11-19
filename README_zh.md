@@ -54,12 +54,12 @@ RustPods 把 macOS 上习以为常的 AirPods 体验带到 Linux 桌面：电量
 - 5° 听感量化加 50 ms 重建节流，避免 100 Hz 传感器流占满 CPU。
 - HRTF 播放流是被动节点，跟随当前默认输出；应用按流路由到虚拟节点，而不是把虚拟节点设为系统默认。
 
-### 点头代答智能体选择题
+### 头部手势审批智能体权限
 
-- 当 ZCode 等桌面智能体触发 `AskUserQuestion` 时，`PreToolUse` hook 会把问题转发给 RustPods。
-- **点头 N 次即选择第 N 项**；摇头取消；超时自动回退到原生界面。
+- 当 ZCode、Codex 等智能体请求执行敏感工具（如 `Bash` 执行命令、`write_file`/`edit_file` 修改文件）时，`PreToolUse` hook 会把权限申请转发给 RustPods。
+- **点头允许执行**；**摇头拒绝执行**；超时或关闭自动回退到终端原生确认。
 - 带迟滞的状态机与自适应静止基准，即使仰卧或低头阅读也能稳定识别。
-- 问题显示在独立的浮动卡片中（Wayland Layer Shell / X11 悬浮窗）。
+- 权限申请显示在独立的浮动卡片中（Wayland Layer Shell / X11 悬浮窗），支持手势应答与直接点击。
 
 ### 开盖弹窗与系统托盘
 
@@ -67,6 +67,15 @@ RustPods 把 macOS 上习以为常的 AirPods 体验带到 Linux 桌面：电量
 - 基于 Freedesktop StatusNotifierItem 的托盘图标（`ksni`），兼容 Waybar、Niri、Hyprland、Sway、GNOME 和 KDE。
 - 托盘环形图标显示当前耳塞电量：低电量变红，充电时呈绿色并带闪电徽标。
 - 右键菜单提供实时电量、降噪模式切换和主界面呼出。
+
+> [!TIP]
+> **彻底杜绝与蓝牙键鼠（BLE HID 设备）的频段竞争与重连冲突**：
+> 默认情况下，通用 BLE 广播扫描可能与桌面低功耗蓝牙键鼠（如无线键盘、无线鼠标）争夺无线电时间片。建议开启 BlueZ 的硬件级模式过滤（`AdvertisementMonitor`，类似 macOS 机制，由 Linux 内核与蓝牙芯片硬件直接匹配 Apple 广播特征码，完全不进行全频段泛扫描、不占用扫描带宽）：
+> ```bash
+> sudo sed -i 's/#Experimental = false/Experimental = true/' /etc/bluetooth/main.conf
+> sudo systemctl restart bluetooth
+> ```
+> 开启后，RustPods 会优先激活硬件过滤模式，不仅开盖弹窗响应更迅速灵敏，还能彻底避免蓝牙键鼠休眠重连时的卡顿与冲突。
 
 ### 纯 Rust AACP 协议栈
 
@@ -227,9 +236,9 @@ rustpods --log-file PATH  # 同时把日志写入文件
 
 5. 把需要空间化的播放流路由到 **RustPods Head-Tracked Stereo**（例如在 `pavucontrol` 的“播放”标签页或用 `pw-link`）。**不要**把它设为系统默认输出：HRTF 播放流是被动节点，会跟随真实的默认输出，这样音量键和其他桌面行为仍作用于物理设备。
 
-### 智能体点头代答
+### 智能体手势权限审批
 
-**智能体接入**页面可以安装 ZCode 的 `PreToolUse` hook 并查看状态。安装后，ZCode 的问题会显示在浮动卡片中；按提示点头若干次、摇头取消，或等待超时回到终端原生界面。Hook 通过 Unix socket 与 RustPods 通信，服务未运行时始终回退到原生提示。
+**智能体接入**页面可以安装 ZCode / Codex 的 `PreToolUse` hook 并查看状态。安装后，智能体的敏感工具执行权限申请会显示在浮动卡片中；按提示点头允许、摇头拒绝，或等待超时回到终端原生界面。Hook 通过 Unix socket 与 RustPods 通信，服务未运行时始终回退到原生提示。
 
 ## 模块架构
 

@@ -54,12 +54,12 @@ It speaks Apple's AACP protocol over L2CAP directly from Rust. No bridge daemon,
 - 5° perceptual quantization and a 50 ms rebuild throttle keep a 100 Hz sensor stream from saturating the CPU.
 - The HRTF stage is passive and follows the current default sink; applications are routed to it per stream, not by changing the system default.
 
-### Nod answers for AI agents
+### Gesture approval for AI agent permissions
 
-- When a desktop agent such as ZCode raises `AskUserQuestion`, a `PreToolUse` hook forwards the question to RustPods.
-- **Nod N times to choose option N**; shake your head to cancel; a timeout falls back to the native prompt.
+- When an agent such as ZCode or Codex requests permission for sensitive tools (such as `Bash` commands, `write_file`/`edit_file`), a `PreToolUse` hook forwards the request to RustPods.
+- **Nod to allow**; **shake your head to deny**; a timeout or closing falls back to the native terminal prompt.
 - A hysteresis state machine with an adaptive rest baseline keeps recognition reliable when lying down or reading.
-- The question appears in a dedicated floating card (Wayland layer shell / X11 override-redirect window).
+- The permission request appears in a dedicated floating card (Wayland layer shell / X11 override-redirect window) supporting both head gestures and clicks.
 
 ### Lid-open popup and tray
 
@@ -67,6 +67,15 @@ It speaks Apple's AACP protocol over L2CAP directly from Rust. No bridge daemon,
 - A Freedesktop StatusNotifierItem tray icon (`ksni`) works on Waybar, Niri, Hyprland, Sway, GNOME, and KDE.
 - The tray ring shows the current bud battery: red when low, green with a lightning badge while charging.
 - Right-click for live battery status, noise-mode switching, and opening the main window.
+
+> [!TIP]
+> **Eliminate BLE scan interference with Bluetooth mice & keyboards (BLE HID)**:
+> By default, generic active discovery scans continuously across the radio band. If you use BLE keyboards or mice, you can enable BlueZ's hardware offloaded pattern monitoring (`AdvertisementMonitor`, similar to macOS, where the Linux kernel and Bluetooth controller filter Apple packets in hardware without continuous generic discovery):
+> ```bash
+> sudo sed -i 's/#Experimental = false/Experimental = true/' /etc/bluetooth/main.conf
+> sudo systemctl restart bluetooth
+> ```
+> Once enabled, RustPods automatically uses `AdvertisementMonitor`, eliminating RF channel contention and reconnection latency for wireless peripherals while ensuring instant lid-open popups.
 
 ### Native AACP stack
 
@@ -227,9 +236,9 @@ Launching the GUI a second time activates the existing window instead of startin
 
 5. Route the streams you want spatialized to **RustPods Head-Tracked Stereo** (for example in `pavucontrol`'s Playback tab or with `pw-link`). Do **not** set it as the system default sink: the HRTF playback stream is passive and follows your real default output, which keeps volume keys and other desktop behaviour attached to the physical device.
 
-### AI agent nod answers
+### AI agent gesture permission approval
 
-The **AI Agents** page installs the ZCode `PreToolUse` hook and shows its status. Once installed, questions from ZCode appear in a floating card; nod the requested number of times, shake to cancel, or let the timeout return control to the terminal. The hook talks to RustPods over a Unix socket and always falls back to the native prompt if the service is not running.
+The **AI Agents** page installs the ZCode / Codex `PreToolUse` hook and shows its status. Once installed, sensitive tool execution requests appear in a floating card; nod to allow, shake to deny, or let the timeout return control to the terminal. The hook talks to RustPods over a Unix socket and always falls back to the native prompt if the service is not running.
 
 ## Architecture
 

@@ -3,6 +3,7 @@ use crate::core::crypto::{decrypt_proximity_payload, verify_rpa, verify_rpa_be};
 use crate::core::device::AirPodsDeviceState;
 use crate::system::config::AppConfig;
 use crate::ui::UiEvent;
+use bluer::monitor::{data_type, Monitor, MonitorEvent, Pattern, Type};
 use bluer::{AdapterEvent, DiscoveryFilter, DiscoveryTransport, Session};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -13,24 +14,6 @@ use tracing::{debug, info, warn};
 
 const POPUP_COOLDOWN: Duration = Duration::from_secs(5);
 const LID_SLEEP_RESET: Duration = Duration::from_secs(60);
-/// How long each scan window stays active. Kept below BlueZ's 5 s discovery
-/// idle timeout: if the controller stops scanning for a connection attempt,
-/// BlueZ's restart timer would fire after this window has already ended (we
-/// then hold no discovery client), so the scan is never re-armed underneath a
-/// connection in progress.
-const SCAN_WINDOW_ON: Duration = Duration::from_secs(4);
-/// Quiet gap between scan windows. Gives other BLE devices a clear stretch of
-/// time to complete their wake-up reconnections.
-const SCAN_WINDOW_OFF: Duration = Duration::from_secs(8);
-/// Gate check cadence while a scan window is open. AACP connect should stop
-/// the scan promptly instead of waiting for the window to expire.
-const SCAN_GATE_POLL: Duration = Duration::from_secs(1);
-/// Gate check cadence while scanning is paused or disabled; no radio work is
-/// happening, so a slower poll is enough for settings/state changes.
-const IDLE_GATE_POLL: Duration = Duration::from_secs(5);
-/// Delay before retrying when BlueZ ends our discovery stream by itself
-/// (adapter reset, bus restart).
-const DISCOVERY_RESTART_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 struct LidTracker {
@@ -111,74 +94,28 @@ impl LidTracker {
     }
 }
 
-/// Why the proximity scanner is or is not running. Re-evaluated every few
-/// seconds so a settings toggle or an AACP connect takes effect without a
-/// daemon restart.
+/// Why the proximity scanner is or is not running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScanGate {
-    /// The tracked AirPods are disconnected: scan for the case advertisement.
+pub enum ScanGate {
+    /// Actively monitoring for AirPods proximity beacons.
     Active,
-    /// AACP is connected. It already carries battery and in-ear state, and the
-    /// lid popup is only wanted before a connection exists. Scanning now would
-    /// just compete with audio and other BLE traffic on a shared controller.
-    PausedConnected,
-    /// The user turned background BLE scanning off in the settings.
+    /// Case popup is disabled in settings.
     Disabled,
-    /// No AirPods are tracked, so advertisements could not be associated with
-    /// a device anyway.
+    /// No AirPods are tracked, so beacons cannot be associated with any device.
     NoTrackedDevice,
 }
 
-async fn scan_gate(
+pub async fn scan_gate(
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
     config: &Arc<std::sync::RwLock<AppConfig>>,
 ) -> ScanGate {
-    let enabled = config.read().map(|c| c.ble_scan_enabled).unwrap_or(true);
+    let enabled = config.read().map(|c| c.case_popup_enabled).unwrap_or(true);
     if !enabled {
         return ScanGate::Disabled;
     }
     match dev_state.read().await.as_ref() {
         None => ScanGate::NoTrackedDevice,
-        Some(state) if state.is_connected => ScanGate::PausedConnected,
         Some(_) => ScanGate::Active,
-    }
-}
-
-/// BlueZ caches the last advertisement per device and replays every known
-/// device as `DeviceAdded` when a new discovery stream starts. Those cache hits
-/// are not fresh advertisements: after the lid tracker's 60 s reset, an old
-/// "lid open" payload would pop the card again. This keeps the last payload
-/// parsed per address and accepts only a changed one.
-#[derive(Debug, Default)]
-struct AdvertFreshness {
-    last: HashMap<bluer::Address, Vec<u8>>,
-}
-
-impl AdvertFreshness {
-    /// Records a payload without treating it as fresh (used to seed the cache
-    /// entries that predate a scan window).
-    fn remember(&mut self, addr: bluer::Address, data: &[u8]) {
-        self.last.insert(addr, data.to_vec());
-    }
-
-    /// Returns true only when this payload differs from the last one parsed
-    /// for the address, and records it.
-    fn accept(&mut self, addr: bluer::Address, data: &[u8]) -> bool {
-        if self
-            .last
-            .get(&addr)
-            .is_some_and(|previous| previous.as_slice() == data)
-        {
-            return false;
-        }
-        self.remember(addr, data);
-        true
-    }
-
-    /// Drops addresses BlueZ has already forgotten, so rotating private
-    /// addresses do not grow the map without bound.
-    fn retain_known(&mut self, known: &[bluer::Address]) {
-        self.last.retain(|addr, _| known.contains(addr));
     }
 }
 
@@ -195,177 +132,240 @@ pub async fn start_le_monitor(
         .await
         .map_err(|e| format!("Failed to get default adapter for LE monitor: {}", e))?;
 
-    // Keep this a *regular* discovery. BlueZ classifies a LE-only transport
-    // (or `duplicate_data = true`, even with transport Auto) as a filtered
-    // discovery and restarts the scan immediately every time the controller
-    // stops scanning to establish a connection. That immediate restart aborts
-    // the pending LE connect, which surfaces as
-    // `le-connection-abort-by-local` and breaks automatic reconnection of BLE
-    // keyboards/mice sharing the controller. A regular scan is retried only
-    // after BlueZ's idle timeout, leaving connection attempts alone.
-    //
-    // Suppressing duplicate reports matters too: with duplicate data enabled
-    // BlueZ emits a ManufacturerData property change for every advertisement
-    // from every nearby device, flooding D-Bus and keeping blueman busy. We
-    // only need payload changes (lid counter, battery), which still arrive.
-    let regular_filter = DiscoveryFilter {
-        transport: DiscoveryTransport::Auto,
-        duplicate_data: false,
-        ..Default::default()
-    };
-
     let lid_tracker = Arc::new(Mutex::new(LidTracker::default()));
-    let mut previous_gate: Option<ScanGate> = None;
-    let mut freshness = AdvertFreshness::default();
+    let mut prev_gate: Option<ScanGate> = None;
+
+    info!("Starting BLE proximity monitor (AdvertisementMonitor with discovery fallback)...");
 
     loop {
         let gate = scan_gate(&dev_state, &config).await;
         if gate != ScanGate::Active {
-            if previous_gate != Some(gate) {
+            if prev_gate != Some(gate) {
                 match gate {
-                    ScanGate::PausedConnected => {
-                        info!("BLE proximity scan paused: AirPods are connected")
-                    }
                     ScanGate::Disabled => {
-                        info!("BLE proximity scan disabled by settings")
+                        info!("BLE proximity monitoring disabled by settings (case_popup_enabled=false)");
                     }
                     ScanGate::NoTrackedDevice => {
-                        info!("BLE proximity scan idle: no tracked AirPods")
+                        info!("BLE proximity monitoring idle: no paired/tracked AirPods");
                     }
                     ScanGate::Active => {}
                 }
             }
-            previous_gate = Some(gate);
-            tokio::time::sleep(IDLE_GATE_POLL).await;
+            prev_gate = Some(gate);
+            tokio::time::sleep(Duration::from_secs(3)).await;
             continue;
         }
 
-        if previous_gate != Some(ScanGate::Active) {
-            info!(
-                "BLE proximity monitor active ({}s scan / {}s pause, regular discovery)",
-                SCAN_WINDOW_ON.as_secs(),
-                SCAN_WINDOW_OFF.as_secs()
-            );
-        }
-        previous_gate = Some(ScanGate::Active);
+        prev_gate = Some(ScanGate::Active);
 
-        // Anything already in BlueZ's cache predates this window; only
-        // payload changes observed during the window are fresh. Re-seeding
-        // here also covers cache updates made by other discovery clients
-        // during the off gap, and drops addresses BlueZ has forgotten so
-        // rotating private addresses do not grow the map without bound.
-        if let Ok(addrs) = adapter.device_addresses().await {
-            freshness.retain_known(&addrs);
-            for addr in addrs {
-                let Ok(dev) = adapter.device(addr) else {
-                    continue;
-                };
-                let Ok(Some(mfg)) = dev.manufacturer_data().await else {
-                    continue;
-                };
-                if let Some(apple_data) = mfg.get(&76) {
-                    freshness.remember(addr, apple_data);
+        // Try modern BlueZ AdvertisementMonitor first: hardware/kernel pattern matching
+        // without continuous generic discovery, eliminating RF congestion and BLE HID conflicts.
+        match run_advertisement_monitor(&adapter, &dev_state, &ui_tx, &config, &lid_tracker).await {
+            Ok(()) => {
+                debug!("AdvertisementMonitor session completed normally");
+            }
+            Err(e) => {
+                info!(
+                    "AdvertisementMonitor unavailable ({}); using discovery stream fallback (Tip: enable 'Experimental = true' in /etc/bluetooth/main.conf for hardware pattern monitoring)",
+                    e
+                );
+                if let Err(e2) =
+                    run_discovery_stream(&adapter, &dev_state, &ui_tx, &config, &lid_tracker).await
+                {
+                    warn!("Discovery stream error ({}); retrying in 3s", e2);
                 }
             }
         }
 
-        // Re-apply the filter for every window: BlueZ derives the "auto"
-        // transport from the adapter's current BR/EDR/LE settings, which are
-        // unknown while the adapter is powered off. A stale filter would be
-        // merged as a *filtered* discovery (and re-arm the scan immediately)
-        // once the adapter comes up.
-        if let Err(e) = adapter.set_discovery_filter(regular_filter.clone()).await {
-            // Without a filter StartDiscovery still runs a regular scan, so
-            // this is not fatal.
-            debug!("Failed to set regular discovery filter ({}); using defaults", e);
-        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
 
-        let mut stream = match adapter.discover_devices_with_changes().await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("BLE discovery failed to start: {}, retrying in 3s", e);
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                continue;
-            }
-        };
+/// Runs kernel/hardware pattern-matched monitoring via BlueZ AdvertisementMonitor1.
+///
+/// This registers an offloaded pattern monitor matching Apple Manufacturer Specific Data
+/// (0x004C) with the 0x07 Proximity Pairing sub-type. It avoids running full-band active
+/// discovery, eliminating conflicts with BLE keyboards/mice reconnecting.
+async fn run_advertisement_monitor(
+    adapter: &bluer::Adapter,
+    dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    config: &Arc<std::sync::RwLock<AppConfig>>,
+    lid_tracker: &Arc<Mutex<LidTracker>>,
+) -> Result<(), bluer::Error> {
+    let monitor_mgr = adapter.monitor().await?;
+    let pattern = Pattern::new(
+        data_type::MANUFACTURER_SPECIFIC_DATA,
+        0,
+        &[0x4C, 0x00, 0x07],
+    );
+    let monitor = Monitor {
+        monitor_type: Type::OrPatterns,
+        patterns: Some(vec![pattern]),
+        ..Default::default()
+    };
+    let mut handle = monitor_mgr.register(monitor).await?;
+    info!("Registered BlueZ AdvertisementMonitor for AirPods Proximity Beacons");
 
-        let mut gate_tick = tokio::time::interval(SCAN_GATE_POLL);
-        gate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Consume the immediate first tick so the first gate check happens one
-        // interval from now.
-        gate_tick.tick().await;
-        let mut interrupted = false;
-        let mut stream_ended = false;
-        let window_end = tokio::time::sleep(SCAN_WINDOW_ON);
-        tokio::pin!(window_end);
+    let mut gate_tick = tokio::time::interval(Duration::from_secs(2));
+    gate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    gate_tick.tick().await;
 
-        loop {
-            tokio::select! {
-                evt = stream.next() => {
-                    match evt {
-                        Some(AdapterEvent::DeviceAdded(addr)) => {
-                            let Ok(dev) = adapter.device(addr) else {
-                                continue;
-                            };
-                            let Ok(Some(mfg)) = dev.manufacturer_data().await else {
-                                continue;
-                            };
-                            if let Some(apple_data) = mfg.get(&76) {
-                                // Identical payload == cached listing at window
-                                // start (or a duplicate re-report); skip it.
-                                if !freshness.accept(addr, apple_data) {
-                                    continue;
+    let mut active_devices: HashMap<bluer::Address, tokio::task::JoinHandle<()>> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            evt = handle.next() => {
+                match evt {
+                    Some(MonitorEvent::DeviceFound(device_id)) => {
+                        let addr = device_id.device;
+                        debug!("AdvertisementMonitor: device found {}", addr);
+
+                        if let Ok(dev) = adapter.device(addr) {
+                            if let Ok(Some(mfg)) = dev.manufacturer_data().await {
+                                if let Some(apple_data) = mfg.get(&76) {
+                                    parse_proximity_message(
+                                        apple_data,
+                                        addr,
+                                        dev_state,
+                                        ui_tx,
+                                        config,
+                                        lid_tracker,
+                                    ).await;
                                 }
-                                parse_proximity_message(
-                                    apple_data,
-                                    addr,
-                                    &dev_state,
-                                    &ui_tx,
-                                    &config,
-                                    &lid_tracker,
-                                )
-                                .await;
+                            }
+
+                            // Watch subsequent property changes on this device while in range
+                            // (e.g. lid opened, closed, battery level updates).
+                            if !active_devices.contains_key(&addr) {
+                                let dev_c = dev.clone();
+                                let dev_state_c = dev_state.clone();
+                                let ui_tx_c = ui_tx.clone();
+                                let cfg_c = config.clone();
+                                let lid_c = lid_tracker.clone();
+
+                                let task = tokio::spawn(async move {
+                                    if let Ok(mut events) = dev_c.events().await {
+                                        while let Some(dev_evt) = events.next().await {
+                                            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ManufacturerData(mfg)) = dev_evt {
+                                                if let Some(apple_data) = mfg.get(&76) {
+                                                    parse_proximity_message(
+                                                        apple_data,
+                                                        addr,
+                                                        &dev_state_c,
+                                                        &ui_tx_c,
+                                                        &cfg_c,
+                                                        &lid_c,
+                                                    ).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                                active_devices.insert(addr, task);
                             }
                         }
-                        Some(_) => {}
-                        None => {
-                            stream_ended = true;
-                            break;
+                    }
+                    Some(MonitorEvent::DeviceLost(device_id)) => {
+                        let addr = device_id.device;
+                        debug!("AdvertisementMonitor: device lost {}", addr);
+                        if let Some(task) = active_devices.remove(&addr) {
+                            task.abort();
                         }
                     }
-                }
-                _ = gate_tick.tick() => {
-                    if scan_gate(&dev_state, &config).await != ScanGate::Active {
-                        interrupted = true;
+                    Some(_) => {}
+                    None => {
+                        warn!("AdvertisementMonitor event stream ended");
                         break;
                     }
                 }
-                _ = &mut window_end => {
+            }
+            _ = gate_tick.tick() => {
+                if scan_gate(dev_state, config).await != ScanGate::Active {
+                    info!("Scan gate no longer active, releasing AdvertisementMonitor");
+                    break;
+                }
+                active_devices.retain(|_, task| !task.is_finished());
+            }
+        }
+    }
+
+    for (_, task) in active_devices {
+        task.abort();
+    }
+
+    Ok(())
+}
+
+/// Fallback discovery stream used when AdvertisementMonitor1 is unsupported.
+async fn run_discovery_stream(
+    adapter: &bluer::Adapter,
+    dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    config: &Arc<std::sync::RwLock<AppConfig>>,
+    lid_tracker: &Arc<Mutex<LidTracker>>,
+) -> Result<(), bluer::Error> {
+    let le_filter = DiscoveryFilter {
+        transport: DiscoveryTransport::Le,
+        duplicate_data: true,
+        ..Default::default()
+    };
+    if let Err(e) = adapter.set_discovery_filter(le_filter).await {
+        warn!("Failed to set LE discovery filter ({}), trying Auto", e);
+        let auto_filter = DiscoveryFilter {
+            transport: DiscoveryTransport::Auto,
+            duplicate_data: true,
+            ..Default::default()
+        };
+        let _ = adapter.set_discovery_filter(auto_filter).await;
+    }
+
+    let mut stream = adapter.discover_devices_with_changes().await?;
+    info!("BLE discovery stream active (duplicate_data=true fallback mode)");
+
+    let mut gate_tick = tokio::time::interval(Duration::from_secs(2));
+    gate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    gate_tick.tick().await;
+
+    loop {
+        tokio::select! {
+            evt = stream.next() => {
+                match evt {
+                    Some(AdapterEvent::DeviceAdded(addr)) => {
+                        let Ok(dev) = adapter.device(addr) else {
+                            continue;
+                        };
+                        let Ok(Some(mfg)) = dev.manufacturer_data().await else {
+                            continue;
+                        };
+                        if let Some(apple_data) = mfg.get(&76) {
+                            parse_proximity_message(
+                                apple_data,
+                                addr,
+                                dev_state,
+                                ui_tx,
+                                config,
+                                lid_tracker,
+                            )
+                            .await;
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        warn!("BLE discovery stream ended");
+                        break;
+                    }
+                }
+            }
+            _ = gate_tick.tick() => {
+                if scan_gate(dev_state, config).await != ScanGate::Active {
                     break;
                 }
             }
         }
-
-        // Dropping the stream ends our discovery client. When no other client
-        // needs discovery, BlueZ stops the scan, which is what releases the
-        // controller while AirPods are connected, scanning is disabled, or we
-        // are in the quiet gap between windows.
-        drop(stream);
-
-        if interrupted {
-            continue;
-        }
-
-        if stream_ended {
-            warn!(
-                "BLE discovery stream ended; restarting in {}s",
-                DISCOVERY_RESTART_DELAY.as_secs()
-            );
-            tokio::time::sleep(DISCOVERY_RESTART_DELAY).await;
-        } else {
-            tokio::time::sleep(SCAN_WINDOW_OFF).await;
-        }
     }
+
+    Ok(())
 }
 
 fn load_hex_key(hex_opt: Option<&str>) -> Option<[u8; 16]> {
@@ -426,7 +426,7 @@ async fn parse_proximity_message(
     let parse_nibble_battery = |nibble: u8| -> Option<u8> {
         match nibble {
             0x0..=0x9 => Some(nibble * 10),
-            0xA..=0xE => Some(100),
+            0xA => Some(100),
             _ => None,
         }
     };
@@ -457,36 +457,37 @@ async fn parse_proximity_message(
     let mut case_charging = (flags & 0x04) != 0;
 
     if let Some(enc_key) = enc_key_opt
-        && data.len() >= 27 {
-            let mut block = [0u8; 16];
-            block.copy_from_slice(&data[data.len() - 16..]);
-            let dec = decrypt_proximity_payload(&enc_key, &block);
-            let left_idx = if are_values_flipped { 2 } else { 1 };
-            let right_idx = if are_values_flipped { 1 } else { 2 };
+        && data.len() >= 27
+    {
+        let mut block = [0u8; 16];
+        block.copy_from_slice(&data[data.len() - 16..]);
+        let dec = decrypt_proximity_payload(&enc_key, &block);
+        let left_idx = if are_values_flipped { 2 } else { 1 };
+        let right_idx = if are_values_flipped { 1 } else { 2 };
 
-            let parse_exact = |raw: u8| -> Option<(u8, bool)> {
-                let charging = (raw & 0x80) != 0;
-                let level = raw & 0x7F;
-                if level <= 100 {
-                    Some((level, charging))
-                } else {
-                    None
-                }
-            };
+        let parse_exact = |raw: u8| -> Option<(u8, bool)> {
+            let charging = (raw & 0x80) != 0;
+            let level = raw & 0x7F;
+            if level <= 100 {
+                Some((level, charging))
+            } else {
+                None
+            }
+        };
 
-            if let Some((lvl, chg)) = parse_exact(dec[left_idx]) {
-                left_battery = Some(lvl);
-                left_charging = chg;
-            }
-            if let Some((lvl, chg)) = parse_exact(dec[right_idx]) {
-                right_battery = Some(lvl);
-                right_charging = chg;
-            }
-            if let Some((lvl, chg)) = parse_exact(dec[3]) {
-                case_battery = Some(lvl);
-                case_charging = chg;
-            }
+        if let Some((lvl, chg)) = parse_exact(dec[left_idx]) {
+            left_battery = Some(lvl);
+            left_charging = chg;
         }
+        if let Some((lvl, chg)) = parse_exact(dec[right_idx]) {
+            right_battery = Some(lvl);
+            right_charging = chg;
+        }
+        if let Some((lvl, chg)) = parse_exact(dec[3]) {
+            case_battery = Some(lvl);
+            case_charging = chg;
+        }
+    }
 
     let xor_factor = are_values_flipped ^ is_this_pod_in_case;
     let left_in_ear = if xor_factor {
@@ -500,36 +501,71 @@ async fn parse_proximity_message(
         (status & 0x08) != 0
     };
 
+    let model_id = u16::from_le_bytes([data[3], data[4]]);
+    let packet_model = crate::core::models::AirPodsModel::from_product_id(model_id);
+
     let mut lock = dev_state.write().await;
     if let Some(ref mut state) = *lock {
-        if state.mac_address != addr_str && !rpa_verified {
+        let model_matches = packet_model == state.model;
+        let is_target = state.mac_address == addr_str
+            || rpa_verified
+            || (irk_opt.is_none() && model_matches);
+
+        if !is_target {
             debug!(
-                "Ignoring proximity message from {} (tracked device is {}, rpa_verified=false)",
-                device_addr, state.mac_address
+                "Ignoring proximity message from {} (tracked device is {}, rpa_verified=false, packet_model={:?})",
+                device_addr, state.mac_address, packet_model
             );
             return;
         }
 
-        // Preserve AACP-authoritative in-ear state when connected, since BLE status
-        // bits can lag or reflect only the case-side bud.
+        info!(
+            "Accepted Apple Proximity packet from {} (rpa_verified={}, connected={}, lid_open={}, counter={})",
+            device_addr, rpa_verified, state.is_connected, lid_open, lid_counter
+        );
+
+        // Preserve AACP-authoritative in-ear state and battery when connected.
+        // AACP provides exact 1%-granular battery readings directly from the earbuds.
         let aacp_wearing = state.is_connected && state.is_wearing_any();
 
-        if let Some(lb) = left_battery {
-            state.battery_left = Some(lb);
-            state.battery_left_charging = left_charging;
-        }
-        if let Some(rb) = right_battery {
-            state.battery_right = Some(rb);
-            state.battery_right_charging = right_charging;
-        }
-        if let Some(cb) = case_battery {
-            state.battery_case = Some(cb);
-            state.battery_case_charging = case_charging;
-        }
-
         if !state.is_connected {
+            // When disconnected, BLE proximity is the sole source of battery
+            // for the popup window and device state.
+            if let Some(lb) = left_battery {
+                state.battery_left = Some(lb);
+                state.battery_left_charging = left_charging;
+            }
+            if let Some(rb) = right_battery {
+                state.battery_right = Some(rb);
+                state.battery_right_charging = right_charging;
+            }
+            if let Some(cb) = case_battery {
+                state.battery_case = Some(cb);
+                state.battery_case_charging = case_charging;
+            }
+
             state.left_in_ear = EarStatus::Disconnected;
             state.right_in_ear = EarStatus::Disconnected;
+        } else {
+            // When connected, AACP is authoritative for earbud battery and in-ear status.
+            // If AACP has not provided earbud battery yet, use BLE as initial fallback.
+            if state.battery_left.is_none() {
+                if let Some(lb) = left_battery {
+                    state.battery_left = Some(lb);
+                    state.battery_left_charging = left_charging;
+                }
+            }
+            if state.battery_right.is_none() {
+                if let Some(rb) = right_battery {
+                    state.battery_right = Some(rb);
+                    state.battery_right_charging = right_charging;
+                }
+            }
+            // Only update case battery if the case is actively open or in-use.
+            if (lid_open || is_this_pod_in_case) && case_battery.is_some() {
+                state.battery_case = case_battery;
+                state.battery_case_charging = case_charging;
+            }
         }
 
         let wearing_any = aacp_wearing || left_in_ear || right_in_ear;
@@ -583,90 +619,14 @@ mod tests {
         *dev_state.write().await = Some(state.clone());
         assert_eq!(scan_gate(&dev_state, &config).await, ScanGate::Active);
 
+        // Connected AirPods remain Active so case lid open and case battery
+        // updates are tracked even when headphones are in use.
         state.is_connected = true;
         *dev_state.write().await = Some(state.clone());
-        assert_eq!(
-            scan_gate(&dev_state, &config).await,
-            ScanGate::PausedConnected
-        );
+        assert_eq!(scan_gate(&dev_state, &config).await, ScanGate::Active);
 
-        config.write().unwrap().ble_scan_enabled = false;
+        config.write().unwrap().case_popup_enabled = false;
         assert_eq!(scan_gate(&dev_state, &config).await, ScanGate::Disabled);
-    }
-
-    #[test]
-    fn advert_freshness_ignores_cached_replays_until_payload_changes() {
-        let mut freshness = AdvertFreshness::default();
-        let addr: bluer::Address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-
-        // Seeded from the BlueZ cache at startup: replaying it is not fresh.
-        freshness.remember(addr, &[0x07, 0x19]);
-        assert!(!freshness.accept(addr, &[0x07, 0x19]));
-        // A changed payload is a real advertisement.
-        assert!(freshness.accept(addr, &[0x07, 0x19, 0x01]));
-        assert!(!freshness.accept(addr, &[0x07, 0x19, 0x01]));
-        // Once BlueZ forgets the address, the next payload counts as new again.
-        freshness.retain_known(&[]);
-        assert!(freshness.accept(addr, &[0x07, 0x19, 0x01]));
-    }
-
-    /// Live BlueZ check for the scan windowing and the connected-pause gate.
-    /// Ignored by default because it starts and stops discovery on the real
-    /// adapter; run with:
-    /// `cargo test -- --ignored scan_windows_toggle_discovery`.
-    #[tokio::test]
-    #[ignore = "live BlueZ: drives discovery on the system adapter"]
-    async fn scan_windows_toggle_discovery_and_pause_when_connected() {
-        use crate::core::models::AirPodsModel;
-
-        async fn wait_for(adapter: &bluer::Adapter, want: bool, within: Duration) -> bool {
-            let deadline = tokio::time::Instant::now() + within;
-            loop {
-                if adapter.is_discovering().await.unwrap_or(!want) == want {
-                    return true;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return false;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-
-        let session = Session::new().await.unwrap();
-        let adapter = session.default_adapter().await.unwrap();
-
-        let config = Arc::new(std::sync::RwLock::new(AppConfig::default()));
-        let dev_state: Arc<RwLock<Option<AirPodsDeviceState>>> = Arc::new(RwLock::new(Some(
-            AirPodsDeviceState::new(
-                "AA:BB:CC:DD:EE:FF".to_string(),
-                "AirPods".to_string(),
-                AirPodsModel::AirPods3,
-            ),
-        )));
-        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
-
-        let monitor = tokio::spawn(start_le_monitor(dev_state.clone(), ui_tx, config));
-
-        assert!(
-            wait_for(&adapter, true, Duration::from_secs(3)).await,
-            "first scan window should open"
-        );
-        assert!(
-            wait_for(&adapter, false, SCAN_WINDOW_ON + Duration::from_secs(3)).await,
-            "scan should stop between windows"
-        );
-        assert!(
-            wait_for(&adapter, true, SCAN_WINDOW_OFF + Duration::from_secs(3)).await,
-            "next scan window should open"
-        );
-
-        dev_state.write().await.as_mut().unwrap().is_connected = true;
-        assert!(
-            wait_for(&adapter, false, SCAN_GATE_POLL + Duration::from_secs(2)).await,
-            "connected AirPods must pause the scan before the window ends"
-        );
-
-        monitor.abort();
     }
 
     #[test]
