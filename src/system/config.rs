@@ -91,9 +91,18 @@ impl AppLanguage {
         }
     }
 
+    /// Returns the localized display label for this language option in the active UI locale.
+    pub fn localized_label(self) -> String {
+        match self {
+            AppLanguage::Auto => rust_i18n::t!("preferences.lang_auto").to_string(),
+            AppLanguage::ZhCn => rust_i18n::t!("preferences.lang_zh").to_string(),
+            AppLanguage::EnUs => rust_i18n::t!("preferences.lang_en").to_string(),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
-            AppLanguage::Auto => "跟随系统 (Auto)",
+            AppLanguage::Auto => "Follow System (Auto)",
             AppLanguage::ZhCn => "简体中文",
             AppLanguage::EnUs => "English",
         }
@@ -136,6 +145,9 @@ pub struct AppConfig {
     /// preference and rewrites the file from scratch).
     #[serde(default = "default_true")]
     pub head_gesture_answers_enabled: bool,
+    /// Whether to answer agent tool permission inquiries with head gestures (nod to allow, shake to deny).
+    #[serde(default = "default_true")]
+    pub gesture_permission_answers_enabled: bool,
     /// Gesture sensitivity, 1 (only deliberate, large nods) to 5 (light
     /// movements already count). Drives the nod counter's thresholds and the
     /// badge detector's amplitude gates; clamped at the use sites.
@@ -145,12 +157,6 @@ pub struct AppConfig {
     /// AirPods case lid is opened nearby.
     #[serde(default = "default_true")]
     pub case_popup_enabled: bool,
-    /// Run a background BLE scan for the AirPods case proximity advertisement
-    /// (lid-open popups and battery updates while disconnected). This is the
-    /// escape hatch for machines where background scanning disturbs other
-    /// Bluetooth input devices' automatic reconnection.
-    #[serde(default = "default_true")]
-    pub ble_scan_enabled: bool,
     /// Cached Apple Proximity IRK (16 bytes, lowercase hex) for verifying BLE
     /// Resolvable Private Addresses when the case lid opens before Classic BT connects.
     #[serde(default)]
@@ -222,9 +228,9 @@ impl Default for AppConfig {
             start_minimized: false,
             close_to_tray: true,
             head_gesture_answers_enabled: true,
+            gesture_permission_answers_enabled: true,
             gesture_sensitivity: 3,
             case_popup_enabled: true,
-            ble_scan_enabled: true,
             proximity_irk: None,
             proximity_enc_key: None,
             head_mouse_enabled: false,
@@ -430,8 +436,8 @@ mod tests {
             start_minimized: true,
             close_to_tray: false,
             head_gesture_answers_enabled: false,
+            gesture_permission_answers_enabled: false,
             case_popup_enabled: false,
-            ble_scan_enabled: false,
             proximity_irk: Some("0123456789abcdef0123456789abcdef".to_string()),
             proximity_enc_key: Some("fedcba9876543210fedcba9876543210".to_string()),
             head_mouse_enabled: true,
@@ -503,7 +509,6 @@ mod tests {
         let (loaded, outcome) = load_config_from(&path);
         assert_eq!(outcome, ConfigLoad::Loaded);
         assert!(!loaded.head_mouse_enabled);
-        assert!(loaded.ble_scan_enabled, "missing field must default to on");
         assert_eq!(loaded.head_mouse_speed, 20.0);
         assert_eq!(loaded.head_mouse_accel, 1.0);
         assert_eq!(loaded.head_mouse_smoothing, 0.35);

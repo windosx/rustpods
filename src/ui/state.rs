@@ -252,21 +252,21 @@ impl RustPodsController {
         }
     }
 
-    /// Enables/disables the background BLE proximity scan. The scanner polls
-    /// the flag, so the change takes effect without restarting the daemon.
-    pub fn toggle_ble_scan(&self, enabled: bool) {
-        if let Ok(mut c) = self.config.write() {
-            c.ble_scan_enabled = enabled;
-            save_config(&c);
-        }
-    }
-
     pub fn preview_case_popup(&self) {
         let _ = self.ui_tx.send(UiEvent::CaseLidOpened);
     }
 
     pub fn toggle_head_gesture_answers(&self, enabled: bool) {
         if let Ok(mut c) = self.config.write() {
+            c.head_gesture_answers_enabled = enabled;
+            c.gesture_permission_answers_enabled = enabled;
+            save_config(&c);
+        }
+    }
+
+    pub fn toggle_gesture_permission_answers(&self, enabled: bool) {
+        if let Ok(mut c) = self.config.write() {
+            c.gesture_permission_answers_enabled = enabled;
             c.head_gesture_answers_enabled = enabled;
             save_config(&c);
         }
@@ -282,10 +282,14 @@ impl RustPodsController {
     }
 
     pub fn start_agent_test(&self, agent_name: &str) -> tokio::sync::oneshot::Receiver<Result<AskReply, String>> {
+        self.start_agent_permission_test(agent_name)
+    }
+
+    pub fn start_agent_permission_test(&self, agent_name: &str) -> tokio::sync::oneshot::Receiver<Result<AskReply, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let agent = agent_name.to_string();
         self.rt.spawn(async move {
-            let _ = tx.send(zcode_ask::run_test_question(&agent).await);
+            let _ = tx.send(zcode_ask::run_test_permission(&agent).await);
         });
         rx
     }

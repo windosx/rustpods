@@ -72,6 +72,13 @@ fn get_mode_items() -> Vec<String> {
     ]
 }
 
+fn get_language_items() -> Vec<String> {
+    crate::system::config::AppLanguage::ALL
+        .iter()
+        .map(|lang| lang.localized_label())
+        .collect()
+}
+
 pub struct MainWindow {
     app_state: Entity<RustPodsState>,
     rename_input: Entity<InputState>,
@@ -80,6 +87,7 @@ pub struct MainWindow {
     mic_select: Entity<SelectState<Vec<String>>>,
     sensitivity_select: Entity<SelectState<Vec<String>>>,
     mouse_mode_select: Entity<SelectState<Vec<String>>>,
+    language_select: Entity<SelectState<Vec<String>>>,
     mouse_speed_slider: Entity<SliderState>,
     mouse_accel_slider: Entity<SliderState>,
     mouse_smooth_slider: Entity<SliderState>,
@@ -170,6 +178,15 @@ impl MainWindow {
         };
         let mouse_mode_select = cx.new(|cx| {
             SelectState::new(mode_items, Some(IndexPath::default().row(mode_idx)), window, cx)
+        });
+
+        let lang_items = get_language_items();
+        let lang_idx = crate::system::config::AppLanguage::ALL
+            .iter()
+            .position(|&l| l == cfg.language)
+            .unwrap_or(0);
+        let language_select = cx.new(|cx| {
+            SelectState::new(lang_items, Some(IndexPath::default().row(lang_idx)), window, cx)
         });
 
         let mouse_speed_slider = cx.new(|_| {
@@ -300,6 +317,7 @@ impl MainWindow {
             mic_select,
             sensitivity_select,
             mouse_mode_select,
+            language_select,
             mouse_speed_slider,
             mouse_accel_slider,
             mouse_smooth_slider,
@@ -463,6 +481,26 @@ impl MainWindow {
                 },
             ));
         }
+
+        // Language selector.
+        {
+            let app_lang = self.app_state.clone();
+            self._select_subscriptions.push(cx.subscribe(
+                &self.language_select,
+                move |_this, select, event: &SelectEvent<Vec<String>>, cx| {
+                    let SelectEvent::Confirm(_) = event;
+                    let row = select.read(cx).selected_index(cx).map(|p| p.row).unwrap_or(0);
+                    let lang = crate::system::config::AppLanguage::ALL
+                        .get(row)
+                        .copied()
+                        .unwrap_or(crate::system::config::AppLanguage::Auto);
+                    app_lang.update(cx, |s, cx| {
+                        s.controller.set_language(lang);
+                        cx.notify();
+                    });
+                },
+            ));
+        }
     }
 
     fn rebuild_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -500,6 +538,14 @@ impl MainWindow {
         };
         self.mouse_mode_select = cx.new(|cx| {
             SelectState::new(get_mode_items(), Some(IndexPath::default().row(mode_row)), window, cx)
+        });
+
+        let lang_row = crate::system::config::AppLanguage::ALL
+            .iter()
+            .position(|&l| l == cfg.language)
+            .unwrap_or(0);
+        self.language_select = cx.new(|cx| {
+            SelectState::new(get_language_items(), Some(IndexPath::default().row(lang_row)), window, cx)
         });
 
         self.rename_input.update(cx, |input, cx| {
@@ -772,8 +818,13 @@ impl Render for MainWindow {
             )
             .into_any_element(),
 
-            NavPage::Preferences => render_preferences_page(state, &self.app_state, &p)
-                .into_any_element(),
+            NavPage::Preferences => render_preferences_page(
+                state,
+                &self.app_state,
+                &self.language_select,
+                &p,
+            )
+            .into_any_element(),
         };
 
         div()

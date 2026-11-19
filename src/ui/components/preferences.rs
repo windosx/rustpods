@@ -1,8 +1,8 @@
-use crate::system::config::AppLanguage;
 use crate::system::updater::{open_browser, UpdateState};
 use crate::ui::state::RustPodsState;
 use crate::ui::theme::{apply_apple_theme, grouped_card, section_header, setting_row, ApplePalette};
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants as _};
+use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{Icon, ThemeMode};
@@ -14,18 +14,17 @@ use gpui_kit::{
 pub fn render_preferences_page(
     state: &RustPodsState,
     app_state: &Entity<RustPodsState>,
+    language_select: &Entity<SelectState<Vec<String>>>,
     p: &ApplePalette,
 ) -> impl IntoElement {
     let cfg = state.config_snapshot();
     let dev = &state.device;
     let app_tray = app_state.clone();
     let app_popup = app_state.clone();
-    let app_ble_scan = app_state.clone();
     let app_preview = app_state.clone();
     let app_theme_light = app_state.clone();
     let app_theme_dark = app_state.clone();
     let is_dark = state.theme_mode.is_dark();
-    let cur_lang = cfg.language;
 
     let theme_switcher = div()
         .flex()
@@ -102,50 +101,6 @@ pub fn render_preferences_page(
                 .child(rust_i18n::t!("shell.theme_dark")),
         );
 
-    let language_switcher = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .p(px(3.))
-        .rounded(px(10.))
-        .bg(p.pill_bg)
-        .border_1()
-        .border_color(p.card_border)
-        .gap(px(3.))
-        .children(AppLanguage::ALL.iter().map(|&lang| {
-            let active = cur_lang == lang;
-            let app_lang = app_state.clone();
-            div()
-                .id(("pref-lang", lang as usize))
-                .cursor_pointer()
-                .px(px(10.))
-                .py(px(5.))
-                .rounded(px(7.))
-                .text_size(px(12.))
-                .font_weight(if active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
-                })
-                .bg(if active {
-                    p.pill_active_bg
-                } else {
-                    gpui_kit::transparent_black()
-                })
-                .text_color(if active {
-                    p.sidebar_item_active_fg
-                } else {
-                    p.text_primary
-                })
-                .on_click(move |_, _, cx| {
-                    app_lang.update(cx, |s, cx| {
-                        s.controller.set_language(lang);
-                        cx.notify();
-                    });
-                })
-                .child(lang.label())
-        }));
-
     div()
         .w_full()
         .flex()
@@ -169,7 +124,7 @@ pub fn render_preferences_page(
                     p,
                     &rust_i18n::t!("preferences.language"),
                     Some(&rust_i18n::t!("preferences.language_desc")),
-                    language_switcher,
+                    Select::new(language_select).w(px(240.)),
                     true,
                 ))
                 .child(setting_row(
@@ -217,21 +172,6 @@ pub fn render_preferences_page(
                                     });
                                 }),
                         ),
-                    true,
-                ))
-                .child(setting_row(
-                    p,
-                    &rust_i18n::t!("preferences.ble_scan"),
-                    Some(&rust_i18n::t!("preferences.ble_scan_desc")),
-                    Switch::new("ble-scan-switch")
-                        .checked(cfg.ble_scan_enabled)
-                        .on_change(move |checked, _, cx| {
-                            let val = *checked;
-                            app_ble_scan.update(cx, |s, cx| {
-                                s.controller.toggle_ble_scan(val);
-                                cx.notify();
-                            });
-                        }),
                     true,
                 ))
                 .child(setting_row(
