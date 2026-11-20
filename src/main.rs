@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 #[macro_use]
 extern crate rust_i18n;
 
@@ -291,6 +293,12 @@ fn activate_running_gui() -> bool {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
     let cli = Cli::parse();
 
     let log_level = if cli.debug {
