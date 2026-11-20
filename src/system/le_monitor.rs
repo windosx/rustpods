@@ -222,22 +222,22 @@ async fn run_advertisement_monitor(
                         debug!("AdvertisementMonitor: device found {}", addr);
 
                         if let Ok(dev) = adapter.device(addr) {
-                            if let Ok(Some(mfg)) = dev.manufacturer_data().await {
-                                if let Some(apple_data) = mfg.get(&76) {
-                                    parse_proximity_message(
-                                        apple_data,
-                                        addr,
-                                        dev_state,
-                                        ui_tx,
-                                        config,
-                                        lid_tracker,
-                                    ).await;
-                                }
+                            if let Ok(Some(mfg)) = dev.manufacturer_data().await
+                                && let Some(apple_data) = mfg.get(&76)
+                            {
+                                parse_proximity_message(
+                                    apple_data,
+                                    addr,
+                                    dev_state,
+                                    ui_tx,
+                                    config,
+                                    lid_tracker,
+                                ).await;
                             }
 
                             // Watch subsequent property changes on this device while in range
                             // (e.g. lid opened, closed, battery level updates).
-                            if !active_devices.contains_key(&addr) {
+                            if let std::collections::hash_map::Entry::Vacant(entry) = active_devices.entry(addr) {
                                 let dev_c = dev.clone();
                                 let dev_state_c = dev_state.clone();
                                 let ui_tx_c = ui_tx.clone();
@@ -247,22 +247,22 @@ async fn run_advertisement_monitor(
                                 let task = tokio::spawn(async move {
                                     if let Ok(mut events) = dev_c.events().await {
                                         while let Some(dev_evt) = events.next().await {
-                                            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ManufacturerData(mfg)) = dev_evt {
-                                                if let Some(apple_data) = mfg.get(&76) {
-                                                    parse_proximity_message(
-                                                        apple_data,
-                                                        addr,
-                                                        &dev_state_c,
-                                                        &ui_tx_c,
-                                                        &cfg_c,
-                                                        &lid_c,
-                                                    ).await;
-                                                }
+                                            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ManufacturerData(mfg)) = dev_evt
+                                                && let Some(apple_data) = mfg.get(&76)
+                                            {
+                                                parse_proximity_message(
+                                                    apple_data,
+                                                    addr,
+                                                    &dev_state_c,
+                                                    &ui_tx_c,
+                                                    &cfg_c,
+                                                    &lid_c,
+                                                ).await;
                                             }
                                         }
                                     }
                                 });
-                                active_devices.insert(addr, task);
+                                entry.insert(task);
                             }
                         }
                     }
@@ -549,17 +549,17 @@ async fn parse_proximity_message(
         } else {
             // When connected, AACP is authoritative for earbud battery and in-ear status.
             // If AACP has not provided earbud battery yet, use BLE as initial fallback.
-            if state.battery_left.is_none() {
-                if let Some(lb) = left_battery {
-                    state.battery_left = Some(lb);
-                    state.battery_left_charging = left_charging;
-                }
+            if state.battery_left.is_none()
+                && let Some(lb) = left_battery
+            {
+                state.battery_left = Some(lb);
+                state.battery_left_charging = left_charging;
             }
-            if state.battery_right.is_none() {
-                if let Some(rb) = right_battery {
-                    state.battery_right = Some(rb);
-                    state.battery_right_charging = right_charging;
-                }
+            if state.battery_right.is_none()
+                && let Some(rb) = right_battery
+            {
+                state.battery_right = Some(rb);
+                state.battery_right_charging = right_charging;
             }
             // Only update case battery if the case is actively open or in-use.
             if (lid_open || is_this_pod_in_case) && case_battery.is_some() {
