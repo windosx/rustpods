@@ -3,7 +3,7 @@
 
 #define MyAppName "RustPods"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.4"
+  #define MyAppVersion "0.2.0"
 #endif
 #define MyAppPublisher "RustPods"
 #define MyAppURL "https://github.com/windosx/rustpods"

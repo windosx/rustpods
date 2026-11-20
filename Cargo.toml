@@ -1,8 +1,8 @@
 [package]
 name = "rustpods"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
-description = "AirPods Control Center and System Services for Linux"
+description = "AirPods Control Center and System Services for Linux & Windows"
 authors = ["windosx <windosx@github.com>"]
 license = "AGPL-3.0-only"
 repository = "https://github.com/windosx/rustpods"

@@ -27,7 +27,7 @@ RustPods brings the parts of the AirPods experience that macOS takes for granted
 It speaks Apple's AACP protocol over L2CAP directly from Rust. No bridge daemon, no patched BlueZ, no Android phone in the middle.
 
 > [!NOTE]
-> RustPods is early-stage software (v0.1.0). Head tracking has been verified end-to-end on AirPods 3 through Apple RemoteHID; newer models use the documented payload layouts in `src/core/head_tracking.rs`. Expect rough edges, and please [open an issue](https://github.com/windosx/rustpods/issues) when you find one.
+> RustPods is early-stage software (v0.2.0). Head tracking has been verified end-to-end on AirPods 3 through Apple RemoteHID; newer models use the documented payload layouts in `src/core/head_tracking.rs`. Expect rough edges, and please [open an issue](https://github.com/windosx/rustpods/issues) when you find one.
 
 ## Features
 
@@ -225,6 +225,7 @@ To uninstall, run `sudo ./uninstall.sh` (or `contrib/scripts/uninstall.sh`).
 
 ```bash
 rustpods                  # open the control center
+rustpods --minimized      # start minimized to the system tray (autostart)
 rustpods --no-gui         # tray-only daemon (good for autostart)
 rustpods --debug          # verbose logging
 rustpods --log-file PATH  # also write logs to a file

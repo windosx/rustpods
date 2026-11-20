@@ -18,7 +18,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(
     name = "rustpods",
     version,
-    about = "Linux AirPods Control & macOS Parity Experience"
+    about = "AirPods Control Center and System Services for Linux & Windows"
 )]
 struct Cli {
     #[arg(short, long, help = "Enable debug logging")]
