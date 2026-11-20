@@ -5,7 +5,7 @@
 <h1 align="center">RustPods</h1>
 
 <p align="center">
-  <strong>AirPods control center and system service for Linux.</strong><br>
+  <strong>AirPods control center and system service for Linux & Windows.</strong><br>
   Native Rust, GPU-accelerated UI, head-tracked spatial audio, and a pointer you drive with your head.
 </p>
 
@@ -15,14 +15,14 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg"></a>
-  <img alt="Platform: Linux (Wayland / X11)" src="https://img.shields.io/badge/platform-Linux%20%7C%20Wayland%20%7C%20X11-1d1d1f?logo=linux&logoColor=white">
+  <img alt="Platform: Linux | Windows 10/11" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-1d1d1f?logo=linux&logoColor=white">
   <img alt="Rust: 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust">
   <a href="https://github.com/windosx/rustpods/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/windosx/rustpods"></a>
 </p>
 
 ---
 
-RustPods brings the parts of the AirPods experience that macOS takes for granted to the Linux desktop: battery and ear-detection status, noise control, a real control-center UI, and — with head tracking enabled — spatial audio that stays anchored in space and a pointer you can move by turning your head.
+RustPods brings the parts of the AirPods experience that macOS takes for granted to Linux and Windows: battery and ear-detection status, noise control, a real control-center UI, and — with head tracking enabled — spatial audio that stays anchored in space and a pointer you can move by turning your head.
 
 It speaks Apple's AACP protocol over L2CAP directly from Rust. No bridge daemon, no patched BlueZ, no Android phone in the middle.
 
@@ -79,10 +79,31 @@ It speaks Apple's AACP protocol over L2CAP directly from Rust. No bridge daemon,
 
 ### Native AACP stack
 
-- Pure Rust classic-Bluetooth L2CAP channel on PSM `0x1001` via `bluer`.
+- Pure Rust classic-Bluetooth L2CAP channel on PSM `0x1001` (via `bluer` on Linux, and MagicAAP driver/pipe on Windows).
 - Announces all sensor descriptors (`request_all_descriptors`) and brings up Apple RemoteHID (`0x800`) at roughly 100 Hz.
 - Ear detection (pause on removal, resume on insertion) and Conversational Awareness are driven from decoded AACP notifications.
 - AES-128 payload decryption and RPA hash validation live in `src/core/crypto.rs`.
+
+### Windows Dual-Mode Architecture
+
+RustPods natively supports **Windows 10 and 11 (x86_64)** with a dual-mode engine:
+
+- **Native Driverless Mode**:
+  - Works out of the box with zero third-party drivers or kernel extensions.
+  - Native WinRT Bluetooth LE advertisement monitoring with Apple Company ID `0x004C` hardware filter.
+  - Case lid-open popup with 360° device animation and real-time battery ring levels.
+  - Windows Taskbar System Tray icon with dynamic, real-time circular battery gauge (GDI/DIB).
+  - Global System Media Transport Controls (GSMTC) integration for automatic media pause/resume on ear insertion/removal.
+  - Full GPU-accelerated Control Center UI.
+- **Driver Enhanced Mode**:
+  - When the optional MagicAAP driver or named pipe bridge (`\\.\MagicAAP` / `\\.\pipe\magicaap-l2cap`) is present, RustPods unlocks classic Bluetooth L2CAP PSM `0x1001` communications.
+  - Unlocks active noise control (ANC), Transparency, and Adaptive audio switching.
+  - Unlocks 100 Hz real-time IMU sensor telemetry (Apple RemoteHID).
+  - Unlocks Head Mouse (Air Mouse / Laser Pointer) driven via Win32 `SendInput`.
+  - Unlocks head gesture approvals (nod to allow, shake to deny) for AI agent permissions.
+- **OpenTrack UDP Head Tracking (Spatial Audio & Gaming)**:
+  - On Windows, head pose is streamed in real time via UDP to `127.0.0.1:4242` in standard IEEE 754 6DOF format.
+  - Compatible with OpenTrack, FreeTrack, TrackIR games, flight simulators (MSFS, DCS World, X-Plane), and racing simulators.
 
 ## Device compatibility
 
@@ -97,6 +118,7 @@ RustPods recognises AirPods 1–4, AirPods 4 (ANC), AirPods Pro 1/2 (Lightning a
 
 ## Requirements
 
+### Linux
 - Linux with a running **BlueZ** stack (>= 5.60) and a Bluetooth adapter that supports classic Bluetooth.
 - **Rust 1.85+** (the crate uses edition 2024).
 - **PipeWire** for head-tracked audio, with the SOFA filter-chain module:
@@ -107,17 +129,25 @@ RustPods recognises AirPods 1–4, AirPods 4 (ANC), AirPods Pro 1/2 (Lightning a
   - Fedora: `sudo dnf install clang pipewire-devel pkg-config`
   - Debian/Ubuntu: `sudo apt install clang libclang-dev libpipewire-0.3-dev pkg-config`
 
-`audio-follow` is a default Cargo feature because it pulls in `pipewire-sys` and therefore the headers above. To build the rest of the application without it:
+### Windows
+- **Windows 10 (version 1809+) or Windows 11 (x86_64)**.
+- Bluetooth adapter with BLE support.
+- (Optional for Driver Enhanced Mode): MagicAAP driver or compatible L2CAP bridge for ANC, AACP telemetry, and head-mouse features.
+
+`audio-follow` is a default Cargo feature because it pulls in `pipewire-sys` and therefore the headers above on Linux. To build without PipeWire or on Windows:
 
 ```bash
 cargo build --release --no-default-features
 ```
 
-The GUI, tray, AACP stack, and head-pose mouse still work; only the head-tracked audio output is unavailable.
+The GUI, tray, AACP stack, and head-pose mouse work across platforms; on Linux, head-tracked audio is routed through PipeWire SOFA, while on Windows it broadcasts OpenTrack UDP (port 4242).
 
 ## Installation
 
 ### Method 1: Package Managers & Prebuilt Releases (Recommended)
+
+#### Windows (x86_64)
+Download the latest `rustpods-v*-windows-x86_64.zip` from [Releases](https://github.com/windosx/rustpods/releases), extract it, and launch `rustpods.exe`.
 
 #### Arch Linux (AUR)
 ```bash
