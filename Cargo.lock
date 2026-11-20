@@ -5982,6 +5982,7 @@ dependencies = [
  "cipher",
  "clap",
  "dirs 6.0.0",
+ "embed-resource",
  "evdev",
  "futures",
  "gpui-kit",

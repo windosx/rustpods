@@ -64,6 +64,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",
 ] }
 
+[build-dependencies]
+embed-resource = "3.0"
+
 [features]
 default = ["audio-follow"]
 # Pan the stereo image to follow the wearer's head. Requires libpipewire-0.3

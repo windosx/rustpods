@@ -1,6 +1,14 @@
 fn main() {
     #[cfg(target_os = "linux")]
     ensure_xkbcommon_x11_symlink();
+
+    compile_windows_resources();
+}
+
+fn compile_windows_resources() {
+    println!("cargo:rerun-if-changed=assets/rustpods.rc");
+    println!("cargo:rerun-if-changed=assets/rustpods.ico");
+    let _ = embed_resource::compile("assets/rustpods.rc", embed_resource::NONE).manifest_optional();
 }
 
 #[cfg(target_os = "linux")]
