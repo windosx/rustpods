@@ -204,4 +204,87 @@ mod tests {
         assert!(caps.has_adaptive_audio);
         assert!(caps.has_volume_swipe);
     }
+
+    #[test]
+    fn test_mac_address_parse_and_display() {
+        let addr: MacAddress = "00:11:22:33:44:55".parse().unwrap();
+        assert_eq!(addr.0, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(addr.to_string(), "00:11:22:33:44:55");
+
+        let addr_dash: MacAddress = "AA-BB-CC-DD-EE-FF".parse().unwrap();
+        assert_eq!(addr_dash.0, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(addr_dash.to_string(), "AA:BB:CC:DD:EE:FF");
+    }
+}
+
+/// A 6-byte Bluetooth device MAC address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MacAddress(pub [u8; 6]);
+
+impl MacAddress {
+    pub const ZERO: Self = Self([0; 6]);
+
+    pub fn new(bytes: [u8; 6]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 6] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MacAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+        )
+    }
+}
+
+impl std::str::FromStr for MacAddress {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let clean = s.trim();
+        let parts: Vec<&str> = if clean.contains(':') {
+            clean.split(':').collect()
+        } else if clean.contains('-') {
+            clean.split('-').collect()
+        } else {
+            return Err(format!("Invalid MAC address format: {}", s));
+        };
+
+        if parts.len() != 6 {
+            return Err(format!("Expected 6 octets in MAC address, got {}", parts.len()));
+        }
+
+        let mut bytes = [0u8; 6];
+        for (i, part) in parts.iter().enumerate() {
+            bytes[i] = u8::from_str_radix(part, 16)
+                .map_err(|e| format!("Invalid hex octet '{}': {}", part, e))?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl From<[u8; 6]> for MacAddress {
+    fn from(bytes: [u8; 6]) -> Self {
+        Self(bytes)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<bluer::Address> for MacAddress {
+    fn from(addr: bluer::Address) -> Self {
+        Self(addr.0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<MacAddress> for bluer::Address {
+    fn from(addr: MacAddress) -> Self {
+        bluer::Address(addr.0)
+    }
 }

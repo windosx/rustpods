@@ -1,5 +1,7 @@
-use crate::core::models::AirPodsModel;
-use bluer::{Adapter, Address, Session};
+use crate::core::models::{AirPodsModel, MacAddress};
+#[cfg(target_os = "linux")]
+use bluer::{Adapter, Session};
+#[cfg(target_os = "linux")]
 use tracing::info;
 use uuid::Uuid;
 
@@ -8,16 +10,18 @@ pub const APPLE_VENDOR_ID: u32 = 0x004c;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredAirPods {
-    pub address: Address,
+    pub address: MacAddress,
     pub name: String,
     pub model: AirPodsModel,
     pub is_connected: bool,
 }
 
+#[cfg(target_os = "linux")]
 pub struct BluetoothManager {
     session: Session,
 }
 
+#[cfg(target_os = "linux")]
 impl BluetoothManager {
     pub async fn new() -> Result<Self, String> {
         let session = Session::new()
@@ -70,7 +74,7 @@ impl BluetoothManager {
                     let model = modalias_model.unwrap_or(AirPodsModel::AirPods3);
 
                     list.push(DiscoveredAirPods {
-                        address: addr,
+                        address: addr.into(),
                         name,
                         model,
                         is_connected,
@@ -114,7 +118,7 @@ impl BluetoothManager {
                     let model = modalias_model.unwrap_or(AirPodsModel::AirPods3);
 
                     list.push(DiscoveredAirPods {
-                        address: addr,
+                        address: addr.into(),
                         name,
                         model,
                         is_connected,
@@ -131,10 +135,11 @@ impl BluetoothManager {
     /// per attempt and lost BlueZ's structured error; the API also skips the
     /// fixed 3 s sleep the shell version needed because `connect()` resolves
     /// when the link is actually up.
-    pub async fn ensure_connected(&self, addr: Address) -> Result<(), String> {
+    pub async fn ensure_connected(&self, addr: MacAddress) -> Result<(), String> {
         let adapter = self.get_default_adapter().await?;
+        let bluer_addr: bluer::Address = addr.into();
         let device = adapter
-            .device(addr)
+            .device(bluer_addr)
             .map_err(|e| format!("Device {} not found: {}", addr, e))?;
         if device.is_connected().await.unwrap_or(false) {
             return Ok(());
@@ -147,15 +152,16 @@ impl BluetoothManager {
 
     pub async fn watch_connection_events<F>(
         &self,
-        target_addr: Address,
+        target_addr: MacAddress,
         mut callback: F,
     ) -> Result<(), String>
     where
         F: FnMut(bool) + Send + 'static,
     {
         let adapter = self.get_default_adapter().await?;
+        let bluer_addr: bluer::Address = target_addr.into();
         let device = adapter
-            .device(target_addr)
+            .device(bluer_addr)
             .map_err(|e| format!("Device not found: {}", e))?;
 
         let mut events = device
@@ -179,6 +185,39 @@ impl BluetoothManager {
             }
         });
 
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub struct BluetoothManager {}
+
+#[cfg(target_os = "windows")]
+impl BluetoothManager {
+    pub async fn new() -> Result<Self, String> {
+        Ok(Self {})
+    }
+
+    pub async fn find_connected_airpods(&self) -> Result<Vec<DiscoveredAirPods>, String> {
+        Ok(Vec::new())
+    }
+
+    pub async fn find_paired_airpods(&self) -> Result<Vec<DiscoveredAirPods>, String> {
+        Ok(Vec::new())
+    }
+
+    pub async fn ensure_connected(&self, _addr: MacAddress) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub async fn watch_connection_events<F>(
+        &self,
+        _target_addr: MacAddress,
+        mut _callback: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(bool) + Send + 'static,
+    {
         Ok(())
     }
 }

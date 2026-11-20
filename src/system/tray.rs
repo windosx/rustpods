@@ -2,7 +2,9 @@ use crate::core::aacp::commands::NoiseControlMode;
 use crate::core::device::AirPodsDeviceState;
 use crate::system::config::{save_config, AppConfig};
 use crate::ui::UiEvent;
+#[cfg(target_os = "linux")]
 use ksni::menu::*;
+#[cfg(target_os = "linux")]
 use ksni::{Icon, ToolTip, Tray};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -74,6 +76,7 @@ pub struct RustPodsTray {
     pub on_quit: Arc<dyn Fn() + Send + Sync>,
 }
 
+#[cfg(target_os = "linux")]
 impl Tray for RustPodsTray {
     fn id(&self) -> String {
         "rustpods".to_string()
@@ -379,6 +382,7 @@ impl Tray for RustPodsTray {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn generate_circular_battery_icon(
     size: usize,
     level: Option<u8>,

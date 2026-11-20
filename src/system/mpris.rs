@@ -1,10 +1,16 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
+#[cfg(target_os = "linux")]
+use tracing::error;
+
+#[cfg(target_os = "linux")]
 use zbus::proxy;
+#[cfg(target_os = "linux")]
 use zbus::Connection;
 
+#[cfg(target_os = "linux")]
 #[proxy(
     default_service = "org.mpris.MediaPlayer2",
     interface = "org.mpris.MediaPlayer2.Player"
@@ -31,13 +37,13 @@ pub struct MprisController {
     paused_by_us: Arc<Mutex<HashSet<String>>>,
 }
 
+#[cfg(target_os = "linux")]
 impl MprisController {
     pub fn new() -> Self {
         Self {
             paused_by_us: Arc::new(Mutex::new(HashSet::new())),
         }
     }
-
 
     pub async fn get_player_names(&self, conn: &Connection) -> Vec<String> {
         let dbus_proxy = zbus::fdo::DBusProxy::new(conn)
@@ -57,12 +63,14 @@ impl MprisController {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Default for MprisController {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(target_os = "linux")]
 impl MprisController {
     pub async fn handle_ear_detection_pause(&self) {
         info!("Earbuds removed: auto-pausing media players...");
@@ -111,9 +119,6 @@ impl MprisController {
 
             if let Ok(builder) = proxy_res
                 && let Ok(proxy) = builder.build().await {
-                    // Only resume what is still paused. If the user resumed or
-                    // stopped the player themselves while the buds were out,
-                    // forcing play() here would start playback they ended.
                     let still_paused = matches!(
                         proxy.playback_status().await.as_deref(),
                         Ok("Paused")
@@ -189,5 +194,41 @@ impl MprisController {
                     let _ = proxy.previous().await;
                 }
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl MprisController {
+    pub fn new() -> Self {
+        Self {
+            paused_by_us: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    pub async fn handle_ear_detection_pause(&self) {
+        info!("Earbuds removed: auto-pausing media players (Windows)...");
+    }
+
+    pub async fn handle_ear_detection_resume(&self) {
+        info!("Earbuds put back: auto-resuming media players (Windows)...");
+    }
+
+    pub async fn play_pause(&self) {
+        debug!("Media Play/Pause triggered (Windows)");
+    }
+
+    pub async fn next(&self) {
+        debug!("Media Next track triggered (Windows)");
+    }
+
+    pub async fn previous(&self) {
+        debug!("Media Previous track triggered (Windows)");
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Default for MprisController {
+    fn default() -> Self {
+        Self::new()
     }
 }

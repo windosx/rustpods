@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::process::Command;
 use tracing::{debug, error, info};
 
 pub const REPO_OWNER: &str = "windosx";
@@ -241,7 +240,7 @@ pub async fn check_for_update() -> Result<Option<(String, String, String)>, Stri
 
 /// Opens the given URL in the default web browser.
 pub fn open_browser(url: &str) -> std::io::Result<()> {
-    Command::new("xdg-open").arg(url).spawn().map(|_| ())
+    open::that(url)
 }
 
 #[cfg(test)]

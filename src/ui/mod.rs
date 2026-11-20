@@ -5,6 +5,7 @@ pub mod state;
 pub mod theme;
 pub mod window;
 
+#[cfg(target_os = "linux")]
 use crate::core::aacp::commands::NoiseControlMode;
 use crate::core::aacp::events::AacpEvent;
 use crate::core::aacp::AacpManager;
@@ -12,6 +13,7 @@ use crate::core::device::AirPodsDeviceState;
 use crate::system::bluetooth::BluetoothManager;
 use crate::system::config::{load_config, save_config, AppConfig, PauseBehavior, StemAction};
 use crate::system::mpris::MprisController;
+#[cfg(target_os = "linux")]
 use crate::system::tray::RustPodsTray;
 use gpui_kit::assets::{icon_assets, Assets as DefaultKitAssets};
 use gpui_kit::component::ThemeMode;
@@ -115,10 +117,12 @@ impl AssetSource for CompositeAssets {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct SingleInstanceService {
     ui_tx: mpsc::UnboundedSender<UiEvent>,
 }
 
+#[cfg(target_os = "linux")]
 #[zbus::interface(name = "io.github.rustpods.RustPods")]
 impl SingleInstanceService {
     fn activate(&self) {
@@ -126,6 +130,7 @@ impl SingleInstanceService {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn serve_single_instance_dbus(ui_tx: mpsc::UnboundedSender<UiEvent>) {
     match zbus::connection::Builder::session() {
         Ok(builder) => {
@@ -201,12 +206,15 @@ fn bootstrap_gui(
         Arc::new(std::sync::Mutex::new(None));
     open_or_activate_window(&app_state, &active_window, cx);
 
-    // Register D-Bus single-instance Activate handler.
+    // Register D-Bus single-instance Activate handler (Linux only).
+    #[cfg(target_os = "linux")]
     rt_handle.spawn(serve_single_instance_dbus(ui_event_tx.clone()));
 
-    // Spawn System Tray (StatusNotifierItem via ksni).
+    // Spawn System Tray (StatusNotifierItem via ksni on Linux).
+    #[cfg(target_os = "linux")]
     let tray_handle_holder: Arc<tokio::sync::Mutex<Option<ksni::Handle<RustPodsTray>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
+    #[cfg(target_os = "linux")]
     {
         let tray_dev_state = device_state.clone();
         let tx_tray_open = ui_event_tx.clone();
@@ -291,7 +299,9 @@ fn bootstrap_gui(
         let state_ev = app_state.clone();
         let win_ev = active_window.clone();
         let popup_ev = popup_window.clone();
+        #[cfg(target_os = "linux")]
         let tray_ev = tray_handle_holder.clone();
+        #[cfg(target_os = "linux")]
         let rt_ev = rt_handle.clone();
         cx.spawn(async move |cx| {
             let gesture_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -305,13 +315,16 @@ fn bootstrap_gui(
                             s.device = new_dev;
                             cx.notify();
                         });
-                        let holder = tray_ev.clone();
-                        rt_ev.spawn(async move {
-                            let guard = holder.lock().await;
-                            if let Some(h) = guard.as_ref() {
-                                h.update(|_| {}).await;
-                            }
-                        });
+                        #[cfg(target_os = "linux")]
+                        {
+                            let holder = tray_ev.clone();
+                            rt_ev.spawn(async move {
+                                let guard = holder.lock().await;
+                                if let Some(h) = guard.as_ref() {
+                                    h.update(|_| {}).await;
+                                }
+                            });
+                        }
                     }
                     UiEvent::ConnectAttemptFinished => {
                         state_ev.update(cx, |s, cx| {
@@ -352,13 +365,16 @@ fn bootstrap_gui(
                             }
                             cx.notify();
                         });
-                        let holder = tray_ev.clone();
-                        rt_ev.spawn(async move {
-                            let guard = holder.lock().await;
-                            if let Some(h) = guard.as_ref() {
-                                h.update(|_| {}).await;
-                            }
-                        });
+                        #[cfg(target_os = "linux")]
+                        {
+                            let holder = tray_ev.clone();
+                            rt_ev.spawn(async move {
+                                let guard = holder.lock().await;
+                                if let Some(h) = guard.as_ref() {
+                                    h.update(|_| {}).await;
+                                }
+                            });
+                        }
                     }
                     UiEvent::HeadGesture(gesture) => {
                         info!("Head gesture: {:?}", gesture);
@@ -647,6 +663,7 @@ pub async fn start_bluetooth_daemon(
         }
     };
 
+    #[cfg(target_os = "linux")]
     if let Ok(ad) = bt_manager.get_default_adapter().await
         && let Ok(addr) = ad.address().await {
             info!("Local Bluetooth Adapter MAC: {}", addr);

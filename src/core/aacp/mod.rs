@@ -5,20 +5,25 @@ pub mod remotehid;
 pub mod rtbuddy;
 pub mod session;
 
+#[cfg(target_os = "linux")]
 use bluer::l2cap::{SeqPacket, Socket, SocketAddr};
-use bluer::{Address, AddressType};
+#[cfg(target_os = "linux")]
+use bluer::AddressType;
 use commands::{ControlCommandId, MicrophoneMode, NoiseControlMode};
 use events::AacpEvent;
 use packets::*;
 use crate::core::aacp::events::EarStatus;
 use crate::core::head_tracking::{HeadGesture, HeadPose, HeadTracker};
+use crate::core::models::MacAddress;
 use crate::core::spatial::{SpatialClaim, SpatialMode, SpatialSession};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+#[cfg(target_os = "linux")]
+use tracing::error;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// A dead L2CAP link does not necessarily close the socket, so the receive
@@ -32,7 +37,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(150);
 #[derive(Debug, Clone)]
 pub struct AacpState {
     pub is_connected: bool,
-    pub airpods_address: Option<Address>,
+    pub airpods_address: Option<MacAddress>,
     pub local_address: Option<String>,
 }
 
@@ -83,7 +88,10 @@ pub struct AacpManager {
     /// replacing this slot retires a superseded receive loop at its next
     /// iteration instead of leaving it parked on a dead link until the
     /// watchdog expires.
+    #[cfg(target_os = "linux")]
     active_socket: Arc<Mutex<Option<Arc<SeqPacket>>>>,
+    #[cfg(not(target_os = "linux"))]
+    active_socket: Arc<Mutex<Option<Arc<()>>>>,
     /// Monotonic connection counter. The receive task captures its own epoch
     /// at spawn and skips the shared-state cleanup if a newer session has
     /// taken over.
@@ -96,18 +104,24 @@ pub struct AacpManager {
 
 
 /// `SOL_BLUETOOTH` / `BT_SECURITY` socket options, from the kernel headers.
+#[cfg(target_os = "linux")]
 const SOL_BLUETOOTH: libc::c_int = 274;
+#[cfg(target_os = "linux")]
 const BT_SECURITY: libc::c_int = 4;
 /// `BT_SECURITY_MEDIUM`: request an encrypted (or higher) link.
+#[cfg(target_os = "linux")]
 const BT_SECURITY_MEDIUM: libc::c_int = 2;
 
 /// `BT_POWER` / `force_active` socket option, from the kernel's `bluetooth.h`.
+#[cfg(target_os = "linux")]
 const BT_POWER: libc::c_int = 9;
+#[cfg(target_os = "linux")]
 const BT_POWER_FORCE_ACTIVE_ON: u8 = 1;
 
 /// Requests the kernel to keep the Bluetooth ACL link in Active Mode, preventing
 /// the controller from placing it into power-saving Sniff Mode which throttles
 /// the L2CAP polling rate down to ~30 Hz.
+#[cfg(target_os = "linux")]
 fn request_force_active(fd_owner: &impl std::os::unix::io::AsRawFd) {
     let active: u8 = BT_POWER_FORCE_ACTIVE_ON;
     let rc = unsafe {
@@ -137,7 +151,9 @@ fn request_force_active(fd_owner: &impl std::os::unix::io::AsRawFd) {
 /// These are **not** `SOL_BLUETOOTH`: the MTU lives in the L2CAP-level option
 /// block, and setting it through the wrong level silently fails with
 /// `ENOPROTOOPT`, which is why an earlier attempt at this appeared not to work.
+#[cfg(target_os = "linux")]
 const SOL_L2CAP: libc::c_int = 6;
+#[cfg(target_os = "linux")]
 const L2CAP_OPTIONS: libc::c_int = 1;
 
 /// Receive MTU the accessory needs before it will announce the motion sensor.
@@ -147,10 +163,12 @@ const L2CAP_OPTIONS: libc::c_int = 1;
 /// three services instead of eight. At 2582 all eight appear. Established by
 /// `starman-tech/mousepods` (`captures/airpods3_announces_mtu*.hex`) and
 /// reproduced here.
+#[cfg(target_os = "linux")]
 const AACP_RECEIVE_MTU: u16 = 2582;
 
 /// `struct l2cap_options` as the kernel lays it out: omtu, imtu, flush_to, mode,
 /// then a few single-byte fields. Only omtu/imtu are read here.
+#[cfg(target_os = "linux")]
 const L2CAP_OPTIONS_LEN: usize = 12;
 
 /// Raises the L2CAP receive MTU so the accessory will announce every sensor.
@@ -159,6 +177,7 @@ const L2CAP_OPTIONS_LEN: usize = 12;
 /// configuration, so setting it afterwards has no effect on the negotiation.
 /// The existing option block is read first and only the imtu field rewritten,
 /// because the other fields carry the kernel's current settings.
+#[cfg(target_os = "linux")]
 fn raise_receive_mtu<Type>(socket: &Socket<Type>) {
     use std::os::unix::io::AsRawFd;
 
@@ -207,6 +226,7 @@ fn raise_receive_mtu<Type>(socket: &Socket<Type>) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn raise_link_security<Type>(socket: &Socket<Type>) {
     use std::os::unix::io::AsRawFd;
 
@@ -340,17 +360,19 @@ impl AacpManager {
     /// Used by the head-tracking diagnostic to reproduce the LibrePods
     /// sequence exactly: that implementation sends `INIT` then `START` as the
     /// first bytes on a fresh socket, with no handshake in between.
-    pub async fn connect_without_handshake(&self, addr: Address) -> Result<(), String> {
+    pub async fn connect_without_handshake(&self, addr: MacAddress) -> Result<(), String> {
         self.open(addr, false).await
     }
 
-    pub async fn connect(&self, addr: Address) -> Result<(), String> {
+    pub async fn connect(&self, addr: MacAddress) -> Result<(), String> {
         self.open(addr, true).await
     }
 
-    async fn open(&self, addr: Address, handshake: bool) -> Result<(), String> {
-        info!("Connecting AACP L2CAP socket to {} on PSM 0x{:04X}...", addr, PSM_AACP);
-        let target_sa = SocketAddr::new(addr, AddressType::BrEdr, PSM_AACP);
+    #[cfg(target_os = "linux")]
+    async fn open(&self, addr: MacAddress, handshake: bool) -> Result<(), String> {
+        let bluer_addr: bluer::Address = addr.into();
+        info!("Connecting AACP L2CAP socket to {} on PSM 0x{:04X}...", bluer_addr, PSM_AACP);
+        let target_sa = SocketAddr::new(bluer_addr, AddressType::BrEdr, PSM_AACP);
 
         let socket = Socket::new_seq_packet()
             .map_err(|e| format!("Failed to create L2CAP seq_packet socket: {}", e))?;
@@ -853,6 +875,11 @@ impl AacpManager {
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
+    async fn open(&self, _addr: MacAddress, _handshake: bool) -> Result<(), String> {
+        Err("AACP L2CAP transport on Windows requires enhanced driver (Stage 3)".to_string())
+    }
+
     async fn init_handshake(&self) -> Result<(), String> {
         // AACP 1.3 handshake runs on both service 0 and service 4. Connecting
         // only service 4 (the legacy single handshake) leaves the sensor
@@ -1219,7 +1246,7 @@ async fn drive_remote_hid(
     sender: mpsc::Sender<Vec<u8>>,
     mut frames: broadcast::Receiver<Vec<u8>>,
     _tracker: Arc<Mutex<HeadTracker>>,
-    address: Option<Address>,
+    _address: Option<MacAddress>,
     status: Arc<Mutex<String>>,
     remotes: Arc<Mutex<remotehid::DeviceRegistry>>,
     generation: Arc<Mutex<remotehid::Generation>>,
@@ -1309,7 +1336,7 @@ async fn drive_remote_hid(
     // back, while macOS never does this - it keeps one link and waits. Leaving
     // the connection alone lets the next attempt succeed as soon as the wearer
     // puts the buds back in.
-    let _ = address;
+    let _ = _address;
     let message = format!(
         "no motion service after {} rounds. Put the buds in the case and take them \
          out again to re-arm the sensor announcement",

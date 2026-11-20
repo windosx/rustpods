@@ -1,16 +1,23 @@
 use crate::core::aacp::events::EarStatus;
 use crate::core::crypto::{decrypt_proximity_payload, verify_rpa, verify_rpa_be};
 use crate::core::device::AirPodsDeviceState;
+use crate::core::models::MacAddress;
 use crate::system::config::AppConfig;
 use crate::ui::UiEvent;
+#[cfg(target_os = "linux")]
 use bluer::monitor::{data_type, Monitor, MonitorEvent, Pattern, Type};
+#[cfg(target_os = "linux")]
 use bluer::{AdapterEvent, DiscoveryFilter, DiscoveryTransport, Session};
+#[cfg(target_os = "linux")]
 use futures::StreamExt;
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
 const POPUP_COOLDOWN: Duration = Duration::from_secs(5);
 const LID_SLEEP_RESET: Duration = Duration::from_secs(60);
@@ -119,6 +126,7 @@ pub async fn scan_gate(
     }
 }
 
+#[cfg(target_os = "linux")]
 pub async fn start_le_monitor(
     dev_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
@@ -181,11 +189,23 @@ pub async fn start_le_monitor(
     }
 }
 
+#[cfg(target_os = "windows")]
+pub async fn start_le_monitor(
+    _dev_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
+    _ui_tx: mpsc::UnboundedSender<UiEvent>,
+    _config: Arc<std::sync::RwLock<AppConfig>>,
+) -> Result<(), String> {
+    info!("Starting Windows BLE proximity monitor...");
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
 /// Runs kernel/hardware pattern-matched monitoring via BlueZ AdvertisementMonitor1.
 ///
 /// This registers an offloaded pattern monitor matching Apple Manufacturer Specific Data
 /// (0x004C) with the 0x07 Proximity Pairing sub-type. It avoids running full-band active
 /// discovery, eliminating conflicts with BLE keyboards/mice reconnecting.
+#[cfg(target_os = "linux")]
 async fn run_advertisement_monitor(
     adapter: &bluer::Adapter,
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
@@ -227,7 +247,7 @@ async fn run_advertisement_monitor(
                             {
                                 parse_proximity_message(
                                     apple_data,
-                                    addr,
+                                    addr.into(),
                                     dev_state,
                                     ui_tx,
                                     config,
@@ -252,7 +272,7 @@ async fn run_advertisement_monitor(
                                             {
                                                 parse_proximity_message(
                                                     apple_data,
-                                                    addr,
+                                                    addr.into(),
                                                     &dev_state_c,
                                                     &ui_tx_c,
                                                     &cfg_c,
@@ -298,6 +318,7 @@ async fn run_advertisement_monitor(
 }
 
 /// Fallback discovery stream used when AdvertisementMonitor1 is unsupported.
+#[cfg(target_os = "linux")]
 async fn run_discovery_stream(
     adapter: &bluer::Adapter,
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
@@ -341,7 +362,7 @@ async fn run_discovery_stream(
                         if let Some(apple_data) = mfg.get(&76) {
                             parse_proximity_message(
                                 apple_data,
-                                addr,
+                                addr.into(),
                                 dev_state,
                                 ui_tx,
                                 config,
@@ -380,7 +401,7 @@ fn load_hex_key(hex_opt: Option<&str>) -> Option<[u8; 16]> {
 
 async fn parse_proximity_message(
     data: &[u8],
-    device_addr: bluer::Address,
+    device_addr: MacAddress,
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     config: &Arc<std::sync::RwLock<AppConfig>>,

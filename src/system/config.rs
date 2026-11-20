@@ -249,9 +249,12 @@ impl Default for AppConfig {
 }
 
 pub fn get_config_dir() -> PathBuf {
-    // An empty-but-set XDG variable counts as unset (XDG spec); without this
-    // a stray empty value would produce a relative config directory and
-    // settings would silently stop persisting.
+    #[cfg(target_os = "windows")]
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("rustpods");
+
+    #[cfg(not(target_os = "windows"))]
     let dir = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -261,6 +264,7 @@ pub fn get_config_dir() -> PathBuf {
             PathBuf::from(home).join(".config")
         })
         .join("rustpods");
+
     let _ = fs::create_dir_all(&dir);
     dir
 }

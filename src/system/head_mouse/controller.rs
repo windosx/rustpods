@@ -1,5 +1,5 @@
 use super::engine::{MouseButton, MouseEngine};
-use super::uinput::{UinputMouseDevice, UinputStatus};
+use super::{UinputMouseDevice, UinputStatus};
 use crate::core::head_tracking::HeadPose;
 use crate::system::config::{AppConfig, HeadMouseMode};
 use std::sync::atomic::{AtomicU8, Ordering};

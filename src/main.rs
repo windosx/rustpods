@@ -139,10 +139,12 @@ struct Cli {
 /// accessory stop answering for both. The GUI-vs-GUI case is exempted by
 /// checking the GApplication bus name first: a second GUI launch must keep
 /// activating the running window, not fail.
+#[cfg(target_os = "linux")]
 struct InstanceLock {
     _file: std::fs::File,
 }
 
+#[cfg(target_os = "linux")]
 impl InstanceLock {
     fn acquire() -> Result<Self, String> {
         use std::os::unix::io::AsRawFd;
@@ -185,8 +187,46 @@ impl InstanceLock {
     }
 }
 
+#[cfg(target_os = "windows")]
+struct InstanceLock {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl InstanceLock {
+    fn acquire() -> Result<Self, String> {
+        use windows::core::w;
+        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+        use windows::Win32::System::Threading::CreateMutexW;
+
+        let handle = unsafe { CreateMutexW(None, true, w!("Local\\RustPodsSessionLock")) }
+            .map_err(|e| format!("Failed to create session mutex: {}", e))?;
+
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            return Err(
+                "Another RustPods engine (GUI or --no-gui daemon) is already running; only one can use the AACP session at a time".to_string()
+            );
+        }
+
+        Ok(Self { handle })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::ReleaseMutex;
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
 /// Whether a RustPods GUI already owns its application bus name on the
 /// session bus.
+#[cfg(target_os = "linux")]
 fn gui_already_running() -> bool {
     use zbus::blocking::Proxy;
 
@@ -209,7 +249,15 @@ fn gui_already_running() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "windows")]
+fn gui_already_running() -> bool {
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    unsafe { FindWindowW(None, w!("RustPods")).is_ok() }
+}
+
 /// Asks an already-running RustPods GUI instance to bring its window forward.
+#[cfg(target_os = "linux")]
 fn activate_running_gui() -> bool {
     use zbus::blocking::Proxy;
 
@@ -225,6 +273,21 @@ fn activate_running_gui() -> bool {
         return false;
     };
     proxy.call::<_, _, ()>("Activate", &()).is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn activate_running_gui() -> bool {
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("RustPods")) } {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        true
+    } else {
+        false
+    }
 }
 
 fn main() {
@@ -480,50 +543,53 @@ fn main() {
             // (the callback is a plain `Fn`).
             let quit_tx = std::sync::Mutex::new(Some(quit_tx_raw));
 
-            // Spawn tray in daemon mode
-            let tray_state = device_state.clone();
-            let aacp_noise = aacp_manager.clone();
-            let tray_dev_noise = device_state.clone();
-            let tray_tx_noise = ui_tx.clone();
-            let aacp_ear = aacp_manager.clone();
-            let tray_config = config.clone();
-            let tray_dev_ear = device_state.clone();
-            let tray_tx_ear = ui_tx.clone();
-            let tray = system::tray::RustPodsTray {
-                device_state: tray_state,
-                on_open_window: Arc::new(|| {}),
-                on_set_noise_mode: Arc::new(move |mode| {
-                    let aacp = aacp_noise.clone();
-                    let dev = tray_dev_noise.clone();
-                    let tx = tray_tx_noise.clone();
-                    tokio::spawn(async move {
-                        system::tray::apply_noise_mode(&aacp, &dev, &tx, mode).await;
-                    });
-                }),
-                on_toggle_ear_detection: Arc::new(move |enabled| {
-                    let aacp = aacp_ear.clone();
-                    // Persist like the GUI tray does: the daemon's auto-pause
-                    // gate reads the config, so a tray-only toggle used to
-                    // leave the pause behaviour untouched.
-                    let cfg = tray_config.clone();
-                    let dev = tray_dev_ear.clone();
-                    let tx = tray_tx_ear.clone();
-                    tokio::spawn(async move {
-                        system::tray::apply_ear_detection_toggle(&aacp, &cfg, &dev, &tx, enabled)
-                            .await;
-                    });
-                }),
-                on_quit: Arc::new(move || {
-                    // Take the sender out so repeat clicks are no-ops.
-                    if let Some(tx) = quit_tx.lock().ok().and_then(|mut slot| slot.take()) {
-                        let _ = tx.send(());
-                    }
-                }),
-            };
-            tokio::spawn(async move {
-                use ksni::TrayMethods;
-                let _ = tray.spawn().await;
-            });
+            // Spawn tray in daemon mode (Linux only for now)
+            #[cfg(target_os = "linux")]
+            {
+                let tray_state = device_state.clone();
+                let aacp_noise = aacp_manager.clone();
+                let tray_dev_noise = device_state.clone();
+                let tray_tx_noise = ui_tx.clone();
+                let aacp_ear = aacp_manager.clone();
+                let tray_config = config.clone();
+                let tray_dev_ear = device_state.clone();
+                let tray_tx_ear = ui_tx.clone();
+                let tray = system::tray::RustPodsTray {
+                    device_state: tray_state,
+                    on_open_window: Arc::new(|| {}),
+                    on_set_noise_mode: Arc::new(move |mode| {
+                        let aacp = aacp_noise.clone();
+                        let dev = tray_dev_noise.clone();
+                        let tx = tray_tx_noise.clone();
+                        tokio::spawn(async move {
+                            system::tray::apply_noise_mode(&aacp, &dev, &tx, mode).await;
+                        });
+                    }),
+                    on_toggle_ear_detection: Arc::new(move |enabled| {
+                        let aacp = aacp_ear.clone();
+                        // Persist like the GUI tray does: the daemon's auto-pause
+                        // gate reads the config, so a tray-only toggle used to
+                        // leave the pause behaviour untouched.
+                        let cfg = tray_config.clone();
+                        let dev = tray_dev_ear.clone();
+                        let tx = tray_tx_ear.clone();
+                        tokio::spawn(async move {
+                            system::tray::apply_ear_detection_toggle(&aacp, &cfg, &dev, &tx, enabled)
+                                .await;
+                        });
+                    }),
+                    on_quit: Arc::new(move || {
+                        // Take the sender out so repeat clicks are no-ops.
+                        if let Some(tx) = quit_tx.lock().ok().and_then(|mut slot| slot.take()) {
+                            let _ = tx.send(());
+                        }
+                    }),
+                };
+                tokio::spawn(async move {
+                    use ksni::TrayMethods;
+                    let _ = tray.spawn().await;
+                });
+            }
 
             // Consume UI events in background
             tokio::spawn(async move {
@@ -1158,7 +1224,7 @@ async fn run_head_tracking_sweep(target: &str) {
     tracing::info!("Sweep complete");
 }
 
-fn addr_of(target: &str) -> bluer::Address {
+fn addr_of(target: &str) -> core::models::MacAddress {
     target.parse().expect("address validated by prepare_connection")
 }
 
@@ -1166,7 +1232,7 @@ fn addr_of(target: &str) -> bluer::Address {
 async fn prepare_connection(target: &str) -> Option<Arc<core::aacp::AacpManager>> {
     use std::time::Duration;
 
-    let addr: bluer::Address = match target.parse() {
+    let addr: core::models::MacAddress = match target.parse() {
         Ok(addr) => addr,
         Err(e) => {
             tracing::error!("Invalid MAC address '{}': {}", target, e);

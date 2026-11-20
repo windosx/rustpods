@@ -26,6 +26,7 @@ use crate::core::head_tracking::HeadPose;
 use crate::system::agent_hooks::HookInstallStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(target_os = "linux")]
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -802,10 +803,13 @@ impl Default for AskHub {
 
 /// Where the hook process finds the running RustPods instance.
 ///
+pub const WINDOWS_PIPE_NAME: &str = r"\\.\pipe\rustpods-zcode-ask";
+
 /// Falls back to the temp directory when `XDG_RUNTIME_DIR` is unset or
 /// empty; the server side refuses to serve there (see `run_socket_server`),
 /// so the fallback only ever produces a connect-fail on the client, which
 /// fails open.
+#[cfg(target_os = "linux")]
 pub fn socket_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR")
         .ok()
@@ -815,7 +819,23 @@ pub fn socket_path() -> PathBuf {
     dir.join("rustpods").join("zcode-ask.sock")
 }
 
+#[cfg(target_os = "windows")]
+pub fn socket_path() -> PathBuf {
+    PathBuf::from(WINDOWS_PIPE_NAME)
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_to_daemon() -> Result<tokio::net::UnixStream, std::io::Error> {
+    tokio::net::UnixStream::connect(socket_path()).await
+}
+
+#[cfg(target_os = "windows")]
+async fn connect_to_daemon() -> Result<tokio::net::windows::named_pipe::NamedPipeClient, std::io::Error> {
+    tokio::net::windows::named_pipe::ClientOptions::new().open(WINDOWS_PIPE_NAME)
+}
+
 /// The per-user runtime directory, if this session has a proper one.
+#[cfg(target_os = "linux")]
 fn runtime_dir() -> Option<PathBuf> {
     std::env::var("XDG_RUNTIME_DIR")
         .ok()
@@ -828,6 +848,7 @@ fn runtime_dir() -> Option<PathBuf> {
 /// Failing to bind is not an error: another RustPods instance owns the socket
 /// and will answer instead. A stale socket left behind by a crash is removed
 /// and rebound once.
+#[cfg(target_os = "linux")]
 pub async fn run_socket_server() {
     // A predictable world-readable path under /tmp would let any local user
     // pre-bind it (this instance would then silently never serve) or post
@@ -888,9 +909,45 @@ pub async fn run_socket_server() {
     }
 }
 
+#[cfg(target_os = "windows")]
+pub async fn run_socket_server() {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    info!("Listening for ZCode questions on Windows named pipe {}", WINDOWS_PIPE_NAME);
+    let mut server = match ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(WINDOWS_PIPE_NAME)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Could not create named pipe {}: {}", WINDOWS_PIPE_NAME, e);
+            return;
+        }
+    };
+
+    loop {
+        if server.connect().await.is_ok() {
+            let connected_client = server;
+            server = match ServerOptions::new().create(WINDOWS_PIPE_NAME) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Could not create next named pipe instance: {}", e);
+                    break;
+                }
+            };
+            tokio::spawn(handle_hook_connection(connected_client));
+        } else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
 /// Handles one hook connection: read the request, register the question, wait
 /// for the gesture task, reply. Every early exit is a pass-through.
-async fn handle_hook_connection(mut stream: tokio::net::UnixStream) {
+async fn handle_hook_connection<S>(mut stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let reply = ask_from_stream(&mut stream).await.unwrap_or(AskReply::Pass);
     let mut line = serde_json::to_string(&reply).unwrap_or_else(|_| "{\"event\":\"pass\"}".into());
     line.push('\n');
@@ -902,7 +959,10 @@ async fn handle_hook_connection(mut stream: tokio::net::UnixStream) {
 
 /// Reads a question from the hook, shepherds it through the hub, and returns
 /// the decision. `None` means the payload was unusable.
-async fn ask_from_stream(stream: &mut tokio::net::UnixStream) -> Option<AskReply> {
+async fn ask_from_stream<S>(stream: &mut S) -> Option<AskReply>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // One line, capped and time-bounded. `take` guarantees a hostile writer
     // cannot balloon memory; a client that connects and never speaks cannot
     // park this task forever.
@@ -1245,7 +1305,7 @@ pub async fn run_hook_mode() -> i32 {
         is_codex
     );
 
-    let mut stream = match tokio::time::timeout(HOOK_CONNECT_TIMEOUT, tokio::net::UnixStream::connect(socket_path())).await {
+    let mut stream = match tokio::time::timeout(HOOK_CONNECT_TIMEOUT, connect_to_daemon()).await {
         Ok(Ok(stream)) => stream,
         _ => {
             debug!("ask-hook: RustPods socket not reachable; passing through");
@@ -1598,7 +1658,7 @@ pub async fn run_simulate() -> i32 {
 pub async fn run_permission_simulate() -> i32 {
     let request = sample_permission_request("Agent");
 
-    let mut stream = match tokio::net::UnixStream::connect(socket_path()).await {
+    let mut stream = match connect_to_daemon().await {
         Ok(stream) => stream,
         Err(e) => {
             error!(

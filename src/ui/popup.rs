@@ -2,6 +2,7 @@ use crate::core::models::AirPodsModel;
 use crate::ui::state::RustPodsState;
 use crate::ui::theme::{palette, ApplePalette};
 use gpui_kit::component::Icon;
+#[cfg(target_os = "linux")]
 use gpui_kit::layer_shell::{
     Anchor as LayerAnchor, KeyboardInteractivity, Layer, LayerShellOptions,
 };
@@ -511,6 +512,7 @@ pub fn open_or_refresh_case_popup(
         ..Default::default()
     };
 
+    #[cfg(target_os = "linux")]
     let layer_opts = make_opts(WindowKind::LayerShell(LayerShellOptions {
         namespace: "rustpods-popup".to_string(),
         layer: Layer::Overlay,
@@ -521,11 +523,14 @@ pub fn open_or_refresh_case_popup(
         keyboard_interactivity: KeyboardInteractivity::None,
     }));
 
+    #[cfg(target_os = "linux")]
     let state_for_popup = app_state.clone();
+    #[cfg(target_os = "linux")]
     let result = cx.open_window(layer_opts, move |window, cx| {
         cx.new(|cx| CasePopupWindow::new(state_for_popup, window, cx))
     });
 
+    #[cfg(target_os = "linux")]
     let handle: Option<WindowHandle<CasePopupWindow>> = match result {
         Ok(h) => {
             info!("Opened iOS case popup via Wayland LayerShell");
@@ -542,6 +547,23 @@ pub fn open_or_refresh_case_popup(
                     warn!("Failed to open fallback PopUp window: {}", e2);
                     None
                 }
+            }
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let handle: Option<WindowHandle<CasePopupWindow>> = {
+        let state_popup = app_state.clone();
+        match cx.open_window(make_opts(WindowKind::PopUp), move |window, cx| {
+            cx.new(|cx| CasePopupWindow::new(state_popup, window, cx))
+        }) {
+            Ok(h) => {
+                info!("Opened iOS case popup via PopUp window");
+                Some(h)
+            }
+            Err(e) => {
+                warn!("Failed to open PopUp window: {}", e);
+                None
             }
         }
     };
