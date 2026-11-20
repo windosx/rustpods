@@ -6,6 +6,13 @@ use crate::ui::UiEvent;
 use ksni::menu::*;
 #[cfg(target_os = "linux")]
 use ksni::{Icon, ToolTip, Tray};
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Default)]
+pub struct Icon {
+    pub width: i32,
+    pub height: i32,
+    pub data: Vec<u8>,
+}
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -382,7 +389,6 @@ impl Tray for RustPodsTray {
     }
 }
 
-#[cfg(target_os = "linux")]
 pub fn generate_circular_battery_icon(
     size: usize,
     level: Option<u8>,
@@ -487,4 +493,351 @@ fn is_in_lightning_glyph(x: usize, y: usize, size: usize) -> bool {
         let expected_x = 37.0 - (norm_y - 31.0) * 0.7;
         (norm_x - expected_x).abs() <= 2.2
     }
+}
+
+#[cfg(target_os = "windows")]
+pub unsafe fn create_hicon_from_icon(
+    icon: &Icon,
+) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+
+    let width = icon.width;
+    let height = icon.height;
+    if width <= 0 || height <= 0 || icon.data.len() != (width * height * 4) as usize {
+        return None;
+    }
+
+    // Convert ARGB to BGRA
+    let mut bgra = Vec::with_capacity(icon.data.len());
+    for chunk in icon.data.chunks_exact(4) {
+        let a = chunk[0];
+        let r = chunk[1];
+        let g = chunk[2];
+        let b = chunk[3];
+        bgra.push(b);
+        bgra.push(g);
+        bgra.push(r);
+        bgra.push(a);
+    }
+
+    unsafe {
+        let hbm_color = CreateBitmap(width, height, 1, 32, Some(bgra.as_ptr() as *const _));
+        let mask_bytes = vec![0u8; ((width + 15) / 16 * 2 * height) as usize];
+        let hbm_mask = CreateBitmap(width, height, 1, 1, Some(mask_bytes.as_ptr() as *const _));
+
+        let mut icon_info = ICONINFO {
+            fIcon: true.into(),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: hbm_mask,
+            hbmColor: hbm_color,
+        };
+
+        let hicon = CreateIconIndirect(&mut icon_info).ok();
+        let _ = DeleteObject(hbm_color);
+        let _ = DeleteObject(hbm_mask);
+        hicon
+    }
+}
+
+#[cfg(target_os = "windows")]
+const WM_TRAY_CALLBACK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 100;
+#[cfg(target_os = "windows")]
+const TRAY_ICON_ID: u32 = 1;
+#[cfg(target_os = "windows")]
+const TIMER_ID: usize = 1;
+
+#[cfg(target_os = "windows")]
+const ID_OPEN_WINDOW: u32 = 2001;
+#[cfg(target_os = "windows")]
+const ID_NOISE_OFF: u32 = 2002;
+#[cfg(target_os = "windows")]
+const ID_NOISE_TRANSPARENCY: u32 = 2003;
+#[cfg(target_os = "windows")]
+const ID_NOISE_ADAPTIVE: u32 = 2004;
+#[cfg(target_os = "windows")]
+const ID_NOISE_ANC: u32 = 2005;
+#[cfg(target_os = "windows")]
+const ID_EAR_DETECTION: u32 = 2006;
+#[cfg(target_os = "windows")]
+const ID_QUIT: u32 = 2007;
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn tray_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    unsafe {
+        let tray_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RustPodsTray;
+        if tray_ptr.is_null() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        let tray = &*tray_ptr;
+
+        match msg {
+            WM_TRAY_CALLBACK => {
+                let event = lparam.0 as u32;
+                if event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK {
+                    (tray.on_open_window)();
+                } else if event == WM_RBUTTONUP {
+                    show_tray_menu(hwnd, tray);
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                let cmd_id = (wparam.0 & 0xffff) as u32;
+                handle_tray_command(cmd_id, tray);
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                update_tray_icon_and_tip(hwnd, tray);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND, tray: &RustPodsTray) {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::{LPARAM, POINT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    unsafe {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(hwnd);
+
+        let hmenu = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        let state = tray.device_state.try_read().ok().and_then(|g| g.clone());
+        let is_connected = state.as_ref().map(|s| s.is_connected).unwrap_or(false);
+        let has_anc = state.as_ref().map(|s| s.capabilities.has_anc).unwrap_or(false);
+        let current_noise = state.as_ref().map(|s| s.noise_mode).unwrap_or(NoiseControlMode::Off);
+        let ear_detect_enabled = state.as_ref().map(|s| s.ear_detection_enabled).unwrap_or(true);
+
+        let _ = AppendMenuW(hmenu, MF_STRING, ID_OPEN_WINDOW as usize, w!("打开 RustPods"));
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        if is_connected && has_anc {
+            if let Ok(noise_menu) = CreatePopupMenu() {
+                let check_off = if current_noise == NoiseControlMode::Off { MF_CHECKED } else { MF_UNCHECKED };
+                let check_trans = if current_noise == NoiseControlMode::Transparency { MF_CHECKED } else { MF_UNCHECKED };
+                let check_adapt = if current_noise == NoiseControlMode::Adaptive { MF_CHECKED } else { MF_UNCHECKED };
+                let check_anc = if current_noise == NoiseControlMode::NoiseCancellation { MF_CHECKED } else { MF_UNCHECKED };
+
+                let _ = AppendMenuW(noise_menu, MF_STRING | check_off, ID_NOISE_OFF as usize, w!("关闭"));
+                let _ = AppendMenuW(noise_menu, MF_STRING | check_trans, ID_NOISE_TRANSPARENCY as usize, w!("通透模式"));
+                let _ = AppendMenuW(noise_menu, MF_STRING | check_adapt, ID_NOISE_ADAPTIVE as usize, w!("自适应音频"));
+                let _ = AppendMenuW(noise_menu, MF_STRING | check_anc, ID_NOISE_ANC as usize, w!("降噪"));
+
+                let _ = AppendMenuW(hmenu, MF_POPUP, noise_menu.0 as usize, w!("噪声控制"));
+            }
+        }
+
+        if is_connected {
+            let ear_flags = if ear_detect_enabled { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(hmenu, MF_STRING | ear_flags, ID_EAR_DETECTION as usize, w!("自动入耳检测"));
+            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+        }
+
+        let _ = AppendMenuW(hmenu, MF_STRING, ID_QUIT as usize, w!("退出"));
+
+        let _ = TrackPopupMenu(hmenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, None);
+        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(hmenu);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn handle_tray_command(cmd_id: u32, tray: &RustPodsTray) {
+    match cmd_id {
+        ID_OPEN_WINDOW => (tray.on_open_window)(),
+        ID_NOISE_OFF => (tray.on_set_noise_mode)(NoiseControlMode::Off),
+        ID_NOISE_TRANSPARENCY => (tray.on_set_noise_mode)(NoiseControlMode::Transparency),
+        ID_NOISE_ADAPTIVE => (tray.on_set_noise_mode)(NoiseControlMode::Adaptive),
+        ID_NOISE_ANC => (tray.on_set_noise_mode)(NoiseControlMode::NoiseCancellation),
+        ID_EAR_DETECTION => {
+            let current = tray
+                .device_state
+                .try_read()
+                .ok()
+                .and_then(|g| g.clone())
+                .map(|s| s.ear_detection_enabled)
+                .unwrap_or(true);
+            (tray.on_toggle_ear_detection)(!current);
+        }
+        ID_QUIT => (tray.on_quit)(),
+        _ => {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn update_tray_icon_and_tip(hwnd: windows::Win32::Foundation::HWND, tray: &RustPodsTray) {
+    use windows::Win32::UI::Shell::{
+        Shell_NotifyIconW, NIF_ICON, NIF_TIP, NIM_MODIFY, NOTIFYICONDATAW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetPropW, SetPropW, HICON};
+
+    let state_opt = tray.device_state.try_read().ok().and_then(|g| g.clone());
+
+    let (level, charging, connected, tip_text) = if let Some(ref state) = state_opt {
+        let min_bud = match (state.battery_left, state.battery_right) {
+            (Some(l), Some(r)) => Some(l.min(r)),
+            (Some(l), None) => Some(l),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
+        };
+        let charging = state.battery_left_charging || state.battery_right_charging;
+        let mut tip = format!("{}: ", state.name);
+        if state.is_connected {
+            tip.push_str("已连接");
+            if let Some(l) = state.battery_left {
+                tip.push_str(&format!(" | 左: {}%", l));
+            }
+            if let Some(r) = state.battery_right {
+                tip.push_str(&format!(" | 右: {}%", r));
+            }
+            if let Some(c) = state.battery_case {
+                tip.push_str(&format!(" | 盒: {}%", c));
+            }
+        } else {
+            tip.push_str("未连接");
+        }
+        (min_bud, charging, state.is_connected, tip)
+    } else {
+        (None, false, false, "RustPods (未连接)".to_string())
+    };
+
+    let icon_data = generate_circular_battery_icon(32, level, charging, connected);
+    unsafe {
+        if let Some(new_hicon) = create_hicon_from_icon(&icon_data) {
+            let mut nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: TRAY_ICON_ID,
+                uFlags: NIF_ICON | NIF_TIP,
+                hIcon: new_hicon,
+                ..Default::default()
+            };
+
+            let wide: Vec<u16> = tip_text.encode_utf16().chain(std::iter::once(0)).collect();
+            let copy_len = wide.len().min(nid.szTip.len());
+            nid.szTip[..copy_len].copy_from_slice(&wide[..copy_len]);
+
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+
+            let old_handle = GetPropW(hwnd, windows::core::w!("RustPodsHicon"));
+            let _ = SetPropW(
+                hwnd,
+                windows::core::w!("RustPodsHicon"),
+                windows::Win32::Foundation::HANDLE(new_hicon.0),
+            );
+            if !old_handle.is_invalid() && !old_handle.0.is_null() {
+                let _ = DestroyIcon(HICON(old_handle.0));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn spawn_windows_tray(tray: Arc<RustPodsTray>) {
+    std::thread::Builder::new()
+        .name("windows-tray".to_string())
+        .spawn(move || unsafe {
+            use windows::core::w;
+            use windows::Win32::Foundation::HINSTANCE;
+            use windows::Win32::UI::Shell::{
+                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+                NOTIFYICONDATAW,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::*;
+
+            let class_name = w!("RustPodsTrayClass");
+            let hinstance = HINSTANCE::default();
+
+            let wnd_class = WNDCLASSW {
+                lpfnWndProc: Some(tray_wndproc),
+                hInstance: hinstance,
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wnd_class);
+
+            let hwnd = match CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                class_name,
+                w!("RustPodsTrayWindow"),
+                WS_OVERLAPPEDWINDOW,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                None,
+                None,
+                hinstance,
+                None,
+            ) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+
+            let tray_raw = Arc::into_raw(tray);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, tray_raw as isize);
+
+            let initial_icon = generate_circular_battery_icon(32, None, false, false);
+            let initial_hicon = create_hicon_from_icon(&initial_icon);
+            if let Some(hicon) = initial_hicon {
+                let _ = SetPropW(
+                    hwnd,
+                    w!("RustPodsHicon"),
+                    windows::Win32::Foundation::HANDLE(hicon.0),
+                );
+            }
+
+            let mut nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: TRAY_ICON_ID,
+                uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+                uCallbackMessage: WM_TRAY_CALLBACK,
+                hIcon: initial_hicon.unwrap_or_default(),
+                ..Default::default()
+            };
+            let tip = "RustPods\0".encode_utf16().collect::<Vec<u16>>();
+            nid.szTip[..tip.len()].copy_from_slice(&tip);
+
+            let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+
+            let _ = SetTimer(hwnd, TIMER_ID, 1000, None);
+
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+
+            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+            if let Ok(cleanup_handle) = RemovePropW(hwnd, w!("RustPodsHicon")) {
+                if !cleanup_handle.is_invalid() && !cleanup_handle.0.is_null() {
+                    let _ = DestroyIcon(HICON(cleanup_handle.0));
+                }
+            }
+            let _ = Arc::from_raw(tray_raw);
+        })
+        .expect("Failed to spawn windows-tray thread");
 }

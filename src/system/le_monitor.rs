@@ -191,12 +191,95 @@ pub async fn start_le_monitor(
 
 #[cfg(target_os = "windows")]
 pub async fn start_le_monitor(
-    _dev_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
-    _ui_tx: mpsc::UnboundedSender<UiEvent>,
-    _config: Arc<std::sync::RwLock<AppConfig>>,
+    dev_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    config: Arc<std::sync::RwLock<AppConfig>>,
 ) -> Result<(), String> {
-    info!("Starting Windows BLE proximity monitor...");
-    std::future::pending::<()>().await;
+    use windows::Devices::Bluetooth::Advertisement::{
+        BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementWatcher,
+        BluetoothLEScanningMode,
+    };
+    use windows::Foundation::TypedEventHandler;
+    use windows::Storage::Streams::DataReader;
+
+    info!("Starting Windows WinRT BLE proximity monitor...");
+
+    let (watcher, mut adv_rx) = {
+        let watcher = BluetoothLEAdvertisementWatcher::new()
+            .map_err(|e| format!("Failed to create BluetoothLEAdvertisementWatcher: {}", e))?;
+
+        watcher
+            .SetScanningMode(BluetoothLEScanningMode::Active)
+            .map_err(|e| format!("Failed to set active scanning mode: {}", e))?;
+
+        let (adv_tx, adv_rx) = mpsc::unbounded_channel::<(Vec<u8>, MacAddress)>();
+
+        let handler = TypedEventHandler::new(
+            move |_sender: &Option<BluetoothLEAdvertisementWatcher>,
+                  args: &Option<BluetoothLEAdvertisementReceivedEventArgs>| {
+                if let Some(args) = args {
+                    let raw_addr = match args.BluetoothAddress() {
+                        Ok(addr) => addr,
+                        Err(_) => return Ok(()),
+                    };
+                    let b = raw_addr.to_be_bytes();
+                    let mac = MacAddress([b[2], b[3], b[4], b[5], b[6], b[7]]);
+
+                    if let Ok(adv) = args.Advertisement() {
+                        if let Ok(mfg_list) = adv.ManufacturerData() {
+                            for section in mfg_list {
+                                if let Ok(company_id) = section.CompanyId() {
+                                    if company_id == 0x004c {
+                                        if let Ok(data_buf) = section.Data() {
+                                            if let Ok(reader) = DataReader::FromBuffer(&data_buf) {
+                                                if let Ok(len) = reader.UnconsumedBufferLength() {
+                                                    let mut buf = vec![0u8; len as usize];
+                                                    if reader.ReadBytes(&mut buf).is_ok() {
+                                                        let _ = adv_tx.send((buf, mac));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        let _token = watcher
+            .Received(&handler)
+            .map_err(|e| format!("Failed to register Received event handler: {}", e))?;
+
+        watcher
+            .Start()
+            .map_err(|e| format!("Failed to start BluetoothLEAdvertisementWatcher: {}", e))?;
+
+        (watcher, adv_rx)
+    };
+
+    info!("WinRT BLE Advertisement Watcher active");
+
+    let lid_tracker = Arc::new(Mutex::new(LidTracker::default()));
+
+    while let Some((payload, mac)) = adv_rx.recv().await {
+        if scan_gate(&dev_state, &config).await == ScanGate::Active {
+            parse_proximity_message(
+                &payload,
+                mac,
+                &dev_state,
+                &ui_tx,
+                &config,
+                &lid_tracker,
+            )
+            .await;
+        }
+    }
+
+    let _ = watcher.Stop();
     Ok(())
 }
 

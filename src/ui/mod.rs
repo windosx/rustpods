@@ -5,7 +5,6 @@ pub mod state;
 pub mod theme;
 pub mod window;
 
-#[cfg(target_os = "linux")]
 use crate::core::aacp::commands::NoiseControlMode;
 use crate::core::aacp::events::AacpEvent;
 use crate::core::aacp::AacpManager;
@@ -13,7 +12,6 @@ use crate::core::device::AirPodsDeviceState;
 use crate::system::bluetooth::BluetoothManager;
 use crate::system::config::{load_config, save_config, AppConfig, PauseBehavior, StemAction};
 use crate::system::mpris::MprisController;
-#[cfg(target_os = "linux")]
 use crate::system::tray::RustPodsTray;
 use gpui_kit::assets::{icon_assets, Assets as DefaultKitAssets};
 use gpui_kit::component::ThemeMode;
@@ -274,6 +272,59 @@ fn bootstrap_gui(
                 Err(e) => warn!("Failed to spawn system tray: {}", e),
             }
         });
+    }
+
+    // Spawn System Tray (Win32 Shell_NotifyIconW on Windows).
+    #[cfg(target_os = "windows")]
+    {
+        let tray_dev_state = device_state.clone();
+        let tx_tray_open = ui_event_tx.clone();
+        let on_open_win = Arc::new(move || {
+            let _ = tx_tray_open.send(UiEvent::OpenWindow);
+        });
+        let aacp_tray_noise = aacp_manager.clone();
+        let dev_tray_noise = device_state.clone();
+        let tx_tray_noise = ui_event_tx.clone();
+        let rt_noise = rt_handle.clone();
+        let on_tray_noise = Arc::new(move |mode: NoiseControlMode| {
+            let aacp = aacp_tray_noise.clone();
+            let dev = dev_tray_noise.clone();
+            let tx = tx_tray_noise.clone();
+            rt_noise.spawn(async move {
+                crate::system::tray::apply_noise_mode(&aacp, &dev, &tx, mode).await;
+            });
+        });
+
+        let aacp_tray_ear = aacp_manager.clone();
+        let cfg_tray_ear = config.clone();
+        let dev_tray_ear = device_state.clone();
+        let tx_tray_ear = ui_event_tx.clone();
+        let rt_ear = rt_handle.clone();
+        let on_tray_ear = Arc::new(move |enabled: bool| {
+            let aacp = aacp_tray_ear.clone();
+            let cfg = cfg_tray_ear.clone();
+            let dev = dev_tray_ear.clone();
+            let tx = tx_tray_ear.clone();
+            rt_ear.spawn(async move {
+                crate::system::tray::apply_ear_detection_toggle(&aacp, &cfg, &dev, &tx, enabled)
+                    .await;
+            });
+        });
+
+        let tx_tray_quit = ui_event_tx.clone();
+        let on_tray_quit = Arc::new(move || {
+            let _ = tx_tray_quit.send(UiEvent::Quit);
+        });
+
+        let tray = Arc::new(RustPodsTray {
+            device_state: tray_dev_state,
+            on_open_window: on_open_win,
+            on_set_noise_mode: on_tray_noise,
+            on_toggle_ear_detection: on_tray_ear,
+            on_quit: on_tray_quit,
+        });
+
+        crate::system::tray::spawn_windows_tray(tray);
     }
 
     // Spawn Tokio background engines.

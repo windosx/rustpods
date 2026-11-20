@@ -543,8 +543,7 @@ fn main() {
             // (the callback is a plain `Fn`).
             let quit_tx = std::sync::Mutex::new(Some(quit_tx_raw));
 
-            // Spawn tray in daemon mode (Linux only for now)
-            #[cfg(target_os = "linux")]
+            // Spawn tray in daemon mode
             {
                 let tray_state = device_state.clone();
                 let aacp_noise = aacp_manager.clone();
@@ -585,10 +584,13 @@ fn main() {
                         }
                     }),
                 };
+                #[cfg(target_os = "linux")]
                 tokio::spawn(async move {
                     use ksni::TrayMethods;
                     let _ = tray.spawn().await;
                 });
+                #[cfg(target_os = "windows")]
+                system::tray::spawn_windows_tray(Arc::new(tray));
             }
 
             // Consume UI events in background

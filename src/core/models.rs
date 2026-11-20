@@ -51,6 +51,29 @@ impl AirPodsModel {
         }
     }
 
+    pub fn infer_from_name(name: &str) -> Option<Self> {
+        let lower = name.to_lowercase();
+        if lower.contains("max") {
+            Some(Self::AirPodsMax)
+        } else if lower.contains("pro 2") || lower.contains("pro (2") {
+            Some(Self::AirPodsPro2UsbC)
+        } else if lower.contains("pro") {
+            Some(Self::AirPodsPro1)
+        } else if lower.contains("airpods 4") || lower.contains("airpods (4") {
+            Some(Self::AirPods4Anc)
+        } else if lower.contains("airpods 3") || lower.contains("airpods (3") {
+            Some(Self::AirPods3)
+        } else if lower.contains("airpods 2") || lower.contains("airpods (2") {
+            Some(Self::AirPods2)
+        } else if lower.contains("airpods 1") || lower.contains("airpods (1") {
+            Some(Self::AirPods1)
+        } else if lower.contains("airpods") {
+            Some(Self::AirPods3)
+        } else {
+            None
+        }
+    }
+
     pub fn capabilities(&self) -> ModelCapabilities {
         match self {
             Self::AirPods1 => ModelCapabilities {
@@ -190,6 +213,16 @@ mod tests {
         assert!(caps.has_conversational_awareness);
         assert!(caps.has_case_speaker);
         assert!(caps.has_volume_swipe);
+    }
+
+    #[test]
+    fn test_infer_from_name() {
+        assert_eq!(AirPodsModel::infer_from_name("Alice's AirPods Pro"), Some(AirPodsModel::AirPodsPro1));
+        assert_eq!(AirPodsModel::infer_from_name("Bob's AirPods Pro 2"), Some(AirPodsModel::AirPodsPro2UsbC));
+        assert_eq!(AirPodsModel::infer_from_name("AirPods Max - Silver"), Some(AirPodsModel::AirPodsMax));
+        assert_eq!(AirPodsModel::infer_from_name("AirPods 3"), Some(AirPodsModel::AirPods3));
+        assert_eq!(AirPodsModel::infer_from_name("AirPods 4 (ANC)"), Some(AirPodsModel::AirPods4Anc));
+        assert_eq!(AirPodsModel::infer_from_name("Sony WH-1000XM4"), None);
     }
 
     #[test]

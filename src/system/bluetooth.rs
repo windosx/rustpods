@@ -199,11 +199,66 @@ impl BluetoothManager {
     }
 
     pub async fn find_connected_airpods(&self) -> Result<Vec<DiscoveredAirPods>, String> {
-        Ok(Vec::new())
+        let paired = self.find_paired_airpods().await?;
+        Ok(paired.into_iter().filter(|d| d.is_connected).collect())
     }
 
     pub async fn find_paired_airpods(&self) -> Result<Vec<DiscoveredAirPods>, String> {
-        Ok(Vec::new())
+        tokio::task::spawn_blocking(|| {
+            use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice};
+            use windows::Devices::Enumeration::DeviceInformation;
+
+            let selector = BluetoothDevice::GetDeviceSelectorFromPairingState(true)
+                .map_err(|e| format!("Failed to get device selector: {}", e))?;
+
+            let devices = DeviceInformation::FindAllAsyncAqsFilter(&selector)
+                .map_err(|e| format!("Failed to query paired Bluetooth devices: {}", e))?
+                .get()
+                .map_err(|e| format!("Failed to get device query results: {}", e))?;
+
+            let mut list = Vec::new();
+            for dev_info in devices {
+                let id = match dev_info.Id() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let bt_device = match BluetoothDevice::FromIdAsync(&id) {
+                    Ok(op) => match op.get() {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+
+                let name = bt_device
+                    .Name()
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|_| "Bluetooth Device".to_string());
+
+                if let Some(model) = AirPodsModel::infer_from_name(&name) {
+                    let raw_addr = match bt_device.BluetoothAddress() {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    let b = raw_addr.to_be_bytes();
+                    let address = MacAddress([b[2], b[3], b[4], b[5], b[6], b[7]]);
+                    let is_connected = bt_device
+                        .ConnectionStatus()
+                        .map(|s| s == BluetoothConnectionStatus::Connected)
+                        .unwrap_or(false);
+
+                    list.push(DiscoveredAirPods {
+                        address,
+                        name,
+                        model,
+                        is_connected,
+                    });
+                }
+            }
+            Ok(list)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
     }
 
     pub async fn ensure_connected(&self, _addr: MacAddress) -> Result<(), String> {
@@ -212,12 +267,56 @@ impl BluetoothManager {
 
     pub async fn watch_connection_events<F>(
         &self,
-        _target_addr: MacAddress,
-        mut _callback: F,
+        target_addr: MacAddress,
+        mut callback: F,
     ) -> Result<(), String>
     where
         F: FnMut(bool) + Send + 'static,
     {
+        tokio::task::spawn_blocking(move || {
+            use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice};
+            let b = target_addr.0;
+            let raw_addr = u64::from_be_bytes([0, 0, b[0], b[1], b[2], b[3], b[4], b[5]]);
+
+            let bt_device = match BluetoothDevice::FromBluetoothAddressAsync(raw_addr) {
+                Ok(op) => match op.get() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("Failed to get BluetoothDevice for {}: {}", target_addr, e);
+                        return;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("FromBluetoothAddressAsync error for {}: {}", target_addr, e);
+                    return;
+                }
+            };
+
+            let mut last_connected = bt_device
+                .ConnectionStatus()
+                .map(|s| s == BluetoothConnectionStatus::Connected)
+                .unwrap_or(false);
+
+            callback(last_connected);
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let current = bt_device
+                    .ConnectionStatus()
+                    .map(|s| s == BluetoothConnectionStatus::Connected)
+                    .unwrap_or(false);
+
+                if current != last_connected {
+                    last_connected = current;
+                    tracing::info!(
+                        "AirPods connection state changed (Windows): connected = {}",
+                        current
+                    );
+                    callback(current);
+                }
+            }
+        });
+
         Ok(())
     }
 }
