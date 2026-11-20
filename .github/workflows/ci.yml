@@ -45,3 +45,23 @@ jobs:
 
       - name: Run Tests
         run: cargo test --all-features
+
+  check-and-test-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy (Windows)
+        run: cargo clippy --no-default-features -- -D warnings
+
+      - name: Run Tests (Windows)
+        run: cargo test --no-default-features

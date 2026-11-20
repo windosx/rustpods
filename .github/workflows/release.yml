@@ -18,8 +18,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-release:
+  build-linux:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.get_version.outputs.TAG }}
+      version: ${{ steps.get_version.outputs.VERSION }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -81,12 +84,79 @@ jobs:
         run: |
           cargo generate-rpm
 
-      - name: Collect release artifacts
+      - name: Collect Linux artifacts
         run: |
-          mkdir -p release-artifacts
-          cp dist/*.tar.gz release-artifacts/
-          cp target/debian/*.deb release-artifacts/
-          cp target/generate-rpm/*.rpm release-artifacts/
+          mkdir -p artifacts
+          cp dist/*.tar.gz artifacts/
+          cp target/debian/*.deb artifacts/
+          cp target/generate-rpm/*.rpm artifacts/
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: artifacts/*
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: get_version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary (Windows)
+        run: cargo build --release --no-default-features
+
+      - name: Package Windows Zip
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.get_version.outputs.VERSION }}"
+          $distName = "rustpods-v$ver-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path "dist/$distName"
+          Copy-Item "target/release/rustpods.exe" "dist/$distName/"
+          Copy-Item "README.md" "dist/$distName/"
+          Copy-Item "README_zh.md" "dist/$distName/"
+          Copy-Item "LICENSE" "dist/$distName/"
+          Copy-Item "NOTICE" "dist/$distName/"
+          New-Item -ItemType Directory -Force -Path "artifacts"
+          Compress-Archive -Path "dist/$distName" -DestinationPath "artifacts/$distName.zip"
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: artifacts/*
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: |
           cd release-artifacts
           sha256sum * > SHA256SUMS
           ls -la
@@ -94,9 +164,9 @@ jobs:
       - name: Create GitHub Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.get_version.outputs.TAG }}
-          name: RustPods ${{ steps.get_version.outputs.TAG }}
+          tag_name: ${{ needs.build-linux.outputs.tag }}
+          name: RustPods ${{ needs.build-linux.outputs.tag }}
           files: release-artifacts/*
           draft: false
-          prerelease: ${{ contains(steps.get_version.outputs.TAG, '-') }}
+          prerelease: ${{ contains(needs.build-linux.outputs.tag, '-') }}
           generate_release_notes: true
