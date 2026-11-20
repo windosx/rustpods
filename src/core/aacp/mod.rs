@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 #[cfg(target_os = "linux")]
 use tracing::error;
 
+#[cfg(target_os = "linux")]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// A dead L2CAP link does not necessarily close the socket, so the receive
 /// loop's read carries this watchdog: past it, the link is treated as gone
@@ -32,6 +33,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// longest quiet stretch of a live link (head tracking streams at ~50 Hz and
 /// battery/ear notifications arrive every few seconds or via 8s status polling).
 const RECV_WATCHDOG: Duration = Duration::from_secs(20);
+#[cfg(target_os = "linux")]
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone)]
@@ -90,7 +92,9 @@ pub struct AacpManager {
     /// watchdog expires.
     #[cfg(target_os = "linux")]
     active_socket: Arc<Mutex<Option<Arc<SeqPacket>>>>,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    active_socket: Arc<Mutex<Option<Arc<crate::system::magicaap::MagicAapStream>>>>,
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     active_socket: Arc<Mutex<Option<Arc<()>>>>,
     /// Monotonic connection counter. The receive task captures its own epoch
     /// at spawn and skips the shared-state cleanup if a newer session has
@@ -163,7 +167,6 @@ const L2CAP_OPTIONS: libc::c_int = 1;
 /// three services instead of eight. At 2582 all eight appear. Established by
 /// `starman-tech/mousepods` (`captures/airpods3_announces_mtu*.hex`) and
 /// reproduced here.
-#[cfg(target_os = "linux")]
 const AACP_RECEIVE_MTU: u16 = 2582;
 
 /// `struct l2cap_options` as the kernel lays it out: omtu, imtu, flush_to, mode,
@@ -875,9 +878,255 @@ impl AacpManager {
         Ok(())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    async fn open(&self, addr: MacAddress, handshake: bool) -> Result<(), String> {
+        info!("Connecting AACP via MagicAAP driver bridge to {}...", addr);
+
+        let stream = crate::system::magicaap::MagicAapStream::connect(addr).await?;
+        let stream = Arc::new(stream);
+
+        let epoch = self.conn_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.active_socket.lock().await = Some(Arc::clone(&stream));
+
+        info!("AACP stream connected to {}", addr);
+
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(128);
+        {
+            let mut state = self.state.write().await;
+            state.is_connected = true;
+            state.airpods_address = Some(addr);
+        }
+        {
+            let mut send_tx_guard = self.send_tx.lock().await;
+            *send_tx_guard = Some(tx);
+        }
+
+        // Spawn send loop
+        let stream_send = Arc::clone(&stream);
+        tokio::spawn(async move {
+            while let Some(packet) = rx.recv().await {
+                if let Err(e) = stream_send.send(&packet).await {
+                    tracing::error!("Error sending AACP packet: {}", e);
+                    break;
+                }
+            }
+            debug!("AACP send loop terminated");
+        });
+
+        // Spawn receive loop
+        let stream_recv = Arc::downgrade(&stream);
+        let epoch_counter = Arc::clone(&self.conn_epoch);
+        let event_tx = self.event_tx.clone();
+        let state_clone = Arc::clone(&self.state);
+        let send_tx_cleanup = Arc::clone(&self.send_tx);
+        let tracker = Arc::clone(&self.head_tracker);
+        let head_feed = self.head_feed.clone();
+        let gesture_tx = self.gesture_tx.clone();
+        let rtb_acp_tx = self.rtb_acp_tx.clone();
+        let neorelay_ids = Arc::clone(&self.neorelay_ids);
+        let ear_cache = Arc::clone(&self.ear_status);
+        let remotes = Arc::clone(&self.remotes);
+        let self_head_status = Arc::clone(&self.head_status);
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; AACP_RECEIVE_MTU as usize];
+            let mut sensor_frames: u64 = 0;
+            let mut last_ear_query = None::<tokio::time::Instant>;
+            let mut gate_logged_at = None::<std::time::Instant>;
+            loop {
+                let stream_recv = match stream_recv.upgrade() {
+                    Some(s) => s,
+                    None => {
+                        debug!("AACP receive loop superseded by newer connection");
+                        return;
+                    }
+                };
+
+                let read = tokio::time::timeout(RECV_WATCHDOG, stream_recv.recv(&mut buf));
+                let reply = match read.await {
+                    Ok(reply) => reply,
+                    Err(_) => {
+                        warn!(
+                            "AACP link silent for {}s; treating it as disconnected",
+                            RECV_WATCHDOG.as_secs()
+                        );
+                        break;
+                    }
+                };
+                match reply {
+                    Ok(len) if len > 0 => {
+                        let packet = &buf[..len];
+                        if len > 4 && packet[4] == 0x17 {
+                            if routes_to_xml(packet) {
+                                if let Some(ad) = rtbuddy::ServiceAdvertisement::parse(packet) {
+                                    let name = rtbuddy::ServiceAdvertisement::service_name(packet)
+                                        .unwrap_or("<unnamed>");
+                                    info!(
+                                        "Sensor service '{}': id=0x{:08X} cookie=0x{:08X}",
+                                        name, ad.service_id, ad.cookie
+                                    );
+                                    if name == rtbuddy::SERVICE_NAME_NEORELAY {
+                                        let mut ids = neorelay_ids.lock().await;
+                                        *ids = Some((ad.service_id as u16, ad.cookie));
+                                        info!(
+                                            "AACP: cached neorelay service id {} (cookie 0x{:08X})",
+                                            ad.service_id, ad.cookie
+                                        );
+                                    }
+                                    record_advertisement(&remotes, packet).await;
+                                }
+                                continue;
+                            }
+                            let descriptor = if len >= 10 {
+                                u32::from_le_bytes([packet[6], packet[7], packet[8], packet[9]])
+                            } else {
+                                0
+                            };
+                            let is_remote_hid = descriptor == rtbuddy::DESCRIPTOR_SENSOR;
+                            if is_remote_hid {
+                                rtb_acp_tx.send(packet.to_vec()).ok();
+                                debug!(
+                                    "RemoteHID frame: len={} {:02X?}",
+                                    len,
+                                    &packet[..len.min(24)]
+                                );
+                                if len < crate::core::head_tracking::SENSOR_V2_LEN {
+                                    continue;
+                                }
+                            } else if len < crate::core::head_tracking::SENSOR_V2_LEN
+                                && !packet
+                                    .windows(crate::core::head_tracking::PAYLOAD_MARK.len())
+                                    .any(|w| w == crate::core::head_tracking::PAYLOAD_MARK)
+                            {
+                                rtb_acp_tx.send(packet.to_vec()).ok();
+                                debug!(
+                                    "RTBuddy frame: descriptor=0x{:08X} len={} {:02X?}",
+                                    descriptor,
+                                    len,
+                                    &packet[..len.min(24)]
+                                );
+                                continue;
+                            }
+                            sensor_frames += 1;
+                            if sensor_frames == 1 {
+                                info!("Head tracking stream started ({} byte samples)", len);
+                            } else if sensor_frames.is_multiple_of(500) {
+                                debug!("Head tracking: {} samples received", sensor_frames);
+                            }
+                            let ear_now = *ear_cache.lock().await;
+                            let blocked = ear_now.is_some_and(|(l, r)| {
+                                l != EarStatus::InEar || r != EarStatus::InEar
+                            });
+                            if blocked {
+                                let mut tracker = tracker.lock().await;
+                                tracker.active = false;
+                                let _ = head_feed.send(None);
+                                if gate_logged_at
+                                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+                                {
+                                    gate_logged_at = Some(std::time::Instant::now());
+                                    info!(
+                                        "Head-tracking gate: buds not worn ({:?}); samples paused",
+                                        ear_now
+                                    );
+                                }
+                                continue;
+                            }
+                            if ear_now.is_none()
+                                && last_ear_query
+                                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5))
+                            {
+                                last_ear_query = Some(tokio::time::Instant::now());
+                                let _ = stream_recv
+                                    .send(&make_notification_request_packet())
+                                    .await;
+                            }
+                            let mut tracker = tracker.lock().await;
+                            tracker.active = true;
+                            if let Some((pose, gesture)) = tracker.parse_packet(packet) {
+                                let _ = head_feed.send(Some(pose));
+                                if let Some(gesture) = gesture {
+                                    let _ = gesture_tx.send(gesture);
+                                }
+                            }
+                            continue;
+                        }
+                        debug!("AACP raw recv {} bytes: {:02X?}", len, &packet[..len.min(16)]);
+                        if let Some(event) = parse_aacp_packet(packet) {
+                            if let AacpEvent::VersionNegotiation(ref neg) = event {
+                                let ack = neg.acknowledgement();
+                                info!("Auto-acknowledging VersionNegotiation on AACP receive path");
+                                let _ = stream_recv.send(&ack).await;
+                            }
+                            if let AacpEvent::EarDetection(ref ear) = event {
+                                *ear_cache.lock().await = Some((ear.left, ear.right));
+                            }
+                            let _ = event_tx.send(event);
+                        }
+                    }
+                    Ok(_) => {
+                        debug!("AACP stream EOF");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("AACP stream read error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            if epoch_counter.load(Ordering::SeqCst) != epoch {
+                debug!("Superseded receive loop exiting without clearing state");
+                return;
+            }
+
+            {
+                let mut state = state_clone.write().await;
+                state.is_connected = false;
+                state.airpods_address = None;
+            }
+            {
+                let mut send_tx_guard = send_tx_cleanup.lock().await;
+                *send_tx_guard = None;
+            }
+            {
+                let mut tracker = tracker.lock().await;
+                tracker.active = false;
+                tracker.reset();
+            }
+            *remotes.lock().await = remotehid::DeviceRegistry::new();
+            *neorelay_ids.lock().await = None;
+            *ear_cache.lock().await = None;
+            *self_head_status.lock().await = "head tracking not started".to_string();
+            let _ = head_feed.send(None);
+            let _ = event_tx.send(AacpEvent::Disconnected);
+            warn!("AACP receive loop exited, sent Disconnected event");
+        });
+
+        // Initialize handshake sequence if requested
+        if handshake {
+            if let Err(e) = self.init_handshake().await {
+                *self.active_socket.lock().await = None;
+                {
+                    let mut state = self.state.write().await;
+                    state.is_connected = false;
+                    state.airpods_address = None;
+                }
+                {
+                    let mut send_tx_guard = self.send_tx.lock().await;
+                    *send_tx_guard = None;
+                }
+                return Err(format!("AACP 1.3 handshake failed: {}", e));
+            }
+            let _ = self.request_battery_and_status().await;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     async fn open(&self, _addr: MacAddress, _handshake: bool) -> Result<(), String> {
-        Err("AACP L2CAP transport on Windows requires enhanced driver (Stage 3)".to_string())
+        Err("AACP L2CAP transport not supported on this platform".to_string())
     }
 
     async fn init_handshake(&self) -> Result<(), String> {

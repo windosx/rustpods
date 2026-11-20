@@ -5,6 +5,7 @@ pub mod codex_ask;
 pub mod config;
 pub mod head_mouse;
 pub mod le_monitor;
+pub mod magicaap;
 pub mod mpris;
 pub mod tray;
 pub mod updater;
