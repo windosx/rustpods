@@ -206,7 +206,7 @@ impl BluetoothManager {
     pub async fn find_paired_airpods(&self) -> Result<Vec<DiscoveredAirPods>, String> {
         tokio::task::spawn_blocking(|| {
             use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice};
-            use windows::Devices::Enumeration::DeviceInformation;
+            use windows::Devices::Enumeration::{DeviceClass, DeviceInformation};
 
             let selector = BluetoothDevice::GetDeviceSelectorFromPairingState(true)
                 .map_err(|e| format!("Failed to get device selector: {}", e))?;
@@ -215,6 +215,19 @@ impl BluetoothManager {
                 .map_err(|e| format!("Failed to query paired Bluetooth devices: {}", e))?
                 .get()
                 .map_err(|e| format!("Failed to get device query results: {}", e))?;
+
+            let active_audio_names: Vec<String> = if let Ok(op) = DeviceInformation::FindAllAsyncDeviceClass(DeviceClass::AudioRender) {
+                if let Ok(audio_devs) = op.get() {
+                    audio_devs.into_iter()
+                        .filter(|d| d.IsEnabled().unwrap_or(false))
+                        .filter_map(|d| d.Name().ok().map(|h| h.to_string().to_lowercase()))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
 
             let mut list = Vec::new();
             for dev_info in devices {
@@ -242,10 +255,14 @@ impl BluetoothManager {
                     };
                     let b = raw_addr.to_be_bytes();
                     let address = MacAddress([b[2], b[3], b[4], b[5], b[6], b[7]]);
-                    let is_connected = bt_device
+                    let lower_name = name.to_lowercase();
+                    let audio_connected = active_audio_names.iter().any(|an| an.contains(&lower_name) || lower_name.contains(an));
+                    let bt_connected = bt_device
                         .ConnectionStatus()
                         .map(|s| s == BluetoothConnectionStatus::Connected)
                         .unwrap_or(false);
+
+                    let is_connected = audio_connected || bt_connected;
 
                     list.push(DiscoveredAirPods {
                         address,
@@ -275,6 +292,7 @@ impl BluetoothManager {
     {
         tokio::task::spawn_blocking(move || {
             use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice};
+            use windows::Devices::Enumeration::{DeviceClass, DeviceInformation};
             let b = target_addr.0;
             let raw_addr = u64::from_be_bytes([0, 0, b[0], b[1], b[2], b[3], b[4], b[5]]);
 
@@ -292,19 +310,34 @@ impl BluetoothManager {
                 }
             };
 
-            let mut last_connected = bt_device
-                .ConnectionStatus()
-                .map(|s| s == BluetoothConnectionStatus::Connected)
-                .unwrap_or(false);
+            let target_name = bt_device.Name().map(|h| h.to_string().to_lowercase()).unwrap_or_default();
+
+            let check_connected = |bt_dev: &BluetoothDevice, name: &str| -> bool {
+                let bt_conn = bt_dev
+                    .ConnectionStatus()
+                    .map(|s| s == BluetoothConnectionStatus::Connected)
+                    .unwrap_or(false);
+                if bt_conn {
+                    return true;
+                }
+                if let Ok(op) = DeviceInformation::FindAllAsyncDeviceClass(DeviceClass::AudioRender) {
+                    if let Ok(audio_devs) = op.get() {
+                        return audio_devs.into_iter()
+                            .filter(|d| d.IsEnabled().unwrap_or(false))
+                            .filter_map(|d| d.Name().ok().map(|h| h.to_string().to_lowercase()))
+                            .any(|an| !name.is_empty() && (an.contains(name) || name.contains(&an)));
+                    }
+                }
+                false
+            };
+
+            let mut last_connected = check_connected(&bt_device, &target_name);
 
             callback(last_connected);
 
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                let current = bt_device
-                    .ConnectionStatus()
-                    .map(|s| s == BluetoothConnectionStatus::Connected)
-                    .unwrap_or(false);
+                let current = check_connected(&bt_device, &target_name);
 
                 if current != last_connected {
                     last_connected = current;

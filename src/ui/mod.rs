@@ -34,6 +34,8 @@ pub enum UiEvent {
     OpenWindow,
     CaseLidOpened,
     CaseLidClosed,
+    InEarPauseRequested,
+    InEarResumeRequested,
     HeadGesture(crate::core::head_tracking::HeadGesture),
     UpdateStateChanged(crate::system::updater::UpdateState),
     /// Requests a graceful application shutdown, so every Drop (notably the
@@ -354,10 +356,10 @@ fn bootstrap_gui(
         let state_ev = app_state.clone();
         let win_ev = active_window.clone();
         let popup_ev = popup_window.clone();
+        let mpris_ev = mpris_controller.clone();
+        let rt_ev = rt_handle.clone();
         #[cfg(target_os = "linux")]
         let tray_ev = tray_handle_holder.clone();
-        #[cfg(target_os = "linux")]
-        let rt_ev = rt_handle.clone();
         cx.spawn(async move |cx| {
             let gesture_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
             while let Some(evt) = ui_event_rx.recv().await {
@@ -400,6 +402,18 @@ fn bootstrap_gui(
                     UiEvent::CaseLidClosed => {
                         cx.update(|cx| {
                             popup::close_case_popup(&popup_ev, cx);
+                        });
+                    }
+                    UiEvent::InEarPauseRequested => {
+                        let m = mpris_ev.clone();
+                        rt_ev.spawn(async move {
+                            m.handle_ear_detection_pause().await;
+                        });
+                    }
+                    UiEvent::InEarResumeRequested => {
+                        let m = mpris_ev.clone();
+                        rt_ev.spawn(async move {
+                            m.handle_ear_detection_resume().await;
                         });
                     }
                     UiEvent::ConnectedChanged(connected) => {
@@ -832,14 +846,25 @@ pub async fn start_bluetooth_daemon(
                 let mut event_rx = aacp.subscribe();
 
                 if let Err(e) = aacp.connect(pod.address).await {
-                    warn!("AACP connection failed (BlueZ is still connected): {}", e);
-                    // BlueZ is still connected: keep device state connected and retain
-                    // battery info, retrying AACP in the background after a delay.
-                    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                    continue;
-                }
-
-                info!("AACP event stream active and connected");
+                    info!(
+                        "AACP connection failed ({}), running in native driverless mode",
+                        e
+                    );
+                    // Bluetooth audio is connected: keep device state connected.
+                    // In driverless mode, le_monitor updates battery and in-ear status.
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        let still_connected = match bt_manager.find_connected_airpods().await {
+                            Ok(list) => list.iter().any(|p| p.address == pod.address),
+                            Err(_) => false,
+                        };
+                        if !still_connected {
+                            info!("AirPods disconnected in driverless mode");
+                            break;
+                        }
+                    }
+                } else {
+                    info!("AACP event stream active and connected");
 
                 info!("Requesting initial battery and status...");
                 let _ = aacp.request_battery_and_status().await;
@@ -1067,6 +1092,7 @@ pub async fn start_bluetooth_daemon(
 
                         _ => {}
                     }
+                }
                 }
 
                 warn!("AirPods event loop exited, verifying connection status...");

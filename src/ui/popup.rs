@@ -189,15 +189,18 @@ impl Render for CasePopupWindow {
             .flex_col()
             .justify_center()
             .items_center()
-            .p(px(12.))
+            .when(!cfg!(target_os = "windows"), |el| el.p(px(12.)))
             .child(
                 div()
-                    .w(px(388.))
-                    .rounded(px(28.))
+                    .when(!cfg!(target_os = "windows"), |el| {
+                        el.w(px(388.)).rounded(px(28.)).shadow_lg()
+                    })
+                    .when(cfg!(target_os = "windows"), |el| {
+                        el.size_full().rounded(px(20.))
+                    })
                     .bg(card_bg)
                     .border_1()
                     .border_color(card_border)
-                    .shadow_lg()
                     .px(px(20.))
                     .pt(px(16.))
                     .pb(px(20.))
@@ -495,11 +498,19 @@ pub fn open_or_refresh_case_popup(
             *guard = None;
         }
 
-    let popup_size = size(px(416.), px(370.));
+    let popup_size = if cfg!(target_os = "windows") {
+        size(px(388.), px(346.))
+    } else {
+        size(px(416.), px(370.))
+    };
     let popup_bounds = WindowBounds::Windowed(Bounds::centered(None, popup_size, cx));
     let make_opts = |kind: WindowKind| WindowOptions {
         window_bounds: Some(popup_bounds),
-        titlebar: None,
+        titlebar: Some(gpui_kit::TitlebarOptions {
+            title: Some("RustPodsCasePopup".into()),
+            appears_transparent: true,
+            traffic_light_position: None,
+        }),
         focus: false,
         show: true,
         kind,
@@ -559,6 +570,14 @@ pub fn open_or_refresh_case_popup(
         }) {
             Ok(h) => {
                 info!("Opened iOS case popup via PopUp window");
+                #[cfg(target_os = "windows")]
+                {
+                    configure_windows_popup_dwm("RustPodsCasePopup");
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        configure_windows_popup_dwm("RustPodsCasePopup");
+                    });
+                }
                 Some(h)
             }
             Err(e) => {
@@ -570,6 +589,58 @@ pub fn open_or_refresh_case_popup(
 
     if let (Some(h), Ok(mut guard)) = (handle, slot.lock()) {
         *guard = Some(h);
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn configure_windows_popup_dwm(title: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER, WS_CAPTION, WS_POPUP, WS_THICKFRAME,
+    };
+
+    let title_h = HSTRING::from(title);
+    if let Ok(hwnd) = unsafe { FindWindowW(None, windows::core::PCWSTR(title_h.as_ptr())) } {
+        if !hwnd.is_invalid() {
+            unsafe {
+                let style = GetWindowLongW(hwnd, GWL_STYLE);
+                let new_style = (style
+                    & !(WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32 | WS_BORDER.0 as i32))
+                    | (WS_POPUP.0 as i32);
+                SetWindowLongW(hwnd, GWL_STYLE, new_style);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+                );
+
+                // Turn off DWM frame border (0xFFFFFFFE = DWMWA_COLOR_NONE)
+                let color_none: u32 = 0xFFFFFFFE;
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_BORDER_COLOR,
+                    &color_none as *const _ as *const _,
+                    std::mem::size_of::<u32>() as u32,
+                );
+
+                // Request rounded corners (2 = DWMWCP_ROUND)
+                let corner: u32 = 2;
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &corner as *const _ as *const _,
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+        }
     }
 }
 

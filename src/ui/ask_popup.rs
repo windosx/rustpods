@@ -139,11 +139,15 @@ impl Render for AskPopupWindow {
             .flex_col()
             .justify_end()
             .items_center()
-            .p(px(12.))
+            .when(!cfg!(target_os = "windows"), |el| el.p(px(12.)))
             .child(
                 div()
-                    .w(px(436.))
-                    .rounded(px(24.))
+                    .when(!cfg!(target_os = "windows"), |el| {
+                        el.w(px(436.)).rounded(px(24.)).shadow_lg()
+                    })
+                    .when(cfg!(target_os = "windows"), |el| {
+                        el.size_full().rounded(px(20.))
+                    })
                     .bg(card_bg)
                     .border_1()
                     .border_color(if is_resolved_only {
@@ -510,11 +514,19 @@ pub fn open_or_refresh_ask_popup(
             *guard = None;
         }
 
-    let popup_size = size(px(460.), px(320.));
+    let popup_size = if cfg!(target_os = "windows") {
+        size(px(436.), px(296.))
+    } else {
+        size(px(460.), px(320.))
+    };
     let popup_bounds = WindowBounds::Windowed(Bounds::centered(None, popup_size, cx));
     let make_opts = |kind: WindowKind| WindowOptions {
         window_bounds: Some(popup_bounds),
-        titlebar: None,
+        titlebar: Some(gpui_kit::TitlebarOptions {
+            title: Some("RustPodsAskPopup".into()),
+            appears_transparent: true,
+            traffic_light_position: None,
+        }),
         focus: false,
         show: true,
         kind,
@@ -578,6 +590,14 @@ pub fn open_or_refresh_ask_popup(
         }) {
             Ok(h) => {
                 info!("Opened ZCode Ask popup via PopUp window");
+                #[cfg(target_os = "windows")]
+                {
+                    crate::ui::popup::configure_windows_popup_dwm("RustPodsAskPopup");
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        crate::ui::popup::configure_windows_popup_dwm("RustPodsAskPopup");
+                    });
+                }
                 Some(h)
             }
             Err(e) => {

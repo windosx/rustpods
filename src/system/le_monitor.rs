@@ -625,51 +625,58 @@ async fn parse_proximity_message(
             device_addr, rpa_verified, state.is_connected, lid_open, lid_counter
         );
 
-        // Preserve AACP-authoritative in-ear state and battery when connected.
-        // AACP provides exact 1%-granular battery readings directly from the earbuds.
-        let aacp_wearing = state.is_connected && state.is_wearing_any();
+        let old_both = state.is_wearing_both();
+        let old_any = state.is_wearing_any();
+
+        // Always update battery readings when reported by BLE proximity
+        if let Some(lb) = left_battery {
+            state.battery_left = Some(lb);
+            state.battery_left_charging = left_charging;
+        }
+        if let Some(rb) = right_battery {
+            state.battery_right = Some(rb);
+            state.battery_right_charging = right_charging;
+        }
+        if (lid_open || is_this_pod_in_case || !state.is_connected) && case_battery.is_some() {
+            state.battery_case = case_battery;
+            state.battery_case_charging = case_charging;
+        }
 
         if !state.is_connected {
-            // When disconnected, BLE proximity is the sole source of battery
-            // for the popup window and device state.
-            if let Some(lb) = left_battery {
-                state.battery_left = Some(lb);
-                state.battery_left_charging = left_charging;
-            }
-            if let Some(rb) = right_battery {
-                state.battery_right = Some(rb);
-                state.battery_right_charging = right_charging;
-            }
-            if let Some(cb) = case_battery {
-                state.battery_case = Some(cb);
-                state.battery_case_charging = case_charging;
-            }
-
             state.left_in_ear = EarStatus::Disconnected;
             state.right_in_ear = EarStatus::Disconnected;
         } else {
-            // When connected, AACP is authoritative for earbud battery and in-ear status.
-            // If AACP has not provided earbud battery yet, use BLE as initial fallback.
-            if state.battery_left.is_none()
-                && let Some(lb) = left_battery
-            {
-                state.battery_left = Some(lb);
-                state.battery_left_charging = left_charging;
-            }
-            if state.battery_right.is_none()
-                && let Some(rb) = right_battery
-            {
-                state.battery_right = Some(rb);
-                state.battery_right_charging = right_charging;
-            }
-            // Only update case battery if the case is actively open or in-use.
-            if (lid_open || is_this_pod_in_case) && case_battery.is_some() {
-                state.battery_case = case_battery;
-                state.battery_case_charging = case_charging;
+            // In driverless mode (or before AACP has taken over), update in-ear status from BLE
+            state.left_in_ear = if left_in_ear { EarStatus::InEar } else { EarStatus::OutOfEar };
+            state.right_in_ear = if right_in_ear { EarStatus::InEar } else { EarStatus::OutOfEar };
+
+            let new_both = state.is_wearing_both();
+            let new_any = state.is_wearing_any();
+
+            if let Ok(cfg) = config.read() {
+                if cfg.ear_detection_enabled {
+                    match cfg.pause_behavior {
+                        crate::system::config::PauseBehavior::OneRemoved => {
+                            if old_both && !new_both {
+                                let _ = ui_tx.send(UiEvent::InEarPauseRequested);
+                            } else if !old_both && new_both {
+                                let _ = ui_tx.send(UiEvent::InEarResumeRequested);
+                            }
+                        }
+                        crate::system::config::PauseBehavior::BothRemoved => {
+                            if old_any && !new_any {
+                                let _ = ui_tx.send(UiEvent::InEarPauseRequested);
+                            } else if !old_any && new_any {
+                                let _ = ui_tx.send(UiEvent::InEarResumeRequested);
+                            }
+                        }
+                        crate::system::config::PauseBehavior::Never => {}
+                    }
+                }
             }
         }
 
-        let wearing_any = aacp_wearing || left_in_ear || right_in_ear;
+        let wearing_any = left_in_ear || right_in_ear;
 
         let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state.clone()));
 
