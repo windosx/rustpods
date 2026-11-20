@@ -667,8 +667,47 @@ pub async fn run_audio_follow(
     client.shutdown();
 }
 
-/// Stub for builds without the feature, so the call site stays uniform.
-#[cfg(not(feature = "audio-follow"))]
+/// Broadcasts head tracking via OpenTrack UDP protocol (127.0.0.1:4242) on Windows.
+#[cfg(all(target_os = "windows", not(feature = "audio-follow")))]
+pub async fn run_audio_follow(
+    mut pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
+) {
+    use tokio::net::UdpSocket;
+    let socket = match UdpSocket::bind("127.0.0.1:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to bind UDP socket for OpenTrack: {}", e);
+            return;
+        }
+    };
+    let target = "127.0.0.1:4242";
+    info!("OpenTrack UDP head pose broadcaster ready (target: {})", target);
+
+    while pose_rx.changed().await.is_ok() {
+        let pose = *pose_rx.borrow_and_update();
+        if let Some(pose) = pose {
+            let mut buf = [0u8; 48];
+            let x: f64 = 0.0;
+            let y: f64 = 0.0;
+            let z: f64 = 0.0;
+            let yaw: f64 = pose.yaw as f64;
+            let pitch: f64 = pose.pitch as f64;
+            let roll: f64 = pose.roll as f64;
+
+            buf[0..8].copy_from_slice(&x.to_le_bytes());
+            buf[8..16].copy_from_slice(&y.to_le_bytes());
+            buf[16..24].copy_from_slice(&z.to_le_bytes());
+            buf[24..32].copy_from_slice(&yaw.to_le_bytes());
+            buf[32..40].copy_from_slice(&pitch.to_le_bytes());
+            buf[40..48].copy_from_slice(&roll.to_le_bytes());
+
+            let _ = socket.send_to(&buf, target).await;
+        }
+    }
+}
+
+/// Stub for builds without the feature on non-Windows platforms.
+#[cfg(all(not(target_os = "windows"), not(feature = "audio-follow")))]
 pub async fn run_audio_follow(
     _pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
 ) {
