@@ -85,11 +85,12 @@ pub fn is_driver_available() -> bool {
                 windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
                 None,
             );
-            if let Ok(h) = handle {
-                if h != INVALID_HANDLE_VALUE && !h.is_invalid() {
-                    let _ = CloseHandle(h);
-                    return true;
-                }
+            if let Ok(h) = handle
+                && h != INVALID_HANDLE_VALUE
+                && !h.is_invalid()
+            {
+                let _ = CloseHandle(h);
+                return true;
             }
         }
     }
@@ -136,12 +137,13 @@ impl MagicAapStream {
                         windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
                         None,
                     );
-                    if let Ok(h) = handle {
-                        if h != INVALID_HANDLE_VALUE && !h.is_invalid() {
-                            info!("Opened MagicAAP driver/pipe interface");
-                            device_handle = Some(h);
-                            break;
-                        }
+                    if let Ok(h) = handle
+                        && h != INVALID_HANDLE_VALUE
+                        && !h.is_invalid()
+                    {
+                        info!("Opened MagicAAP driver/pipe interface");
+                        device_handle = Some(h);
+                        break;
                     }
                 }
             }

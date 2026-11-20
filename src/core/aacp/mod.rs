@@ -967,7 +967,7 @@ impl AacpManager {
                                     );
                                     if name == rtbuddy::SERVICE_NAME_NEORELAY {
                                         let mut ids = neorelay_ids.lock().await;
-                                        *ids = Some((ad.service_id as u16, ad.cookie));
+                                        *ids = Some((ad.service_id, ad.cookie));
                                         info!(
                                             "AACP: cached neorelay service id {} (cookie 0x{:08X})",
                                             ad.service_id, ad.cookie

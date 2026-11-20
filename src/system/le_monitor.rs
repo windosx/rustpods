@@ -225,22 +225,19 @@ pub async fn start_le_monitor(
                     let b = raw_addr.to_be_bytes();
                     let mac = MacAddress([b[2], b[3], b[4], b[5], b[6], b[7]]);
 
-                    if let Ok(adv) = args.Advertisement() {
-                        if let Ok(mfg_list) = adv.ManufacturerData() {
-                            for section in mfg_list {
-                                if let Ok(company_id) = section.CompanyId() {
-                                    if company_id == 0x004c {
-                                        if let Ok(data_buf) = section.Data() {
-                                            if let Ok(reader) = DataReader::FromBuffer(&data_buf) {
-                                                if let Ok(len) = reader.UnconsumedBufferLength() {
-                                                    let mut buf = vec![0u8; len as usize];
-                                                    if reader.ReadBytes(&mut buf).is_ok() {
-                                                        let _ = adv_tx.send((buf, mac));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                    if let Ok(adv) = args.Advertisement()
+                        && let Ok(mfg_list) = adv.ManufacturerData()
+                    {
+                        for section in mfg_list {
+                            if let Ok(company_id) = section.CompanyId()
+                                && company_id == 0x004c
+                                && let Ok(data_buf) = section.Data()
+                                && let Ok(reader) = DataReader::FromBuffer(&data_buf)
+                                && let Ok(len) = reader.UnconsumedBufferLength()
+                            {
+                                let mut buf = vec![0u8; len as usize];
+                                if reader.ReadBytes(&mut buf).is_ok() {
+                                    let _ = adv_tx.send((buf, mac));
                                 }
                             }
                         }

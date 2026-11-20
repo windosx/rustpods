@@ -496,7 +496,7 @@ fn is_in_lightning_glyph(x: usize, y: usize, size: usize) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub unsafe fn create_hicon_from_icon(
+pub fn create_hicon_from_icon(
     icon: &Icon,
 ) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
     use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
@@ -510,15 +510,11 @@ pub unsafe fn create_hicon_from_icon(
 
     // Convert ARGB to BGRA
     let mut bgra = Vec::with_capacity(icon.data.len());
-    for chunk in icon.data.chunks_exact(4) {
-        let a = chunk[0];
-        let r = chunk[1];
-        let g = chunk[2];
-        let b = chunk[3];
-        bgra.push(b);
-        bgra.push(g);
-        bgra.push(r);
-        bgra.push(a);
+    for [a, r, g, b] in icon.data.as_chunks::<4>().0 {
+        bgra.push(*b);
+        bgra.push(*g);
+        bgra.push(*r);
+        bgra.push(*a);
     }
 
     unsafe {
@@ -526,7 +522,7 @@ pub unsafe fn create_hicon_from_icon(
         let mask_bytes = vec![0u8; ((width + 15) / 16 * 2 * height) as usize];
         let hbm_mask = CreateBitmap(width, height, 1, 1, Some(mask_bytes.as_ptr() as *const _));
 
-        let mut icon_info = ICONINFO {
+        let icon_info = ICONINFO {
             fIcon: true.into(),
             xHotspot: 0,
             yHotspot: 0,
@@ -534,7 +530,7 @@ pub unsafe fn create_hicon_from_icon(
             hbmColor: hbm_color,
         };
 
-        let hicon = CreateIconIndirect(&mut icon_info).ok();
+        let hicon = CreateIconIndirect(&icon_info).ok();
         let _ = DeleteObject(hbm_color);
         let _ = DeleteObject(hbm_mask);
         hicon
@@ -633,8 +629,9 @@ unsafe fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND, tray: &RustPods
         let _ = AppendMenuW(hmenu, MF_STRING, ID_OPEN_WINDOW as usize, w!("打开 RustPods"));
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
 
-        if is_connected && has_anc {
-            if let Ok(noise_menu) = CreatePopupMenu() {
+        if is_connected && has_anc
+            && let Ok(noise_menu) = CreatePopupMenu()
+        {
                 let check_off = if current_noise == NoiseControlMode::Off { MF_CHECKED } else { MF_UNCHECKED };
                 let check_trans = if current_noise == NoiseControlMode::Transparency { MF_CHECKED } else { MF_UNCHECKED };
                 let check_adapt = if current_noise == NoiseControlMode::Adaptive { MF_CHECKED } else { MF_UNCHECKED };
@@ -645,8 +642,7 @@ unsafe fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND, tray: &RustPods
                 let _ = AppendMenuW(noise_menu, MF_STRING | check_adapt, ID_NOISE_ADAPTIVE as usize, w!("自适应音频"));
                 let _ = AppendMenuW(noise_menu, MF_STRING | check_anc, ID_NOISE_ANC as usize, w!("降噪"));
 
-                let _ = AppendMenuW(hmenu, MF_POPUP, noise_menu.0 as usize, w!("噪声控制"));
-            }
+            let _ = AppendMenuW(hmenu, MF_POPUP, noise_menu.0 as usize, w!("噪声控制"));
         }
 
         if is_connected {
@@ -832,10 +828,10 @@ pub fn spawn_windows_tray(tray: Arc<RustPodsTray>) {
             }
 
             let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
-            if let Ok(cleanup_handle) = RemovePropW(hwnd, w!("RustPodsHicon")) {
-                if !cleanup_handle.is_invalid() && !cleanup_handle.0.is_null() {
-                    let _ = DestroyIcon(HICON(cleanup_handle.0));
-                }
+            if let Ok(cleanup_handle) = RemovePropW(hwnd, w!("RustPodsHicon"))
+                && !cleanup_handle.is_invalid() && !cleanup_handle.0.is_null()
+            {
+                let _ = DestroyIcon(HICON(cleanup_handle.0));
             }
             let _ = Arc::from_raw(tray_raw);
         })
