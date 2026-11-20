@@ -155,7 +155,7 @@ async fn serve_single_instance_dbus(ui_tx: mpsc::UnboundedSender<UiEvent>) {
 }
 
 /// Starts the GPUI desktop application.
-pub fn run_app(rt_handle: tokio::runtime::Handle) {
+pub fn run_app(rt_handle: tokio::runtime::Handle, start_minimized: bool) {
     gpui_kit::application()
         .with_assets(CompositeAssets)
         .with_quit_mode(QuitMode::Explicit)
@@ -163,13 +163,14 @@ pub fn run_app(rt_handle: tokio::runtime::Handle) {
             gpui_kit::init(cx);
             let initial_mode = ThemeMode::Dark;
             theme::apply_apple_theme(initial_mode, cx);
-            bootstrap_gui(rt_handle, initial_mode, cx);
+            bootstrap_gui(rt_handle, initial_mode, start_minimized, cx);
         });
 }
 
 fn bootstrap_gui(
     rt_handle: tokio::runtime::Handle,
     initial_mode: ThemeMode,
+    start_minimized: bool,
     cx: &mut App,
 ) {
     let config = Arc::new(std::sync::RwLock::new(load_config()));
@@ -202,7 +203,10 @@ fn bootstrap_gui(
         Arc::new(std::sync::Mutex::new(None));
     let ask_popup_window: Arc<std::sync::Mutex<Option<gpui_kit::WindowHandle<ask_popup::AskPopupWindow>>>> =
         Arc::new(std::sync::Mutex::new(None));
-    open_or_activate_window(&app_state, &active_window, cx);
+    let should_minimize = start_minimized || config.read().unwrap().start_minimized;
+    if !should_minimize {
+        open_or_activate_window(&app_state, &active_window, cx);
+    }
 
     // Register D-Bus single-instance Activate handler (Linux only).
     #[cfg(target_os = "linux")]

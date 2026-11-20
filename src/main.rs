@@ -24,6 +24,9 @@ struct Cli {
     #[arg(short, long, help = "Enable debug logging")]
     debug: bool,
 
+    #[arg(long, help = "Start minimized to the system tray")]
+    minimized: bool,
+
     #[arg(long, help = "Check if a newer version of RustPods is available")]
     check_update: bool,
 
@@ -660,7 +663,7 @@ fn main() {
         };
 
         // Run GPUI application
-        ui::run_app(rt.handle().clone());
+        ui::run_app(rt.handle().clone(), cli.minimized);
     }
 }
 

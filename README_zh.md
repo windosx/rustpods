@@ -147,7 +147,8 @@ cargo build --release --no-default-features
 ### 方式一：包管理器与预编译安装（推荐）
 
 #### Windows (x86_64)
-从 [Releases 页面](https://github.com/windosx/rustpods/releases) 下载最新的 `rustpods-v*-windows-x86_64.zip`，解压后直接运行 `rustpods.exe` 即可。
+- **安装包（推荐，开箱即用）**：从 [Releases 页面](https://github.com/windosx/rustpods/releases) 下载 `RustPods-Setup-v*-x86_64.exe` 安装向导，支持桌面快捷方式与开机托盘常驻自启。
+- **便携绿色包 (Portable)**：下载 `rustpods-v*-windows-x86_64.zip`，解压后双击 `rustpods.exe` 即可直接运行。
 
 #### Arch Linux (AUR)
 ```bash

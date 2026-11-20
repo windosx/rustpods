@@ -147,7 +147,8 @@ The GUI, tray, AACP stack, and head-pose mouse work across platforms; on Linux, 
 ### Method 1: Package Managers & Prebuilt Releases (Recommended)
 
 #### Windows (x86_64)
-Download the latest `rustpods-v*-windows-x86_64.zip` from [Releases](https://github.com/windosx/rustpods/releases), extract it, and launch `rustpods.exe`.
+- **Installer (Recommended)**: Download and run `RustPods-Setup-v*-x86_64.exe` from [Releases](https://github.com/windosx/rustpods/releases) for a one-click setup with desktop shortcuts and optional auto-start.
+- **Portable Zip**: Download `rustpods-v*-windows-x86_64.zip`, extract, and launch `rustpods.exe`.
 
 #### Arch Linux (AUR)
 ```bash
