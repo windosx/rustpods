@@ -636,7 +636,7 @@ fn open_or_activate_window(
 }
 
 /// Drives the head-tracked audio stage for as long as poses arrive.
-#[cfg(feature = "audio-follow")]
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 pub async fn run_audio_follow(
     pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
 ) {
@@ -686,7 +686,7 @@ pub async fn run_audio_follow(
 }
 
 /// Broadcasts head tracking via OpenTrack UDP protocol (127.0.0.1:4242) on Windows.
-#[cfg(all(target_os = "windows", not(feature = "audio-follow")))]
+#[cfg(target_os = "windows")]
 pub async fn run_audio_follow(
     mut pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
 ) {
@@ -725,7 +725,7 @@ pub async fn run_audio_follow(
 }
 
 /// Stub for builds without the feature on non-Windows platforms.
-#[cfg(all(not(target_os = "windows"), not(feature = "audio-follow")))]
+#[cfg(all(not(target_os = "windows"), not(all(target_os = "linux", feature = "audio-follow"))))]
 pub async fn run_audio_follow(
     _pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
 ) {

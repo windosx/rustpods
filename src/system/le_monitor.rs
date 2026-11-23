@@ -653,25 +653,25 @@ async fn parse_proximity_message(
             let new_both = state.is_wearing_both();
             let new_any = state.is_wearing_any();
 
-            if let Ok(cfg) = config.read() {
-                if cfg.ear_detection_enabled {
-                    match cfg.pause_behavior {
-                        crate::system::config::PauseBehavior::OneRemoved => {
-                            if old_both && !new_both {
-                                let _ = ui_tx.send(UiEvent::InEarPauseRequested);
-                            } else if !old_both && new_both {
-                                let _ = ui_tx.send(UiEvent::InEarResumeRequested);
-                            }
+            if let Ok(cfg) = config.read()
+                && cfg.ear_detection_enabled
+            {
+                match cfg.pause_behavior {
+                    crate::system::config::PauseBehavior::OneRemoved => {
+                        if old_both && !new_both {
+                            let _ = ui_tx.send(UiEvent::InEarPauseRequested);
+                        } else if !old_both && new_both {
+                            let _ = ui_tx.send(UiEvent::InEarResumeRequested);
                         }
-                        crate::system::config::PauseBehavior::BothRemoved => {
-                            if old_any && !new_any {
-                                let _ = ui_tx.send(UiEvent::InEarPauseRequested);
-                            } else if !old_any && new_any {
-                                let _ = ui_tx.send(UiEvent::InEarResumeRequested);
-                            }
-                        }
-                        crate::system::config::PauseBehavior::Never => {}
                     }
+                    crate::system::config::PauseBehavior::BothRemoved => {
+                        if old_any && !new_any {
+                            let _ = ui_tx.send(UiEvent::InEarPauseRequested);
+                        } else if !old_any && new_any {
+                            let _ = ui_tx.send(UiEvent::InEarResumeRequested);
+                        }
+                    }
+                    crate::system::config::PauseBehavior::Never => {}
                 }
             }
         }

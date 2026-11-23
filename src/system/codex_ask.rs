@@ -12,8 +12,8 @@ use tracing::info;
 
 /// Path of the user-level Codex hooks file: `~/.codex/hooks.json`.
 pub fn codex_hooks_json_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".codex").join("hooks.json")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".codex").join("hooks.json")
 }
 
 /// The argv marker that identifies our hook entry in Codex configuration.

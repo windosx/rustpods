@@ -320,13 +320,13 @@ impl BluetoothManager {
                 if bt_conn {
                     return true;
                 }
-                if let Ok(op) = DeviceInformation::FindAllAsyncDeviceClass(DeviceClass::AudioRender) {
-                    if let Ok(audio_devs) = op.get() {
-                        return audio_devs.into_iter()
-                            .filter(|d| d.IsEnabled().unwrap_or(false))
-                            .filter_map(|d| d.Name().ok().map(|h| h.to_string().to_lowercase()))
-                            .any(|an| !name.is_empty() && (an.contains(name) || name.contains(&an)));
-                    }
+                if let Ok(op) = DeviceInformation::FindAllAsyncDeviceClass(DeviceClass::AudioRender)
+                    && let Ok(audio_devs) = op.get()
+                {
+                    return audio_devs.into_iter()
+                        .filter(|d| d.IsEnabled().unwrap_or(false))
+                        .filter_map(|d| d.Name().ok().map(|h| h.to_string().to_lowercase()))
+                        .any(|an| !name.is_empty() && (an.contains(name) || name.contains(&an)));
                 }
                 false
             };

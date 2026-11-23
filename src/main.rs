@@ -258,7 +258,12 @@ fn gui_already_running() -> bool {
 fn gui_already_running() -> bool {
     use windows::core::w;
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    unsafe { FindWindowW(None, w!("RustPods")).is_ok() }
+    unsafe {
+        match FindWindowW(None, w!("RustPods")) {
+            Ok(h) => !h.is_invalid() && !h.0.is_null(),
+            Err(_) => false,
+        }
+    }
 }
 
 /// Asks an already-running RustPods GUI instance to bring its window forward.
@@ -284,7 +289,10 @@ fn activate_running_gui() -> bool {
 fn activate_running_gui() -> bool {
     use windows::core::w;
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
-    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("RustPods")) } {
+    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("RustPods")) }
+        && !hwnd.is_invalid()
+        && !hwnd.0.is_null()
+    {
         unsafe {
             let _ = ShowWindow(hwnd, SW_RESTORE);
             let _ = SetForegroundWindow(hwnd);
@@ -402,29 +410,38 @@ fn main() {
     }
 
     if cli.update {
-        let is_pkg = system::updater::is_package_managed();
-        if is_pkg {
-            eprintln!("Error: This binary is located in a system package directory (/usr/bin).");
-            eprintln!("To prevent package database corruption, please update using your package manager (e.g. yay, apt, dnf).");
-            std::process::exit(1);
+        #[cfg(target_os = "windows")]
+        {
+            println!("Opening the latest RustPods releases in your default browser...");
+            let _ = open::that("https://github.com/windosx/rustpods/releases/latest");
+            return;
         }
-        println!("Triggering RustPods in-place update...");
-        let status = std::process::Command::new("bash")
-            .arg("-c")
-            .arg("curl -fsSL https://raw.githubusercontent.com/windosx/rustpods/master/contrib/scripts/update.sh | bash")
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                println!("Update complete.");
-                return;
-            }
-            Ok(s) => {
-                eprintln!("Update exited with status: {:?}", s.code());
-                std::process::exit(s.code().unwrap_or(1));
-            }
-            Err(e) => {
-                eprintln!("Failed to run update script: {}", e);
+        #[cfg(not(target_os = "windows"))]
+        {
+            let is_pkg = system::updater::is_package_managed();
+            if is_pkg {
+                eprintln!("Error: This binary is located in a system package directory (/usr/bin).");
+                eprintln!("To prevent package database corruption, please update using your package manager (e.g. yay, apt, dnf).");
                 std::process::exit(1);
+            }
+            println!("Triggering RustPods in-place update...");
+            let status = std::process::Command::new("bash")
+                .arg("-c")
+                .arg("curl -fsSL https://raw.githubusercontent.com/windosx/rustpods/master/contrib/scripts/update.sh | bash")
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    println!("Update complete.");
+                    return;
+                }
+                Ok(s) => {
+                    eprintln!("Update exited with status: {:?}", s.code());
+                    std::process::exit(s.code().unwrap_or(1));
+                }
+                Err(e) => {
+                    eprintln!("Failed to run update script: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }

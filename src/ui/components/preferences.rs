@@ -25,6 +25,16 @@ pub fn render_preferences_page(
     let app_theme_light = app_state.clone();
     let app_theme_dark = app_state.clone();
     let is_dark = state.theme_mode.is_dark();
+    let media_title = if cfg!(target_os = "windows") {
+        "Windows 媒体与系统音频集成".to_string()
+    } else {
+        rust_i18n::t!("controls.mpris_integration").into_owned()
+    };
+    let media_desc = if cfg!(target_os = "windows") {
+        "自动控制 Windows 本地媒体播放器暂停与恢复（支持网易云音乐、QQ音乐、Spotify、浏览器等）".to_string()
+    } else {
+        rust_i18n::t!("controls.mpris_desc").into_owned()
+    };
 
     let theme_switcher = div()
         .flex()
@@ -220,20 +230,32 @@ pub fn render_preferences_page(
                     true,
                 )),
         )
-        .child(section_header(p, &rust_i18n::t!("controls.mpris_integration"), None))
+        .child(section_header(p, &media_title, None))
         .child(
             grouped_card(p)
                 .child(setting_row(
                     p,
-                    "D-Bus MPRIS 媒体联动",
-                    Some(&rust_i18n::t!("controls.mpris_desc")),
+                    if cfg!(target_os = "windows") {
+                        "Windows 全局媒体传输控件 (GSMTC)"
+                    } else {
+                        "D-Bus MPRIS 媒体联动"
+                    },
+                    Some(&media_desc),
                     Tag::success().outline().child(rust_i18n::t!("preferences.running")),
                     false,
                 ))
                 .child(setting_row(
                     p,
-                    "PipeWire / PulseAudio 原生音频",
-                    Some("支持 A2DP 高清立体声音频流与无缝切换"),
+                    if cfg!(target_os = "windows") {
+                        "Windows 核心音频 / A2DP"
+                    } else {
+                        "PipeWire / PulseAudio 原生音频"
+                    },
+                    Some(if cfg!(target_os = "windows") {
+                        "基于 Windows 核心音频渲染与蓝牙 A2DP 高清立体声音频流"
+                    } else {
+                        "支持 A2DP 高清立体声音频流与无缝切换"
+                    }),
                     Tag::success().outline().child(rust_i18n::t!("preferences.normal")),
                     true,
                 )),

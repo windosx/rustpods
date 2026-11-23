@@ -1376,8 +1376,8 @@ async fn read_stdin_with_timeout() -> Option<String> {
 
 /// Path of the user-level ZCode CLI config.
 fn zcode_cli_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".zcode").join("cli").join("config.json")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".zcode").join("cli").join("config.json")
 }
 
 /// The hook entry RustPods installs, as a reusable value: a `process` hook

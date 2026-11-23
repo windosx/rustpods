@@ -604,42 +604,43 @@ pub fn configure_windows_popup_dwm(title: &str) {
     };
 
     let title_h = HSTRING::from(title);
-    if let Ok(hwnd) = unsafe { FindWindowW(None, windows::core::PCWSTR(title_h.as_ptr())) } {
-        if !hwnd.is_invalid() {
-            unsafe {
-                let style = GetWindowLongW(hwnd, GWL_STYLE);
-                let new_style = (style
-                    & !(WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32 | WS_BORDER.0 as i32))
-                    | (WS_POPUP.0 as i32);
-                SetWindowLongW(hwnd, GWL_STYLE, new_style);
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-                );
+    if let Ok(hwnd) = unsafe { FindWindowW(None, windows::core::PCWSTR(title_h.as_ptr())) }
+        && !hwnd.is_invalid()
+        && !hwnd.0.is_null()
+    {
+        unsafe {
+            let style = GetWindowLongW(hwnd, GWL_STYLE);
+            let new_style = (style
+                & !(WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32 | WS_BORDER.0 as i32))
+                | (WS_POPUP.0 as i32);
+            SetWindowLongW(hwnd, GWL_STYLE, new_style);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
 
-                // Turn off DWM frame border (0xFFFFFFFE = DWMWA_COLOR_NONE)
-                let color_none: u32 = 0xFFFFFFFE;
-                let _ = DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_BORDER_COLOR,
-                    &color_none as *const _ as *const _,
-                    std::mem::size_of::<u32>() as u32,
-                );
+            // Turn off DWM frame border (0xFFFFFFFE = DWMWA_COLOR_NONE)
+            let color_none: u32 = 0xFFFFFFFE;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &color_none as *const _ as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
 
-                // Request rounded corners (2 = DWMWCP_ROUND)
-                let corner: u32 = 2;
-                let _ = DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_WINDOW_CORNER_PREFERENCE,
-                    &corner as *const _ as *const _,
-                    std::mem::size_of::<u32>() as u32,
-                );
-            }
+            // Request rounded corners (2 = DWMWCP_ROUND)
+            let corner: u32 = 2;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &corner as *const _ as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
         }
     }
 }

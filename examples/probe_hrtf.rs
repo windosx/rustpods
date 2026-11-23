@@ -19,17 +19,25 @@
 //! *existing* global. Creating a new object with `create_object` instead produces
 //! a second, unrelated node that accepts writes into the void.
 
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 use pipewire as pw;
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 use pw::spa::param::ParamType;
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 use pw::spa::pod::{Pod, Value};
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 use std::cell::RefCell;
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 use std::rc::Rc;
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 use std::time::{Duration, Instant};
 
 /// The control to drive. filter-graph splices sofa control ports into the node's
 /// Props under this name.
+#[allow(dead_code)]
 const CONTROL: &str = "spatL:Azimuth";
 
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let name = std::env::args()
         .nth(1)
@@ -157,6 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Runs the loop until the core acknowledges a sync, so every pending event has
 /// been delivered before the caller inspects its buffers.
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 fn sync(core: &pw::core::CoreRc, mainloop: &pw::main_loop::MainLoopRc) -> Result<(), Box<dyn std::error::Error>> {
     let pending = core.sync(0)?;
     let ml = mainloop.clone();
@@ -183,6 +192,7 @@ fn sync(core: &pw::core::CoreRc, mainloop: &pw::main_loop::MainLoopRc) -> Result
 }
 
 /// Serialises `SPA_TYPE_OBJECT_Props { SPA_PROP_params: Struct(name, value) }`.
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 fn build_props(control_name: &str, value: f32) -> Vec<u8> {
     use pw::spa::pod::Object;
     use pw::spa::pod::Property;
@@ -212,6 +222,7 @@ fn build_props(control_name: &str, value: f32) -> Vec<u8> {
 }
 
 /// Renders a Props pod as `PropName=value` lines so differences are visible.
+#[cfg(all(target_os = "linux", feature = "audio-follow"))]
 fn describe(pod: &Pod) -> String {
     let value = match pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(
         pod.as_bytes(),
@@ -227,4 +238,9 @@ fn describe(pod: &Pod) -> String {
         parts.push(format!("{}= {:?}", prop.key, prop.value));
     }
     parts.join(", ")
+}
+
+#[cfg(not(all(target_os = "linux", feature = "audio-follow")))]
+fn main() {
+    eprintln!("probe_hrtf is only supported on Linux with audio-follow");
 }
