@@ -35,8 +35,11 @@ impl BatteryStatus {
     pub fn from_u8(val: u8) -> Self {
         match val {
             0x01 => Self::Charging,
+            0x02 => Self::NotCharging,
             0x04 => Self::Disconnected,
-            _ => Self::NotCharging,
+            // Unknown/unset status bytes (e.g. 0x00 in transient frames) must not
+            // be treated as a valid NotCharging reading.
+            _ => Self::Disconnected,
         }
     }
 }

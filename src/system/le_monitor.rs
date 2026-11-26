@@ -1,4 +1,5 @@
 use crate::core::aacp::events::EarStatus;
+use crate::core::aacp::AacpManager;
 use crate::core::crypto::{decrypt_proximity_payload, verify_rpa, verify_rpa_be};
 use crate::core::device::AirPodsDeviceState;
 use crate::core::models::MacAddress;
@@ -25,7 +26,6 @@ const LID_SLEEP_RESET: Duration = Duration::from_secs(60);
 #[derive(Debug, Default)]
 struct LidTracker {
     last_lid_open: Option<bool>,
-    last_popped_counter: Option<u8>,
     last_seen_at: Option<Instant>,
     last_popup_at: Option<Instant>,
     popup_active: bool,
@@ -42,7 +42,7 @@ impl LidTracker {
     fn observe(
         &mut self,
         lid_open: bool,
-        lid_counter: u8,
+        _lid_counter: u8,
         wearing_any: bool,
         now: Instant,
     ) -> LidTransition {
@@ -52,7 +52,6 @@ impl LidTracker {
             .unwrap_or(false);
         if slept {
             self.last_lid_open = None;
-            self.last_popped_counter = None;
             self.popup_active = false;
         }
         self.last_seen_at = Some(now);
@@ -61,7 +60,6 @@ impl LidTracker {
         self.last_lid_open = Some(lid_open);
 
         if !lid_open {
-            self.last_popped_counter = None;
             if prev_open == Some(true) || self.popup_active {
                 self.popup_active = false;
                 return LidTransition::Closed;
@@ -73,15 +71,12 @@ impl LidTracker {
         if wearing_any {
             if self.popup_active {
                 self.popup_active = false;
-                self.last_popped_counter = Some(lid_counter);
                 return LidTransition::Closed;
             }
-            self.last_popped_counter = Some(lid_counter);
             return LidTransition::None;
         }
 
-        let new_open_event =
-            prev_open == Some(false) || self.last_popped_counter != Some(lid_counter);
+        let new_open_event = matches!(prev_open, None | Some(false));
         if !new_open_event {
             return LidTransition::None;
         }
@@ -92,7 +87,6 @@ impl LidTracker {
             .unwrap_or(true);
         if cooled_down {
             self.last_popup_at = Some(now);
-            self.last_popped_counter = Some(lid_counter);
             self.popup_active = true;
             LidTransition::Opened
         } else {
@@ -129,6 +123,7 @@ pub async fn scan_gate(
 #[cfg(target_os = "linux")]
 pub async fn start_le_monitor(
     dev_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
+    aacp: Arc<AacpManager>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     config: Arc<std::sync::RwLock<AppConfig>>,
 ) -> Result<(), String> {
@@ -168,7 +163,7 @@ pub async fn start_le_monitor(
 
         // Try modern BlueZ AdvertisementMonitor first: hardware/kernel pattern matching
         // without continuous generic discovery, eliminating RF congestion and BLE HID conflicts.
-        match run_advertisement_monitor(&adapter, &dev_state, &ui_tx, &config, &lid_tracker).await {
+        match run_advertisement_monitor(&adapter, &dev_state, &aacp, &ui_tx, &config, &lid_tracker).await {
             Ok(()) => {
                 debug!("AdvertisementMonitor session completed normally");
             }
@@ -178,7 +173,7 @@ pub async fn start_le_monitor(
                     e
                 );
                 if let Err(e2) =
-                    run_discovery_stream(&adapter, &dev_state, &ui_tx, &config, &lid_tracker).await
+                    run_discovery_stream(&adapter, &dev_state, &aacp, &ui_tx, &config, &lid_tracker).await
                 {
                     warn!("Discovery stream error ({}); retrying in 3s", e2);
                 }
@@ -192,6 +187,7 @@ pub async fn start_le_monitor(
 #[cfg(target_os = "windows")]
 pub async fn start_le_monitor(
     dev_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
+    aacp: Arc<AacpManager>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     config: Arc<std::sync::RwLock<AppConfig>>,
 ) -> Result<(), String> {
@@ -268,6 +264,7 @@ pub async fn start_le_monitor(
                 &payload,
                 mac,
                 &dev_state,
+                &aacp,
                 &ui_tx,
                 &config,
                 &lid_tracker,
@@ -289,6 +286,7 @@ pub async fn start_le_monitor(
 async fn run_advertisement_monitor(
     adapter: &bluer::Adapter,
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
+    aacp: &Arc<AacpManager>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     config: &Arc<std::sync::RwLock<AppConfig>>,
     lid_tracker: &Arc<Mutex<LidTracker>>,
@@ -329,6 +327,7 @@ async fn run_advertisement_monitor(
                                     apple_data,
                                     addr.into(),
                                     dev_state,
+                                    aacp,
                                     ui_tx,
                                     config,
                                     lid_tracker,
@@ -340,6 +339,7 @@ async fn run_advertisement_monitor(
                             if let std::collections::hash_map::Entry::Vacant(entry) = active_devices.entry(addr) {
                                 let dev_c = dev.clone();
                                 let dev_state_c = dev_state.clone();
+                                let aacp_c = aacp.clone();
                                 let ui_tx_c = ui_tx.clone();
                                 let cfg_c = config.clone();
                                 let lid_c = lid_tracker.clone();
@@ -354,6 +354,7 @@ async fn run_advertisement_monitor(
                                                     apple_data,
                                                     addr.into(),
                                                     &dev_state_c,
+                                                    &aacp_c,
                                                     &ui_tx_c,
                                                     &cfg_c,
                                                     &lid_c,
@@ -402,6 +403,7 @@ async fn run_advertisement_monitor(
 async fn run_discovery_stream(
     adapter: &bluer::Adapter,
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
+    aacp: &Arc<AacpManager>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     config: &Arc<std::sync::RwLock<AppConfig>>,
     lid_tracker: &Arc<Mutex<LidTracker>>,
@@ -444,6 +446,7 @@ async fn run_discovery_stream(
                                 apple_data,
                                 addr.into(),
                                 dev_state,
+                                aacp,
                                 ui_tx,
                                 config,
                                 lid_tracker,
@@ -479,10 +482,45 @@ fn load_hex_key(hex_opt: Option<&str>) -> Option<[u8; 16]> {
     Some(out)
 }
 
+fn proximity_model_matches(
+    tracked: crate::core::models::AirPodsModel,
+    model_inferred: bool,
+    advertised: crate::core::models::AirPodsModel,
+) -> bool {
+    use crate::core::models::AirPodsModel;
+    if advertised == tracked {
+        return true;
+    }
+    if !model_inferred {
+        return false;
+    }
+    match tracked {
+        // Generic "AirPods" name fallback in infer_from_name defaults to AirPods3;
+        // accept any known AirPods model until refined.
+        AirPodsModel::AirPods3 => !matches!(advertised, AirPodsModel::Unknown(_)),
+        AirPodsModel::AirPodsPro1 => matches!(
+            advertised,
+            AirPodsModel::AirPodsPro1
+                | AirPodsModel::AirPodsPro2Lightning
+                | AirPodsModel::AirPodsPro2UsbC
+        ),
+        AirPodsModel::AirPodsMax => matches!(
+            advertised,
+            AirPodsModel::AirPodsMax | AirPodsModel::AirPodsMaxUsbC
+        ),
+        AirPodsModel::AirPods4Anc => matches!(
+            advertised,
+            AirPodsModel::AirPods4 | AirPodsModel::AirPods4Anc
+        ),
+        _ => false,
+    }
+}
+
 async fn parse_proximity_message(
     data: &[u8],
     device_addr: MacAddress,
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
+    aacp: &Arc<AacpManager>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     config: &Arc<std::sync::RwLock<AppConfig>>,
     lid_tracker: &Arc<Mutex<LidTracker>>,
@@ -605,9 +643,11 @@ async fn parse_proximity_message(
     let model_id = u16::from_le_bytes([data[3], data[4]]);
     let packet_model = crate::core::models::AirPodsModel::from_product_id(model_id);
 
+    let aacp_active = aacp.is_connected().await;
+
     let mut lock = dev_state.write().await;
     if let Some(ref mut state) = *lock {
-        let model_matches = packet_model == state.model;
+        let model_matches = proximity_model_matches(state.model, state.model_inferred, packet_model);
         let is_target = state.mac_address == addr_str
             || rpa_verified
             || (irk_opt.is_none() && model_matches);
@@ -620,65 +660,106 @@ async fn parse_proximity_message(
             return;
         }
 
+        if state.model_inferred
+            && !matches!(packet_model, crate::core::models::AirPodsModel::Unknown(_))
+        {
+            if packet_model != state.model {
+                info!(
+                    "Refined AirPods model from {:?} to {:?} via BLE proximity beacon",
+                    state.model, packet_model
+                );
+                state.model = packet_model;
+                state.capabilities = packet_model.capabilities();
+            }
+            state.model_inferred = false;
+        }
+
         info!(
-            "Accepted Apple Proximity packet from {} (rpa_verified={}, connected={}, lid_open={}, counter={})",
-            device_addr, rpa_verified, state.is_connected, lid_open, lid_counter
+            "Accepted Apple Proximity packet from {} (rpa_verified={}, connected={}, aacp={}, lid_open={}, counter={})",
+            device_addr, rpa_verified, state.is_connected, aacp_active, lid_open, lid_counter
         );
 
-        let old_both = state.is_wearing_both();
-        let old_any = state.is_wearing_any();
+        // When AACP is connected it is the authoritative source for battery and
+        // ear-detection state; overwriting with BLE proximity beacons causes
+        // quantized/stale flips and redundant UI refreshes.
+        if !aacp_active {
+            let before = (
+                state.battery_left,
+                state.battery_left_charging,
+                state.battery_right,
+                state.battery_right_charging,
+                state.battery_case,
+                state.battery_case_charging,
+                state.left_in_ear,
+                state.right_in_ear,
+            );
 
-        // Always update battery readings when reported by BLE proximity
-        if let Some(lb) = left_battery {
-            state.battery_left = Some(lb);
-            state.battery_left_charging = left_charging;
-        }
-        if let Some(rb) = right_battery {
-            state.battery_right = Some(rb);
-            state.battery_right_charging = right_charging;
-        }
-        if (lid_open || is_this_pod_in_case || !state.is_connected) && case_battery.is_some() {
-            state.battery_case = case_battery;
-            state.battery_case_charging = case_charging;
-        }
+            let old_both = state.is_wearing_both();
+            let old_any = state.is_wearing_any();
 
-        if !state.is_connected {
-            state.left_in_ear = EarStatus::Disconnected;
-            state.right_in_ear = EarStatus::Disconnected;
-        } else {
-            // In driverless mode (or before AACP has taken over), update in-ear status from BLE
-            state.left_in_ear = if left_in_ear { EarStatus::InEar } else { EarStatus::OutOfEar };
-            state.right_in_ear = if right_in_ear { EarStatus::InEar } else { EarStatus::OutOfEar };
+            if let Some(lb) = left_battery {
+                state.battery_left = Some(lb);
+                state.battery_left_charging = left_charging;
+            }
+            if let Some(rb) = right_battery {
+                state.battery_right = Some(rb);
+                state.battery_right_charging = right_charging;
+            }
+            if (lid_open || is_this_pod_in_case || !state.is_connected) && case_battery.is_some() {
+                state.battery_case = case_battery;
+                state.battery_case_charging = case_charging;
+            }
 
-            let new_both = state.is_wearing_both();
-            let new_any = state.is_wearing_any();
+            if !state.is_connected {
+                state.left_in_ear = EarStatus::Disconnected;
+                state.right_in_ear = EarStatus::Disconnected;
+            } else {
+                // Driverless mode (or before AACP connects): update in-ear status from BLE.
+                state.left_in_ear = if left_in_ear { EarStatus::InEar } else { EarStatus::OutOfEar };
+                state.right_in_ear = if right_in_ear { EarStatus::InEar } else { EarStatus::OutOfEar };
 
-            if let Ok(cfg) = config.read()
-                && cfg.ear_detection_enabled
-            {
-                match cfg.pause_behavior {
-                    crate::system::config::PauseBehavior::OneRemoved => {
-                        if old_both && !new_both {
-                            let _ = ui_tx.send(UiEvent::InEarPauseRequested);
-                        } else if !old_both && new_both {
-                            let _ = ui_tx.send(UiEvent::InEarResumeRequested);
+                let new_both = state.is_wearing_both();
+                let new_any = state.is_wearing_any();
+
+                if let Ok(cfg) = config.read()
+                    && cfg.ear_detection_enabled
+                {
+                    match cfg.pause_behavior {
+                        crate::system::config::PauseBehavior::OneRemoved => {
+                            if old_both && !new_both {
+                                let _ = ui_tx.send(UiEvent::InEarPauseRequested);
+                            } else if !old_both && new_both {
+                                let _ = ui_tx.send(UiEvent::InEarResumeRequested);
+                            }
                         }
-                    }
-                    crate::system::config::PauseBehavior::BothRemoved => {
-                        if old_any && !new_any {
-                            let _ = ui_tx.send(UiEvent::InEarPauseRequested);
-                        } else if !old_any && new_any {
-                            let _ = ui_tx.send(UiEvent::InEarResumeRequested);
+                        crate::system::config::PauseBehavior::BothRemoved => {
+                            if old_any && !new_any {
+                                let _ = ui_tx.send(UiEvent::InEarPauseRequested);
+                            } else if !old_any && new_any {
+                                let _ = ui_tx.send(UiEvent::InEarResumeRequested);
+                            }
                         }
+                        crate::system::config::PauseBehavior::Never => {}
                     }
-                    crate::system::config::PauseBehavior::Never => {}
                 }
+            }
+
+            let after = (
+                state.battery_left,
+                state.battery_left_charging,
+                state.battery_right,
+                state.battery_right_charging,
+                state.battery_case,
+                state.battery_case_charging,
+                state.left_in_ear,
+                state.right_in_ear,
+            );
+            if after != before {
+                let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state.clone()));
             }
         }
 
-        let wearing_any = left_in_ear || right_in_ear;
-
-        let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state.clone()));
+        let wearing_any = left_in_ear || right_in_ear || state.is_wearing_any();
 
         if popup_enabled {
             let transition = lid_tracker
@@ -798,5 +879,66 @@ mod tests {
             tracker.observe(true, 3, false, t0 + Duration::from_secs(70)),
             LidTransition::Opened
         );
+    }
+
+    #[test]
+    fn lid_tracker_does_not_reopen_when_counter_changes_while_lid_stays_open() {
+        let mut tracker = LidTracker::default();
+        let t0 = Instant::now();
+
+        assert_eq!(tracker.observe(true, 1, false, t0), LidTransition::Opened);
+        // Taking a bud out and putting it back into the already-open case increments
+        // the proximity counter while lid_open stays true; popup must NOT re-open.
+        assert_eq!(
+            tracker.observe(true, 1, false, t0 + Duration::from_secs(8)),
+            LidTransition::None
+        );
+        assert_eq!(
+            tracker.observe(true, 2, false, t0 + Duration::from_secs(12)),
+            LidTransition::None
+        );
+        // Only after an actual close -> open transition should it open again.
+        assert_eq!(
+            tracker.observe(false, 2, false, t0 + Duration::from_secs(14)),
+            LidTransition::Closed
+        );
+        assert_eq!(
+            tracker.observe(true, 3, false, t0 + Duration::from_secs(16)),
+            LidTransition::Opened
+        );
+    }
+
+    #[test]
+    fn inferred_model_matches_family_models_without_irk() {
+        use crate::core::models::AirPodsModel;
+        // "Alice's AirPods Pro" infers AirPodsPro1, must match Pro 2 USB-C when inferred.
+        assert!(proximity_model_matches(
+            AirPodsModel::AirPodsPro1,
+            true,
+            AirPodsModel::AirPodsPro2UsbC
+        ));
+        // Once model is confirmed (not inferred), mismatch is rejected.
+        assert!(!proximity_model_matches(
+            AirPodsModel::AirPodsPro1,
+            false,
+            AirPodsModel::AirPodsPro2UsbC
+        ));
+        // Generic "AirPods" fallback (AirPods3) accepts any known AirPods model when inferred.
+        assert!(proximity_model_matches(
+            AirPodsModel::AirPods3,
+            true,
+            AirPodsModel::AirPodsPro2UsbC
+        ));
+        // AirPods 4 family matches AirPods 4 variants, not unknown Apple/Beats PIDs.
+        assert!(proximity_model_matches(
+            AirPodsModel::AirPods4Anc,
+            true,
+            AirPodsModel::AirPods4
+        ));
+        assert!(!proximity_model_matches(
+            AirPodsModel::AirPods4Anc,
+            true,
+            AirPodsModel::Unknown(0x2017)
+        ));
     }
 }

@@ -80,19 +80,21 @@ const AZIMUTH_CENTRE_DEG: f32 = 0.0;
 /// left, 270 is right. The dataset is symmetric at 0 and 180 (equal energy in
 /// both ears), which is why only the off-axis rows prove the sign.
 ///
-/// ## Why the sign is negated
+/// ## Why the sign matches yaw
 ///
-/// Spatial audio keeps a source *固定的位置*: turning the head left must move the
-/// perceived source to the right of the head, which is what makes the stage feel
-/// like it stays put. [`HeadPose::yaw`] uses the opposite convention (positive is
-/// a turn to the right, see the compass), so the azimuth is `-yaw`.
+/// Spatial audio keeps a source *固定的位置*: turning the head right (+yaw,
+/// clockwise seen from above) turns the listener away from a fixed front source,
+/// placing the source to the listener's left in the head frame. In the SOFA
+/// coordinate system, azimuth is measured anti-clockwise from front (90 deg
+/// is left), so a source to the left of the head has a positive azimuth (+90).
+/// Therefore, turning right (+yaw) maps to positive azimuth (`azimuth = yaw`).
 pub fn azimuth_for_yaw(yaw_deg: f32) -> f32 {
     if !yaw_deg.is_finite() {
         return AZIMUTH_CENTRE_DEG;
     }
     // Keep the result in [0, 360) without the drift that repeated `+ 360.0`
     // accumulates on a value that is already in range.
-    let az = -yaw_deg;
+    let az = yaw_deg;
     az.rem_euclid(360.0)
 }
 
@@ -157,8 +159,9 @@ impl Default for StageAngles {
 ///
 /// In `HeadPose`:
 /// * `yaw_deg > 0` turns the head right (clockwise from above), so a fixed
-///   source rotates by `-yaw_deg` around `+Z` — matching [`azimuth_for_yaw`]
-///   exactly when `pitch` and `roll` are zero;
+///   source rotates anti-clockwise (towards the left, `+Y`) by `+yaw_deg`
+///   around `+Z` — matching [`azimuth_for_yaw`] exactly when `pitch` and
+///   `roll` are zero;
 /// * `pitch_deg > 0` tilts the head up, so a source in front (`+X`) moves down
 ///   (`-Z`, negative elevation) in the head frame;
 /// * `roll_deg > 0` tilts the head toward the right shoulder, lifting the left
@@ -183,7 +186,7 @@ pub fn speaker_for_pose(
     };
 
     // 1. Yaw in the horizontal plane around +Z.
-    let alpha = (speaker_offset_deg - yaw).to_radians();
+    let alpha = (speaker_offset_deg + yaw).to_radians();
     let (y1, x1) = alpha.sin_cos();
 
     // 2. Pitch around the head's lateral axis (+Y).
@@ -200,7 +203,7 @@ pub fn speaker_for_pose(
 
     let elevation = z3.clamp(-1.0, 1.0).asin().to_degrees();
     let azimuth = if x3 * x3 + y3 * y3 < 1e-12 {
-        (speaker_offset_deg - yaw).rem_euclid(360.0)
+        (speaker_offset_deg + yaw).rem_euclid(360.0)
     } else {
         y3.atan2(x3).to_degrees().rem_euclid(360.0)
     };
@@ -806,15 +809,15 @@ mod tests {
     fn the_sign_is_the_documented_one() {
         // Measurement (see `azimuth_for_yaw`): 90 degrees puts the source on the
         // listener's left. Turning the head right (+yaw) has to move the source
-        // to the head's left, so yaw and azimuth run in opposite directions.
+        // to the head's left, so yaw and azimuth run in the same direction.
         assert!(
-            (azimuth_for_yaw(30.0) - 330.0).abs() < 1e-4,
-            "turning right should send azimuth below 360, got {}",
+            (azimuth_for_yaw(30.0) - 30.0).abs() < 1e-4,
+            "turning right should send azimuth to 30 (left of head), got {}",
             azimuth_for_yaw(30.0)
         );
         assert!(
-            (azimuth_for_yaw(-30.0) - 30.0).abs() < 1e-4,
-            "turning left should send azimuth to 30, got {}",
+            (azimuth_for_yaw(-30.0) - 330.0).abs() < 1e-4,
+            "turning left should send azimuth to 330 (right of head), got {}",
             azimuth_for_yaw(-30.0)
         );
     }
@@ -872,7 +875,7 @@ mod tests {
     fn pure_yaw_matches_the_verified_azimuth_convention() {
         // With pitch and roll at zero, a 0-degree centre speaker must match
         // `azimuth_for_yaw` bit-for-bit, and the +/-30 speakers must shift by
-        // the exact same -yaw offset.
+        // the exact same +yaw offset.
         for yaw in [-90.0, -30.0, 0.0, 30.0, 90.0, 180.0] {
             let (centre_az, centre_el) = speaker_for_pose(0.0, yaw, 0.0, 0.0);
             assert!(
@@ -886,10 +889,10 @@ mod tests {
 
             let stage = stage_for_pose(yaw, 0.0, 0.0);
             assert!(
-                angle_between(stage.left_azimuth, (30.0 - yaw).rem_euclid(360.0)) < 1e-3
+                angle_between(stage.left_azimuth, (30.0 + yaw).rem_euclid(360.0)) < 1e-3
             );
             assert!(
-                angle_between(stage.right_azimuth, (-30.0 - yaw).rem_euclid(360.0)) < 1e-3
+                angle_between(stage.right_azimuth, (-30.0 + yaw).rem_euclid(360.0)) < 1e-3
             );
         }
     }

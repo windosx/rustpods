@@ -99,8 +99,16 @@ pub fn render_settings_page(
                 })
                 .child(setting_row(
                     p,
-                    &rust_i18n::t!("controls.mpris_integration"),
-                    Some(&rust_i18n::t!("controls.mpris_desc")),
+                    &if cfg!(target_os = "windows") {
+                        rust_i18n::t!("preferences.gsmtc_row_title")
+                    } else {
+                        rust_i18n::t!("controls.mpris_integration")
+                    },
+                    Some(&if cfg!(target_os = "windows") {
+                        rust_i18n::t!("preferences.windows_media_desc")
+                    } else {
+                        rust_i18n::t!("controls.mpris_desc")
+                    }),
                     Tag::success().outline().child(
                         div()
                             .flex()

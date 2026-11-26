@@ -135,6 +135,14 @@ impl Tray for RustPodsTray {
         let state_opt = state_guard.ok().and_then(|g| g.clone());
 
         if let Some(state) = state_opt {
+            if !state.is_connected {
+                return ToolTip {
+                    icon_name: "io.github.rustpods.RustPods".to_string(),
+                    icon_pixmap: vec![],
+                    title: format!("{} {}", state.name, rust_i18n::t!("tray.tag_disconnected")),
+                    description: rust_i18n::t!("tray.not_connected").to_string(),
+                };
+            }
             let l = state
                 .battery_left
                 .map(|v| format!("{}%", v))
@@ -205,35 +213,38 @@ impl Tray for RustPodsTray {
                 .into(),
             );
 
-            // Battery item
-            let l_str = state
-                .battery_left
-                .map(|v| format!("{}%", v))
-                .unwrap_or_else(|| "--".to_string());
-            let r_str = state
-                .battery_right
-                .map(|v| format!("{}%", v))
-                .unwrap_or_else(|| "--".to_string());
-            let c_str = state
-                .battery_case
-                .map(|v| format!("{}%", v))
-                .unwrap_or_else(|| rust_i18n::t!("tray.case_closed").to_string());
+            // Battery item (only when connected; disconnected BLE proximity readings
+            // are reserved for the case-open popup)
+            if state.is_connected {
+                let l_str = state
+                    .battery_left
+                    .map(|v| format!("{}%", v))
+                    .unwrap_or_else(|| "--".to_string());
+                let r_str = state
+                    .battery_right
+                    .map(|v| format!("{}%", v))
+                    .unwrap_or_else(|| "--".to_string());
+                let c_str = state
+                    .battery_case
+                    .map(|v| format!("{}%", v))
+                    .unwrap_or_else(|| rust_i18n::t!("tray.case_closed").to_string());
 
-            let batt_text = rust_i18n::t!(
-                "tray.battery_line",
-                left = l_str,
-                right = r_str,
-                case = c_str
-            )
-            .to_string();
-            menu.push(
-                StandardItem {
-                    label: batt_text,
-                    enabled: false,
-                    ..Default::default()
-                }
-                .into(),
-            );
+                let batt_text = rust_i18n::t!(
+                    "tray.battery_line",
+                    left = l_str,
+                    right = r_str,
+                    case = c_str
+                )
+                .to_string();
+                menu.push(
+                    StandardItem {
+                        label: batt_text,
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
 
             menu.push(MenuItem::Separator);
 
@@ -441,7 +452,7 @@ pub fn generate_circular_battery_icon(
                     data.extend_from_slice(&track_color);
                 }
             } else if dist < inner_r - 1.5 {
-                if charging {
+                if connected && charging {
                     // Draw central lightning bolt ⚡
                     if is_in_lightning_glyph(x, y, size) {
                         data.extend_from_slice(&[255, 52, 199, 89]);
@@ -540,6 +551,8 @@ pub fn create_hicon_from_icon(
 #[cfg(target_os = "windows")]
 const WM_TRAY_CALLBACK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 100;
 #[cfg(target_os = "windows")]
+pub const WM_TRAY_SHOW_MAIN: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 101;
+#[cfg(target_os = "windows")]
 const TRAY_ICON_ID: u32 = 1;
 #[cfg(target_os = "windows")]
 const TIMER_ID: usize = 1;
@@ -586,6 +599,10 @@ unsafe extern "system" fn tray_wndproc(
                 }
                 LRESULT(0)
             }
+            WM_TRAY_SHOW_MAIN => {
+                (tray.on_open_window)();
+                LRESULT(0)
+            }
             WM_COMMAND => {
                 let cmd_id = (wparam.0 & 0xffff) as u32;
                 handle_tray_command(cmd_id, tray);
@@ -593,6 +610,10 @@ unsafe extern "system" fn tray_wndproc(
             }
             WM_TIMER => {
                 update_tray_icon_and_tip(hwnd, tray);
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -751,7 +772,7 @@ unsafe fn update_tray_icon_and_tip(hwnd: windows::Win32::Foundation::HWND, tray:
 }
 
 #[cfg(target_os = "windows")]
-pub fn spawn_windows_tray(tray: Arc<RustPodsTray>) {
+pub fn spawn_windows_tray(tray: Arc<RustPodsTray>, has_gui: bool) {
     std::thread::Builder::new()
         .name("windows-tray".to_string())
         .spawn(move || unsafe {
@@ -764,6 +785,11 @@ pub fn spawn_windows_tray(tray: Arc<RustPodsTray>) {
             use windows::Win32::UI::WindowsAndMessaging::*;
 
             let class_name = w!("RustPodsTrayClass");
+            let window_title = if has_gui {
+                w!("RustPodsTrayWindow")
+            } else {
+                w!("RustPodsDaemonTrayWindow")
+            };
             let hinstance = HINSTANCE::default();
 
             let wnd_class = WNDCLASSW {
@@ -777,7 +803,7 @@ pub fn spawn_windows_tray(tray: Arc<RustPodsTray>) {
             let hwnd = match CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 class_name,
-                w!("RustPodsTrayWindow"),
+                window_title,
                 WS_OVERLAPPEDWINDOW,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -836,4 +862,30 @@ pub fn spawn_windows_tray(tray: Arc<RustPodsTray>) {
             let _ = Arc::from_raw(tray_raw);
         })
         .expect("Failed to spawn windows-tray thread");
+}
+
+#[cfg(target_os = "windows")]
+pub fn close_windows_tray() {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_DELETE, NOTIFYICONDATAW};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
+
+    for title in [w!("RustPodsTrayWindow"), w!("RustPodsDaemonTrayWindow")] {
+        if let Ok(hwnd) = unsafe { FindWindowW(w!("RustPodsTrayClass"), title) }
+            && !hwnd.is_invalid()
+            && !hwnd.0.is_null()
+        {
+            let nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: TRAY_ICON_ID,
+                ..Default::default()
+            };
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
 }

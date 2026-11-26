@@ -165,10 +165,19 @@ pub fn parse_aacp_packet(packet: &[u8]) -> Option<AacpEvent> {
                 offset += 5; // standard format: [comp] 01 [level] [status] 01
 
                 if let Some(comp) = BatteryComponent::from_u8(comp_byte) {
+                    let status = if level > 100 {
+                        debug!(
+                            "Ignoring out-of-range AACP battery level {} (status=0x{:02X}) for {:?}",
+                            level, status_byte, comp
+                        );
+                        BatteryStatus::Disconnected
+                    } else {
+                        BatteryStatus::from_u8(status_byte)
+                    };
                     list.push(SingleBatteryInfo {
                         component: comp,
                         level: level.min(100),
-                        status: BatteryStatus::from_u8(status_byte),
+                        status,
                     });
                 }
             }
@@ -451,6 +460,34 @@ mod tests {
                 assert_eq!(list[1].component, BatteryComponent::Right);
                 assert_eq!(list[1].level, 85);
                 assert_eq!(list[1].status, BatteryStatus::NotCharging);
+            }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_battery_info_treats_0xff_and_unknown_status_as_disconnected() {
+        // Opcode 0x04: count=3
+        // Left(0x04) level=76 status=Charging(1)
+        // Right(0x02) level=0xFF status=0x02 (invalid/unavailable level)
+        // Case(0x08) level=0 status=0x00 (unknown/transient status)
+        let packet = [
+            0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03, // count = 3
+            0x04, 0x01, 76, 0x01, 0x01,
+            0x02, 0x01, 0xFF, 0x02, 0x01,
+            0x08, 0x01, 0, 0x00, 0x01,
+        ];
+        let evt = parse_aacp_packet(&packet);
+        match evt {
+            Some(AacpEvent::Battery(list)) => {
+                assert_eq!(list.len(), 3);
+                assert_eq!(list[0].component, BatteryComponent::Left);
+                assert_eq!(list[0].level, 76);
+                assert_eq!(list[0].status, BatteryStatus::Charging);
+                assert_eq!(list[1].component, BatteryComponent::Right);
+                assert_eq!(list[1].status, BatteryStatus::Disconnected);
+                assert_eq!(list[2].component, BatteryComponent::Case);
+                assert_eq!(list[2].status, BatteryStatus::Disconnected);
             }
             other => panic!("Unexpected event: {:?}", other),
         }

@@ -115,17 +115,31 @@ impl RustPodsController {
                 }
             };
             let Some(mac_addr) = mac_addr else {
+                #[cfg(target_os = "windows")]
+                let _ = open::that("ms-settings:bluetooth");
                 let _ = tx.send(UiEvent::ConnectAttemptFinished);
                 return;
             };
             info!("Triggering connect to {}", mac_addr);
-            let ok = tokio::process::Command::new("bluetoothctl")
-                .arg("connect")
-                .arg(&mac_addr)
-                .output()
-                .await
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            let ok = if let Ok(parsed) = mac_addr.parse::<crate::core::models::MacAddress>() {
+                match crate::system::bluetooth::BluetoothManager::new().await {
+                    Ok(bm) => match bm.ensure_connected(parsed).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!("Bluetooth connect failed ({}): {}", mac_addr, e);
+                            #[cfg(target_os = "windows")]
+                            let _ = open::that("ms-settings:bluetooth");
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("BluetoothManager unavailable: {}", e);
+                        false
+                    }
+                }
+            } else {
+                false
+            };
             if ok {
                 // Give the Bluetooth daemon poll cycle time to observe the connection
                 // and emit ConnectedChanged(true) before clearing the loading state.
@@ -468,21 +482,42 @@ impl RustPodsController {
     /// with the lock already free.
     pub fn restart_app(&self) {
         let exe = crate::system::updater::restart_binary_path();
-        let pid = std::process::id().to_string();
         let exe = exe.to_string_lossy().into_owned();
-        let spawned = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec \"$2\"",
-                "rustpods-restart",
-                &pid,
-                &exe,
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .is_ok();
+        #[cfg(not(target_os = "windows"))]
+        let spawned = {
+            let pid = std::process::id().to_string();
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec \"$2\"",
+                    "rustpods-restart",
+                    &pid,
+                    &exe,
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .is_ok()
+        };
+        #[cfg(target_os = "windows")]
+        let spawned = {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            // Avoid `timeout.exe`, which exits immediately with an error when stdin is redirected to NUL.
+            std::process::Command::new("cmd")
+                .args(["/C", "ping", "-n", "3", "127.0.0.1"])
+                .arg("&&")
+                .arg("start")
+                .arg("")
+                .arg(&exe)
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .is_ok()
+        };
         if spawned {
             let _ = self.ui_tx.send(UiEvent::Quit);
         } else {

@@ -245,26 +245,40 @@ mod win_media {
         }
     }
 
-    pub fn try_gsmtc_pause() -> Option<String> {
-        let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-            .ok()?
-            .get()
-            .ok()?;
-        let session = manager.GetCurrentSession().ok()?;
-        let playback_info = session.GetPlaybackInfo().ok()?;
-        if playback_info.PlaybackStatus().ok()?
-            == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
+    pub enum GsmtcPauseResult {
+        Paused(String),
+        NotPlaying,
+        NoSession,
+    }
+
+    pub fn try_gsmtc_pause() -> GsmtcPauseResult {
+        let Ok(op) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync() else {
+            return GsmtcPauseResult::NoSession;
+        };
+        let Ok(manager) = op.get() else {
+            return GsmtcPauseResult::NoSession;
+        };
+        let Ok(session) = manager.GetCurrentSession() else {
+            return GsmtcPauseResult::NoSession;
+        };
+        let Ok(playback_info) = session.GetPlaybackInfo() else {
+            return GsmtcPauseResult::NotPlaying;
+        };
+        if playback_info.PlaybackStatus().ok()
+            == Some(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
         {
             let app_id = session
                 .SourceAppUserModelId()
                 .map(|h| h.to_string())
                 .unwrap_or_else(|_| "UnknownApp".to_string());
-            if let Ok(true) = session.TryPauseAsync().ok()?.get() {
+            if let Ok(op) = session.TryPauseAsync()
+                && op.get() == Ok(true)
+            {
                 info!("Paused Windows media session: {}", app_id);
-                return Some(app_id);
+                return GsmtcPauseResult::Paused(app_id);
             }
         }
-        None
+        GsmtcPauseResult::NotPlaying
     }
 
     pub fn try_gsmtc_resume() -> bool {
@@ -351,12 +365,14 @@ impl MprisController {
     pub async fn handle_ear_detection_pause(&self) {
         info!("Earbuds removed: auto-pausing media players (Windows)...");
         let paused_by_us = self.paused_by_us.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Some(app_id) = win_media::try_gsmtc_pause() {
+        let _ = tokio::task::spawn_blocking(move || match win_media::try_gsmtc_pause() {
+            win_media::GsmtcPauseResult::Paused(app_id) => {
                 if let Ok(mut set) = paused_by_us.try_lock() {
                     set.insert(app_id);
                 }
-            } else {
+            }
+            win_media::GsmtcPauseResult::NotPlaying => {}
+            win_media::GsmtcPauseResult::NoSession => {
                 win_media::send_media_key(win_media::VK_MEDIA_PLAY_PAUSE);
                 if let Ok(mut set) = paused_by_us.try_lock() {
                     set.insert("VK_MEDIA_KEY".to_string());

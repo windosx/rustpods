@@ -125,6 +125,8 @@ impl MainWindow {
             window.on_window_should_close(cx, move |_window, cx| {
                 let close_to_tray = state_close.read(cx).config_snapshot().close_to_tray;
                 if !close_to_tray {
+                    #[cfg(target_os = "windows")]
+                    crate::system::tray::close_windows_tray();
                     cx.quit();
                 }
                 true
@@ -841,6 +843,8 @@ impl Render for MainWindow {
                         if close_to_tray {
                             window.remove_window();
                         } else {
+                            #[cfg(target_os = "windows")]
+                            crate::system::tray::close_windows_tray();
                             cx.quit();
                         }
                     })

@@ -43,6 +43,18 @@ pub fn render_battery_card(state: &AirPodsDeviceState, p: &ApplePalette) -> impl
         ))
 }
 
+fn effective_battery_display(
+    level_opt: Option<u8>,
+    charging: bool,
+    is_connected: bool,
+) -> (Option<u8>, bool) {
+    if is_connected {
+        (level_opt, charging)
+    } else {
+        (None, false)
+    }
+}
+
 fn render_single_battery_column(
     title: &str,
     level_opt: Option<u8>,
@@ -52,11 +64,14 @@ fn render_single_battery_column(
     is_connected: bool,
     p: &ApplePalette,
 ) -> impl IntoElement {
-    let pct_str = format_center_text(level_opt);
-    let status_str = format_status_string(level_opt, charging, ear_status, is_case, is_connected);
-    let ring_color = ring_color_for(level_opt, charging, p);
+    let (display_level, display_charging) =
+        effective_battery_display(level_opt, charging, is_connected);
+    let pct_str = format_center_text(display_level);
+    let status_str =
+        format_status_string(display_level, display_charging, ear_status, is_case, is_connected);
+    let ring_color = ring_color_for(display_level, display_charging, p);
     let track_color = p.track_bg;
-    let status_color = if charging {
+    let status_color = if display_charging {
         p.accent_green
     } else {
         p.text_secondary
@@ -93,7 +108,7 @@ fn render_single_battery_column(
                             paint_battery_ring(
                                 window,
                                 bounds,
-                                level_opt,
+                                display_level,
                                 track_color,
                                 ring_color,
                             );
@@ -115,7 +130,7 @@ fn render_single_battery_column(
                                 .text_color(p.text_primary)
                                 .child(pct_str),
                         )
-                        .when(charging, |this| {
+                        .when(display_charging, |this| {
                             this.child(
                                 Icon::new(gpui_kit::assets::IconName::Zap)
                                     .size(px(11.))
@@ -244,27 +259,23 @@ fn format_status_string(
     is_case: bool,
     is_connected: bool,
 ) -> String {
+    if !is_connected {
+        return if level.is_none() {
+            if is_case {
+                rust_i18n::t!("battery.sleeping").to_string()
+            } else {
+                rust_i18n::t!("battery.waiting_connection").to_string()
+            }
+        } else {
+            rust_i18n::t!("battery.disconnected_status").to_string()
+        };
+    }
+
     if level.is_none() {
         return if is_case {
             rust_i18n::t!("battery.sleeping").to_string()
         } else {
             rust_i18n::t!("battery.waiting_connection").to_string()
-        };
-    }
-
-    if !is_connected {
-        return if charging {
-            if is_case {
-                rust_i18n::t!("battery.charging").to_string()
-            } else {
-                format!(
-                    "{} • {}",
-                    rust_i18n::t!("battery.charging"),
-                    rust_i18n::t!("battery.disconnected_status")
-                )
-            }
-        } else {
-            rust_i18n::t!("battery.disconnected_status").to_string()
         };
     }
 
@@ -325,25 +336,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disconnected_device_never_shows_in_use_or_worn() {
+    fn disconnected_device_hides_battery_level_and_charging() {
+        assert_eq!(effective_battery_display(Some(85), true, false), (None, false));
+        assert_eq!(effective_battery_display(Some(0), false, false), (None, false));
+        assert_eq!(effective_battery_display(Some(85), true, true), (Some(85), true));
+        assert_eq!(format_center_text(None), "--");
+    }
+
+    #[test]
+    fn disconnected_device_never_shows_in_use_worn_or_charging() {
         let s = format_status_string(Some(85), false, EarStatus::InEar, false, false);
         assert_eq!(s, rust_i18n::t!("battery.disconnected_status"));
 
         let s_charging = format_status_string(Some(85), true, EarStatus::InCase, false, false);
-        assert_eq!(
-            s_charging,
-            format!(
-                "{} • {}",
-                rust_i18n::t!("battery.charging"),
-                rust_i18n::t!("battery.disconnected_status")
-            )
-        );
+        assert_eq!(s_charging, rust_i18n::t!("battery.disconnected_status"));
 
         let s_case = format_status_string(Some(90), false, EarStatus::InCase, true, false);
         assert_eq!(s_case, rust_i18n::t!("battery.disconnected_status"));
 
         let s_none = format_status_string(None, false, EarStatus::Disconnected, false, false);
         assert_eq!(s_none, rust_i18n::t!("battery.waiting_connection"));
+
+        let s_case_none = format_status_string(None, false, EarStatus::InCase, true, false);
+        assert_eq!(s_case_none, rust_i18n::t!("battery.sleeping"));
     }
 
     #[test]

@@ -330,7 +330,7 @@ fn bootstrap_gui(
             on_quit: on_tray_quit,
         });
 
-        crate::system::tray::spawn_windows_tray(tray);
+        crate::system::tray::spawn_windows_tray(tray, true);
     }
 
     // Spawn Tokio background engines.
@@ -418,14 +418,11 @@ fn bootstrap_gui(
                     }
                     UiEvent::ConnectedChanged(connected) => {
                         state_ev.update(cx, |s, cx| {
-                            s.device.is_connected = connected;
                             if connected {
+                                s.device.is_connected = true;
                                 s.is_connecting = false;
                             } else {
-                                s.device.left_in_ear =
-                                    crate::core::aacp::events::EarStatus::Disconnected;
-                                s.device.right_in_ear =
-                                    crate::core::aacp::events::EarStatus::Disconnected;
+                                s.device.mark_disconnected();
                                 s.head_tracking.pose = None;
                                 s.head_tracking.calibrated = false;
                                 s.head_tracking.rate_hz = None;
@@ -479,6 +476,8 @@ fn bootstrap_gui(
                         });
                     }
                     UiEvent::Quit => {
+                        #[cfg(target_os = "windows")]
+                        crate::system::tray::close_windows_tray();
                         cx.update(|cx| cx.quit());
                     }
                 }
@@ -701,25 +700,26 @@ pub async fn run_audio_follow(
     let target = "127.0.0.1:4242";
     info!("OpenTrack UDP head pose broadcaster ready (target: {})", target);
 
+    let mut had_pose = false;
     while pose_rx.changed().await.is_ok() {
         let pose = *pose_rx.borrow_and_update();
         if let Some(pose) = pose {
             let mut buf = [0u8; 48];
-            let x: f64 = 0.0;
-            let y: f64 = 0.0;
-            let z: f64 = 0.0;
             let yaw: f64 = pose.yaw as f64;
             let pitch: f64 = pose.pitch as f64;
             let roll: f64 = pose.roll as f64;
 
-            buf[0..8].copy_from_slice(&x.to_le_bytes());
-            buf[8..16].copy_from_slice(&y.to_le_bytes());
-            buf[16..24].copy_from_slice(&z.to_le_bytes());
             buf[24..32].copy_from_slice(&yaw.to_le_bytes());
             buf[32..40].copy_from_slice(&pitch.to_le_bytes());
             buf[40..48].copy_from_slice(&roll.to_le_bytes());
 
             let _ = socket.send_to(&buf, target).await;
+            had_pose = true;
+        } else if had_pose {
+            // Reset OpenTrack consumer to neutral pose when stream stops or buds are removed.
+            let zero_buf = [0u8; 48];
+            let _ = socket.send_to(&zero_buf, target).await;
+            had_pose = false;
         }
     }
 }
@@ -743,11 +743,12 @@ pub async fn start_bluetooth_daemon(
     crate::core::nod_counter::set_sensitivity(config.read().unwrap().gesture_sensitivity);
 
     let dev_state_le = dev_state.clone();
+    let aacp_le = aacp.clone();
     let ui_tx_le = ui_tx.clone();
     let cfg_le = config.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            crate::system::le_monitor::start_le_monitor(dev_state_le, ui_tx_le, cfg_le).await
+            crate::system::le_monitor::start_le_monitor(dev_state_le, aacp_le, ui_tx_le, cfg_le).await
         {
             warn!("BLE Proximity Monitor error: {}", e);
         }
@@ -784,11 +785,12 @@ pub async fn start_bluetooth_daemon(
         && let Some(first_paired) = paired.first() {
             let mut lock = dev_state.write().await;
             if lock.is_none() {
-                let state = AirPodsDeviceState::new(
+                let mut state = AirPodsDeviceState::new(
                     first_paired.address.to_string(),
                     first_paired.name.clone(),
                     first_paired.model,
                 );
+                state.model_inferred = first_paired.model_inferred;
                 *lock = Some(state.clone());
                 let _ = ui_tx.send(UiEvent::DeviceStateUpdated(state));
             }
@@ -817,8 +819,11 @@ pub async fn start_bluetooth_daemon(
                         Some(existing) if existing.mac_address == pod.address.to_string() => {
                             let mut s = existing.clone();
                             s.name = pod.name.clone();
-                            s.model = pod.model;
-                            s.capabilities = pod.model.capabilities();
+                            if !pod.model_inferred || existing.model_inferred {
+                                s.model = pod.model;
+                                s.capabilities = pod.model.capabilities();
+                                s.model_inferred = pod.model_inferred;
+                            }
                             s.is_connected = true;
                             s.ear_detection_enabled = config.read().unwrap().ear_detection_enabled;
                             s
@@ -829,6 +834,7 @@ pub async fn start_bluetooth_daemon(
                                 pod.name.clone(),
                                 pod.model,
                             );
+                            s.model_inferred = pod.model_inferred;
                             s.is_connected = true;
                             s.ear_detection_enabled = config.read().unwrap().ear_detection_enabled;
                             s
@@ -939,14 +945,32 @@ pub async fn start_bluetooth_daemon(
                     match event {
                         AacpEvent::Battery(battery_list) => {
                             info!("Received Battery Info over AACP: {:?}", battery_list);
+                            let before = (
+                                current_state.battery_left,
+                                current_state.battery_left_charging,
+                                current_state.battery_right,
+                                current_state.battery_right_charging,
+                                current_state.battery_case,
+                                current_state.battery_case_charging,
+                            );
                             for b in battery_list {
                                 current_state.update_battery(b.component, b.level, b.status);
                             }
-                            {
-                                let mut lock = dev_state.write().await;
-                                *lock = Some(current_state.clone());
+                            let after = (
+                                current_state.battery_left,
+                                current_state.battery_left_charging,
+                                current_state.battery_right,
+                                current_state.battery_right_charging,
+                                current_state.battery_case,
+                                current_state.battery_case_charging,
+                            );
+                            if after != before {
+                                {
+                                    let mut lock = dev_state.write().await;
+                                    *lock = Some(current_state.clone());
+                                }
+                                let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
                             }
-                            let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
                         }
 
                         AacpEvent::EarDetection(ear_evt) => {
@@ -1101,15 +1125,11 @@ pub async fn start_bluetooth_daemon(
                     Err(_) => false,
                 };
                 if !still_connected {
-                    current_state.is_connected = false;
-                    current_state.left_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
-                    current_state.right_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
+                    current_state.mark_disconnected();
                     {
                         let mut lock = dev_state.write().await;
                         if let Some(ref mut state) = *lock {
-                            state.is_connected = false;
-                            state.left_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
-                            state.right_in_ear = crate::core::aacp::events::EarStatus::Disconnected;
+                            state.mark_disconnected();
                         }
                     }
                     let _ = ui_tx.send(UiEvent::DeviceStateUpdated(current_state.clone()));
@@ -1126,11 +1146,7 @@ pub async fn start_bluetooth_daemon(
                         let state = match lock.as_mut() {
                             Some(existing) if existing.mac_address == addr_str => {
                                 if existing.is_connected {
-                                    existing.is_connected = false;
-                                    existing.left_in_ear =
-                                        crate::core::aacp::events::EarStatus::Disconnected;
-                                    existing.right_in_ear =
-                                        crate::core::aacp::events::EarStatus::Disconnected;
+                                    existing.mark_disconnected();
                                     Some(existing.clone())
                                 } else {
                                     None
@@ -1142,6 +1158,7 @@ pub async fn start_bluetooth_daemon(
                                     first_paired.name.clone(),
                                     first_paired.model,
                                 );
+                                s.model_inferred = first_paired.model_inferred;
                                 s.is_connected = false;
                                 *lock = Some(s.clone());
                                 Some(s)

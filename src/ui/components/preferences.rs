@@ -26,12 +26,12 @@ pub fn render_preferences_page(
     let app_theme_dark = app_state.clone();
     let is_dark = state.theme_mode.is_dark();
     let media_title = if cfg!(target_os = "windows") {
-        "Windows 媒体与系统音频集成".to_string()
+        rust_i18n::t!("preferences.windows_media_title").into_owned()
     } else {
         rust_i18n::t!("controls.mpris_integration").into_owned()
     };
     let media_desc = if cfg!(target_os = "windows") {
-        "自动控制 Windows 本地媒体播放器暂停与恢复（支持网易云音乐、QQ音乐、Spotify、浏览器等）".to_string()
+        rust_i18n::t!("preferences.windows_media_desc").into_owned()
     } else {
         rust_i18n::t!("controls.mpris_desc").into_owned()
     };
@@ -218,14 +218,14 @@ pub fn render_preferences_page(
                 .child(setting_row(
                     p,
                     &rust_i18n::t!("preferences.firmware"),
-                    Some("A2564 • 65.1868046005000000.52 (官方 6A321 固件)"),
+                    Some(&rust_i18n::t!("preferences.firmware_value")),
                     div(),
                     true,
                 ))
                 .child(setting_row(
                     p,
                     &rust_i18n::t!("preferences.serial"),
-                    Some("主盒: CDGJFXHF63 | 左: GX6MGE30035Y | 右: GX6MGMWS0360"),
+                    Some(&rust_i18n::t!("preferences.serial_value")),
                     div(),
                     true,
                 )),
@@ -235,10 +235,10 @@ pub fn render_preferences_page(
             grouped_card(p)
                 .child(setting_row(
                     p,
-                    if cfg!(target_os = "windows") {
-                        "Windows 全局媒体传输控件 (GSMTC)"
+                    &if cfg!(target_os = "windows") {
+                        rust_i18n::t!("preferences.gsmtc_row_title")
                     } else {
-                        "D-Bus MPRIS 媒体联动"
+                        rust_i18n::t!("preferences.mpris_row_title")
                     },
                     Some(&media_desc),
                     Tag::success().outline().child(rust_i18n::t!("preferences.running")),
@@ -246,15 +246,15 @@ pub fn render_preferences_page(
                 ))
                 .child(setting_row(
                     p,
-                    if cfg!(target_os = "windows") {
-                        "Windows 核心音频 / A2DP"
+                    &if cfg!(target_os = "windows") {
+                        rust_i18n::t!("preferences.windows_audio_title")
                     } else {
-                        "PipeWire / PulseAudio 原生音频"
+                        rust_i18n::t!("preferences.linux_audio_title")
                     },
-                    Some(if cfg!(target_os = "windows") {
-                        "基于 Windows 核心音频渲染与蓝牙 A2DP 高清立体声音频流"
+                    Some(&if cfg!(target_os = "windows") {
+                        rust_i18n::t!("preferences.windows_audio_desc")
                     } else {
-                        "支持 A2DP 高清立体声音频流与无缝切换"
+                        rust_i18n::t!("preferences.linux_audio_desc")
                     }),
                     Tag::success().outline().child(rust_i18n::t!("preferences.normal")),
                     true,
@@ -329,6 +329,8 @@ pub fn render_preferences_page(
                         rust_i18n::t!("preferences.update_via_package_manager")
                     } else if can_self {
                         rust_i18n::t!("preferences.update_ready_hint")
+                    } else if cfg!(target_os = "windows") {
+                        rust_i18n::t!("preferences.update_via_windows_release")
                     } else {
                         rust_i18n::t!("preferences.update_via_script")
                     };

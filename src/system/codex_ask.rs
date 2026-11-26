@@ -27,6 +27,8 @@ pub const HOOK_MATCHER: &str =
 fn canonical_hook_entry(command: &str) -> serde_json::Value {
     let full_command = if command.contains(HOOK_ARG_MARKER) || command.contains("--zcode-ask-hook") {
         command.to_string()
+    } else if command.contains(' ') && !command.starts_with('"') {
+        format!("\"{}\" {}", command, HOOK_ARG_MARKER)
     } else {
         format!("{} {}", command, HOOK_ARG_MARKER)
     };
@@ -358,5 +360,15 @@ mod tests {
 
         let empty: Value = json!({});
         assert_eq!(hook_status_from(&empty), HookInstallStatus::NotInstalled);
+    }
+
+    #[test]
+    fn install_quotes_command_path_containing_spaces() {
+        let mut config: Value = json!({});
+        assert!(install_hook_into(&mut config, r"C:\Program Files\RustPods\rustpods.exe").unwrap());
+        assert_eq!(
+            config["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            r#""C:\Program Files\RustPods\rustpods.exe" --codex-ask-hook"#
+        );
     }
 }

@@ -483,6 +483,9 @@ mod tests {
         assert_eq!(rust_i18n::t!("hero.connecting", locale = "zh-CN"), "连接中...");
         assert_eq!(rust_i18n::t!("hero.connecting", locale = "en"), "Connecting...");
         assert_eq!(rust_i18n::t!("preferences.update_now", locale = "zh-CN"), "立即升级");
+        assert_eq!(rust_i18n::t!("preferences.mpris_row_title", locale = "zh-CN"), "D-Bus MPRIS 媒体联动");
+        assert_eq!(rust_i18n::t!("preferences.mpris_row_title", locale = "en"), "D-Bus MPRIS Media Control");
+        assert_eq!(rust_i18n::t!("preferences.linux_audio_title", locale = "en"), "PipeWire / PulseAudio Native Audio");
         assert_eq!(rust_i18n::t!("preferences.update_now", locale = "en"), "Update Now");
         assert_eq!(
             rust_i18n::t!("preferences.update_complete", version = "0.2.0", locale = "zh-CN"),

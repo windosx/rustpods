@@ -208,6 +208,9 @@ impl InstanceLock {
             .map_err(|e| format!("Failed to create session mutex: {}", e))?;
 
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
             return Err(
                 "Another RustPods engine (GUI or --no-gui daemon) is already running; only one can use the AACP session at a time".to_string()
             );
@@ -259,7 +262,14 @@ fn gui_already_running() -> bool {
     use windows::core::w;
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
     unsafe {
-        match FindWindowW(None, w!("RustPods")) {
+        let main_exists = match FindWindowW(None, w!("RustPods")) {
+            Ok(h) => !h.is_invalid() && !h.0.is_null(),
+            Err(_) => false,
+        };
+        if main_exists {
+            return true;
+        }
+        match FindWindowW(w!("RustPodsTrayClass"), w!("RustPodsTrayWindow")) {
             Ok(h) => !h.is_invalid() && !h.0.is_null(),
             Err(_) => false,
         }
@@ -288,7 +298,10 @@ fn activate_running_gui() -> bool {
 #[cfg(target_os = "windows")]
 fn activate_running_gui() -> bool {
     use windows::core::w;
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
     if let Ok(hwnd) = unsafe { FindWindowW(None, w!("RustPods")) }
         && !hwnd.is_invalid()
         && !hwnd.0.is_null()
@@ -298,6 +311,20 @@ fn activate_running_gui() -> bool {
             let _ = SetForegroundWindow(hwnd);
         }
         true
+    } else if let Ok(tray_hwnd) =
+        unsafe { FindWindowW(w!("RustPodsTrayClass"), w!("RustPodsTrayWindow")) }
+        && !tray_hwnd.is_invalid()
+        && !tray_hwnd.0.is_null()
+    {
+        unsafe {
+            PostMessageW(
+                tray_hwnd,
+                crate::system::tray::WM_TRAY_SHOW_MAIN,
+                WPARAM(0),
+                LPARAM(0),
+            )
+            .is_ok()
+        }
     } else {
         false
     }
@@ -618,7 +645,7 @@ fn main() {
                     let _ = tray.spawn().await;
                 });
                 #[cfg(target_os = "windows")]
-                system::tray::spawn_windows_tray(Arc::new(tray));
+                system::tray::spawn_windows_tray(Arc::new(tray), false);
             }
 
             // Consume UI events in background
@@ -656,6 +683,8 @@ fn main() {
                     info!("Shutdown requested from the tray");
                 }
             }
+            #[cfg(target_os = "windows")]
+            system::tray::close_windows_tray();
             info!("Daemon shutting down");
         });
     } else {
