@@ -27,7 +27,7 @@ RustPods 把 macOS 上习以为常的 AirPods 体验带到 Linux 与 Windows 桌
 它直接通过 L2CAP 与 Apple AACP 协议通信，不需要桥接守护进程、不需要给 BlueZ 打补丁，也不需要一台 Android 手机中转。
 
 > [!NOTE]
-> RustPods 仍处于早期阶段（v0.2.1）。头部追踪已在 AirPods 3 上通过 Apple RemoteHID 完成端到端验证；较新的型号使用 `src/core/head_tracking.rs` 中记录的载荷布局。遇到问题请[提交 issue](https://github.com/windosx/rustpods/issues)。
+> RustPods 仍处于早期阶段（v0.2.2）。头部追踪已在 AirPods 3 上通过 Apple RemoteHID 完成端到端验证；较新的型号使用 `src/core/head_tracking.rs` 中记录的载荷布局。遇到问题请[提交 issue](https://github.com/windosx/rustpods/issues)。
 
 ## 功能特性
 
