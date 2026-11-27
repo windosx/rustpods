@@ -5,20 +5,14 @@ use crate::core::device::AirPodsDeviceState;
 use crate::core::models::MacAddress;
 use crate::system::config::AppConfig;
 use crate::ui::UiEvent;
-#[cfg(target_os = "linux")]
 use bluer::monitor::{data_type, Monitor, MonitorEvent, Pattern, Type};
-#[cfg(target_os = "linux")]
 use bluer::{AdapterEvent, DiscoveryFilter, DiscoveryTransport, Session};
-#[cfg(target_os = "linux")]
 use futures::StreamExt;
-#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info};
-#[cfg(target_os = "linux")]
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 const POPUP_COOLDOWN: Duration = Duration::from_secs(5);
 const LID_SLEEP_RESET: Duration = Duration::from_secs(60);
@@ -120,7 +114,6 @@ pub async fn scan_gate(
     }
 }
 
-#[cfg(target_os = "linux")]
 pub async fn start_le_monitor(
     dev_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
     aacp: Arc<AacpManager>,
@@ -184,105 +177,11 @@ pub async fn start_le_monitor(
     }
 }
 
-#[cfg(target_os = "windows")]
-pub async fn start_le_monitor(
-    dev_state: Arc<RwLock<Option<AirPodsDeviceState>>>,
-    aacp: Arc<AacpManager>,
-    ui_tx: mpsc::UnboundedSender<UiEvent>,
-    config: Arc<std::sync::RwLock<AppConfig>>,
-) -> Result<(), String> {
-    use windows::Devices::Bluetooth::Advertisement::{
-        BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementWatcher,
-        BluetoothLEScanningMode,
-    };
-    use windows::Foundation::TypedEventHandler;
-    use windows::Storage::Streams::DataReader;
-
-    info!("Starting Windows WinRT BLE proximity monitor...");
-
-    let (watcher, mut adv_rx) = {
-        let watcher = BluetoothLEAdvertisementWatcher::new()
-            .map_err(|e| format!("Failed to create BluetoothLEAdvertisementWatcher: {}", e))?;
-
-        watcher
-            .SetScanningMode(BluetoothLEScanningMode::Active)
-            .map_err(|e| format!("Failed to set active scanning mode: {}", e))?;
-
-        let (adv_tx, adv_rx) = mpsc::unbounded_channel::<(Vec<u8>, MacAddress)>();
-
-        let handler = TypedEventHandler::new(
-            move |_sender: &Option<BluetoothLEAdvertisementWatcher>,
-                  args: &Option<BluetoothLEAdvertisementReceivedEventArgs>| {
-                if let Some(args) = args {
-                    let raw_addr = match args.BluetoothAddress() {
-                        Ok(addr) => addr,
-                        Err(_) => return Ok(()),
-                    };
-                    let b = raw_addr.to_be_bytes();
-                    let mac = MacAddress([b[2], b[3], b[4], b[5], b[6], b[7]]);
-
-                    if let Ok(adv) = args.Advertisement()
-                        && let Ok(mfg_list) = adv.ManufacturerData()
-                    {
-                        for section in mfg_list {
-                            if let Ok(company_id) = section.CompanyId()
-                                && company_id == 0x004c
-                                && let Ok(data_buf) = section.Data()
-                                && let Ok(reader) = DataReader::FromBuffer(&data_buf)
-                                && let Ok(len) = reader.UnconsumedBufferLength()
-                            {
-                                let mut buf = vec![0u8; len as usize];
-                                if reader.ReadBytes(&mut buf).is_ok() {
-                                    let _ = adv_tx.send((buf, mac));
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            },
-        );
-
-        let _token = watcher
-            .Received(&handler)
-            .map_err(|e| format!("Failed to register Received event handler: {}", e))?;
-
-        watcher
-            .Start()
-            .map_err(|e| format!("Failed to start BluetoothLEAdvertisementWatcher: {}", e))?;
-
-        (watcher, adv_rx)
-    };
-
-    info!("WinRT BLE Advertisement Watcher active");
-
-    let lid_tracker = Arc::new(Mutex::new(LidTracker::default()));
-
-    while let Some((payload, mac)) = adv_rx.recv().await {
-        if scan_gate(&dev_state, &config).await == ScanGate::Active {
-            parse_proximity_message(
-                &payload,
-                mac,
-                &dev_state,
-                &aacp,
-                &ui_tx,
-                &config,
-                &lid_tracker,
-            )
-            .await;
-        }
-    }
-
-    let _ = watcher.Stop();
-    Ok(())
-}
-
 /// Runs kernel/hardware pattern-matched monitoring via BlueZ AdvertisementMonitor1.
 ///
 /// This registers an offloaded pattern monitor matching Apple Manufacturer Specific Data
 /// (0x004C) with the 0x07 Proximity Pairing sub-type. It avoids running full-band active
 /// discovery, eliminating conflicts with BLE keyboards/mice reconnecting.
-#[cfg(target_os = "linux")]
 async fn run_advertisement_monitor(
     adapter: &bluer::Adapter,
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,
@@ -399,7 +298,6 @@ async fn run_advertisement_monitor(
 }
 
 /// Fallback discovery stream used when AdvertisementMonitor1 is unsupported.
-#[cfg(target_os = "linux")]
 async fn run_discovery_stream(
     adapter: &bluer::Adapter,
     dev_state: &Arc<RwLock<Option<AirPodsDeviceState>>>,

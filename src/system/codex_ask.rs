@@ -365,10 +365,10 @@ mod tests {
     #[test]
     fn install_quotes_command_path_containing_spaces() {
         let mut config: Value = json!({});
-        assert!(install_hook_into(&mut config, r"C:\Program Files\RustPods\rustpods.exe").unwrap());
+        assert!(install_hook_into(&mut config, "/opt/Rust Pods/rustpods").unwrap());
         assert_eq!(
             config["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            r#""C:\Program Files\RustPods\rustpods.exe" --codex-ask-hook"#
+            r#""/opt/Rust Pods/rustpods" --codex-ask-hook"#
         );
     }
 }

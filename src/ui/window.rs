@@ -94,6 +94,9 @@ pub struct MainWindow {
     mouse_deadzone_slider: Entity<SliderState>,
     last_synced_adaptive: u8,
     last_synced_language: crate::system::config::AppLanguage,
+    last_config_revision: u64,
+    last_feedback_seq: u64,
+    last_reset_confirm_seq: u64,
     adaptive_debounce_gen: u64,
     /// Debounce generations for the four head-mouse sliders (speed, accel,
     /// smoothing, deadzone). These sliders had no event subscription at all
@@ -125,8 +128,6 @@ impl MainWindow {
             window.on_window_should_close(cx, move |_window, cx| {
                 let close_to_tray = state_close.read(cx).config_snapshot().close_to_tray;
                 if !close_to_tray {
-                    #[cfg(target_os = "windows")]
-                    crate::system::tray::close_windows_tray();
                     cx.quit();
                 }
                 true
@@ -225,22 +226,89 @@ impl MainWindow {
 
         let mut subscriptions = Vec::new();
 
-        // Re-render window when background state changes, and keep slider/language synced.
+        // Re-render window when background state changes, and keep sliders/language/reset/feedback synced.
         subscriptions.push(cx.observe_in(&app_state, window, |this, state, window, cx| {
-            let (ext_adaptive, ext_lang) = {
+            let (
+                ext_adaptive,
+                cfg,
+                config_rev,
+                theme_mode,
+                feedback_seq,
+                has_feedback,
+                reset_seq,
+                confirm_reset,
+            ) = {
                 let s = state.read(cx);
-                (s.device.adaptive_strength, s.config_snapshot().language)
+                (
+                    s.device.adaptive_strength,
+                    s.config_snapshot(),
+                    s.config_revision,
+                    s.theme_mode,
+                    s.feedback_seq,
+                    s.settings_feedback.is_some(),
+                    s.reset_confirm_seq,
+                    s.confirm_reset,
+                )
             };
+
             if ext_adaptive != this.last_synced_adaptive {
                 this.last_synced_adaptive = ext_adaptive;
                 this.adaptive_slider.update(cx, |s, cx| {
                     s.set_value(ext_adaptive as f32, window, cx);
                 });
             }
-            if ext_lang != this.last_synced_language {
-                this.last_synced_language = ext_lang;
+
+            if config_rev != this.last_config_revision {
+                this.last_config_revision = config_rev;
+                this.last_synced_language = cfg.language;
+                apply_apple_theme(theme_mode, cx);
+                this.rebuild_selects(window, cx);
+                this.mouse_speed_slider.update(cx, |s, cx| {
+                    s.set_value(cfg.head_mouse_speed, window, cx);
+                });
+                this.mouse_accel_slider.update(cx, |s, cx| {
+                    s.set_value(cfg.head_mouse_accel, window, cx);
+                });
+                this.mouse_smooth_slider.update(cx, |s, cx| {
+                    s.set_value(cfg.head_mouse_smoothing, window, cx);
+                });
+                this.mouse_deadzone_slider.update(cx, |s, cx| {
+                    s.set_value(cfg.head_mouse_deadzone, window, cx);
+                });
+            } else if cfg.language != this.last_synced_language {
+                this.last_synced_language = cfg.language;
                 this.rebuild_selects(window, cx);
             }
+
+            if has_feedback && feedback_seq != this.last_feedback_seq {
+                this.last_feedback_seq = feedback_seq;
+                let app_fb = state.clone();
+                cx.spawn(async move |_this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(2200))
+                        .await;
+                    app_fb.update(cx, |s, cx| {
+                        if s.clear_settings_feedback(Some(feedback_seq)) {
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+
+            if confirm_reset && reset_seq != this.last_reset_confirm_seq {
+                this.last_reset_confirm_seq = reset_seq;
+                let app_reset = state.clone();
+                cx.spawn(async move |_this, cx| {
+                    cx.background_executor().timer(Duration::from_secs(5)).await;
+                    app_reset.update(cx, |s, cx| {
+                        s.expire_reset_confirm(reset_seq);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+
             cx.notify();
         }));
 
@@ -326,6 +394,9 @@ impl MainWindow {
             mouse_deadzone_slider,
             last_synced_adaptive: initial_adaptive,
             last_synced_language: cfg.language,
+            last_config_revision: 0,
+            last_feedback_seq: 0,
+            last_reset_confirm_seq: 0,
             adaptive_debounce_gen: 0,
             mouse_slider_gens: [0; 4],
             _subscriptions: subscriptions,
@@ -419,6 +490,7 @@ impl MainWindow {
                     };
                     app_pause.update(cx, |s, cx| {
                         s.controller.change_pause_behavior(behavior);
+                        s.notify_saved();
                         cx.notify();
                     });
                 },
@@ -441,6 +513,7 @@ impl MainWindow {
                     app_mic.update(cx, |s, cx| {
                         s.device.mic_mode = mode;
                         s.controller.change_mic_mode(mode);
+                        s.notify_saved();
                         cx.notify();
                     });
                 },
@@ -458,6 +531,7 @@ impl MainWindow {
                     let level = (row as u8) + 1;
                     app_sens.update(cx, |s, cx| {
                         s.controller.set_gesture_sensitivity(level);
+                        s.notify_saved();
                         cx.notify();
                     });
                 },
@@ -478,6 +552,7 @@ impl MainWindow {
                     };
                     app_mode.update(cx, |s, cx| {
                         s.controller.set_head_mouse_mode(mode);
+                        s.notify_saved();
                         cx.notify();
                     });
                 },
@@ -498,6 +573,7 @@ impl MainWindow {
                         .unwrap_or(crate::system::config::AppLanguage::Auto);
                     app_lang.update(cx, |s, cx| {
                         s.controller.set_language(lang);
+                        s.notify_saved();
                         cx.notify();
                     });
                 },
@@ -720,7 +796,7 @@ impl Render for MainWindow {
                                         };
                                         apply_apple_theme(next, cx);
                                         app_for_theme.update(cx, |s, cx| {
-                                            s.theme_mode = next;
+                                            s.apply_theme_mode(next);
                                             cx.notify();
                                         });
                                     }),
@@ -734,12 +810,16 @@ impl Render for MainWindow {
             std::rc::Rc::new(move |_window: &mut Window, cx: &mut App| {
                 view.update(cx, |_this, cx| {
                     cx.spawn(async move |this, cx| {
-                        let res = tokio::task::spawn_blocking(crate::system::head_mouse::grant_uinput_permission_pkexec)
-                            .await
-                            .unwrap_or_else(|e| Err(format!("任务执行异常: {}", e)));
+                        let res = tokio::task::spawn_blocking(
+                            crate::system::head_mouse::grant_uinput_permission_pkexec,
+                        )
+                        .await
+                        .unwrap_or_else(|e| Err(format!("任务执行异常: {}", e)));
 
                         let _ = this.update(cx, |this, cx| {
-                            if res.is_ok() && crate::system::head_mouse::UinputStatus::probe().is_available() {
+                            if res.is_ok()
+                                && crate::system::head_mouse::UinputStatus::probe().is_available()
+                            {
                                 this.app_state.update(cx, |s, cx| {
                                     s.controller.toggle_head_mouse(true);
                                     cx.notify();
@@ -843,8 +923,6 @@ impl Render for MainWindow {
                         if close_to_tray {
                             window.remove_window();
                         } else {
-                            #[cfg(target_os = "windows")]
-                            crate::system::tray::close_windows_tray();
                             cx.quit();
                         }
                     })

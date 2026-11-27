@@ -58,6 +58,30 @@ pub enum HeadMouseCommand {
     SetScroll(bool),
     Click(MouseButton),
     Recenter,
+    SyncConfig,
+}
+
+fn reconcile_head_mouse_state(
+    enabled: bool,
+    has_device: bool,
+    driver_ready: bool,
+    has_pose: bool,
+    paused: bool,
+    scroll_mode: bool,
+) -> HeadMouseState {
+    if !enabled {
+        HeadMouseState::Disabled
+    } else if !has_device && !driver_ready {
+        HeadMouseState::PermissionDenied
+    } else if !has_pose {
+        HeadMouseState::Disconnected
+    } else if paused {
+        HeadMouseState::Paused
+    } else if scroll_mode {
+        HeadMouseState::ScrollMode
+    } else {
+        HeadMouseState::Active
+    }
 }
 
 /// Global hub for dispatching head mouse commands and observing status.
@@ -126,7 +150,10 @@ pub async fn run_head_mouse_controller(
     // Tuning copied out of the config; only the small [`HeadMouseParams`] is
     // cloned, never the whole AppConfig, and the 120 Hz render tick reads a
     // single bool instead of taking a full snapshot.
-    let mut params = AppConfig::default().head_mouse_params();
+    let mut params = config
+        .read()
+        .map(|c| c.head_mouse_params())
+        .unwrap_or_else(|_| AppConfig::default().head_mouse_params());
     let mut last_smoothing: Option<f32> = None;
     let mut engine_mode = params.mode;
     // A click whose press went out and whose release is pending, so the
@@ -140,6 +167,15 @@ pub async fn run_head_mouse_controller(
     let mut current_vel: (f32, f32) = (0.0, 0.0);
 
     let mut render_ticker = tokio::time::interval(Duration::from_micros(8333)); // ~120 Hz
+
+    HEAD_MOUSE.set_state(reconcile_head_mouse_state(
+        params.enabled,
+        false,
+        UinputStatus::probe().is_available(),
+        pose_rx.borrow().is_some(),
+        paused,
+        scroll_mode,
+    ));
 
     info!("Head mouse background controller started");
 
@@ -293,7 +329,14 @@ pub async fn run_head_mouse_controller(
                     .read()
                     .map(|c| c.head_mouse_enabled)
                     .unwrap_or(false);
-                if !enabled || paused || scroll_mode {
+                if !enabled {
+                    flush_release!();
+                    device = None;
+                    current_vel = (0.0, 0.0);
+                    HEAD_MOUSE.set_state(HeadMouseState::Disabled);
+                    continue;
+                }
+                if paused || scroll_mode {
                     continue;
                 }
 
@@ -333,22 +376,54 @@ pub async fn run_head_mouse_controller(
                         paused = !paused;
                         current_vel = (0.0, 0.0);
                         engine.reset();
+                        HEAD_MOUSE.set_state(reconcile_head_mouse_state(
+                            params.enabled,
+                            device.is_some(),
+                            UinputStatus::probe().is_available(),
+                            pose_rx.borrow().is_some(),
+                            paused,
+                            scroll_mode,
+                        ));
                         info!("Head mouse pause toggled: paused = {}", paused);
                     }
                     HeadMouseCommand::SetPaused(p) => {
                         paused = p;
                         current_vel = (0.0, 0.0);
                         engine.reset();
+                        HEAD_MOUSE.set_state(reconcile_head_mouse_state(
+                            params.enabled,
+                            device.is_some(),
+                            UinputStatus::probe().is_available(),
+                            pose_rx.borrow().is_some(),
+                            paused,
+                            scroll_mode,
+                        ));
                         info!("Head mouse set paused = {}", paused);
                     }
                     HeadMouseCommand::ToggleScroll => {
                         scroll_mode = !scroll_mode;
                         current_vel = (0.0, 0.0);
+                        HEAD_MOUSE.set_state(reconcile_head_mouse_state(
+                            params.enabled,
+                            device.is_some(),
+                            UinputStatus::probe().is_available(),
+                            pose_rx.borrow().is_some(),
+                            paused,
+                            scroll_mode,
+                        ));
                         info!("Head mouse scroll mode toggled: scroll = {}", scroll_mode);
                     }
                     HeadMouseCommand::SetScroll(s) => {
                         scroll_mode = s;
                         current_vel = (0.0, 0.0);
+                        HEAD_MOUSE.set_state(reconcile_head_mouse_state(
+                            params.enabled,
+                            device.is_some(),
+                            UinputStatus::probe().is_available(),
+                            pose_rx.borrow().is_some(),
+                            paused,
+                            scroll_mode,
+                        ));
                         info!("Head mouse set scroll = {}", scroll_mode);
                     }
                     HeadMouseCommand::Click(btn) => {
@@ -362,10 +437,96 @@ pub async fn run_head_mouse_controller(
                         engine.reset();
                         info!("Head mouse recentered");
                     }
+                    HeadMouseCommand::SyncConfig => {
+                        params = config
+                            .read()
+                            .map(|c| c.head_mouse_params())
+                            .unwrap_or(params);
+                        if !params.enabled {
+                            flush_release!();
+                            device = None;
+                            current_vel = (0.0, 0.0);
+                            engine.reset();
+                        }
+                        HEAD_MOUSE.set_state(reconcile_head_mouse_state(
+                            params.enabled,
+                            device.is_some(),
+                            UinputStatus::probe().is_available(),
+                            pose_rx.borrow().is_some(),
+                            paused,
+                            scroll_mode,
+                        ));
+                        debug!(
+                            "Head mouse synced config: enabled={}, state={:?}",
+                            params.enabled,
+                            HEAD_MOUSE.state()
+                        );
+                    }
                 }
             }
         }
     }
 
     info!("Head mouse controller stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconcile_state_covers_all_transitions() {
+        assert_eq!(
+            reconcile_head_mouse_state(false, true, true, true, false, false),
+            HeadMouseState::Disabled
+        );
+        assert_eq!(
+            reconcile_head_mouse_state(true, false, false, false, false, false),
+            HeadMouseState::PermissionDenied
+        );
+        assert_eq!(
+            reconcile_head_mouse_state(true, false, true, false, false, false),
+            HeadMouseState::Disconnected
+        );
+        assert_eq!(
+            reconcile_head_mouse_state(true, true, true, true, true, false),
+            HeadMouseState::Paused
+        );
+        assert_eq!(
+            reconcile_head_mouse_state(true, true, true, true, false, true),
+            HeadMouseState::ScrollMode
+        );
+        assert_eq!(
+            reconcile_head_mouse_state(true, true, true, true, false, false),
+            HeadMouseState::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_config_transitions_without_pose_samples() {
+        let (_pose_tx, pose_rx) = watch::channel(None);
+        let cfg = Arc::new(RwLock::new(AppConfig::default()));
+        let handle = tokio::spawn(run_head_mouse_controller(pose_rx, cfg.clone()));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(HEAD_MOUSE.state(), HeadMouseState::Disabled);
+
+        cfg.write().unwrap().head_mouse_enabled = true;
+        HEAD_MOUSE.send_command(HeadMouseCommand::SyncConfig);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let expected_enabled = if UinputStatus::probe().is_available() {
+            HeadMouseState::Disconnected
+        } else {
+            HeadMouseState::PermissionDenied
+        };
+        assert_eq!(HEAD_MOUSE.state(), expected_enabled);
+
+        cfg.write().unwrap().head_mouse_enabled = false;
+        HEAD_MOUSE.send_command(HeadMouseCommand::SyncConfig);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(HEAD_MOUSE.state(), HeadMouseState::Disabled);
+
+        drop(_pose_tx);
+        let _ = handle.await;
+    }
 }

@@ -333,7 +333,7 @@ impl Default for FilterPlan {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "audio-follow"))]
+#[cfg(feature = "audio-follow")]
 pub use pipewire_link::{HrtfClient, HrtfCommand};
 
 /// The PipeWire side: binds the filter-chain node and writes stage angles to it.
@@ -352,7 +352,7 @@ pub use pipewire_link::{HrtfClient, HrtfCommand};
 /// *second*, unrelated node: every write succeeded and went nowhere. The
 /// difference is invisible from the API - both return a working `Node` - and
 /// only showed up when the node's Props were read back with `enum_params`.
-#[cfg(all(target_os = "linux", feature = "audio-follow"))]
+#[cfg(feature = "audio-follow")]
 mod pipewire_link {
     use std::cell::RefCell;
     use std::rc::Rc;

@@ -90,6 +90,12 @@ pub fn render_head_tracking_card(ht: &HeadTrackingViewState, p: &ApplePalette) -
         )
         .child(
             div()
+                .text_size(px(12.))
+                .text_color(p.text_muted)
+                .child(rust_i18n::t!("spatial.desc")),
+        )
+        .child(
+            div()
                 .text_size(px(12.5))
                 .text_color(p.text_secondary)
                 .child(ht.status.clone()),

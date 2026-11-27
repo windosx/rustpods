@@ -1,14 +1,14 @@
 use crate::system::agent_hooks::{registered_agents, HookInstallStatus};
 use crate::system::zcode_ask::AskReply;
-use crate::ui::state::RustPodsState;
-use crate::ui::theme::{grouped_card, section_header, setting_row, ApplePalette};
-use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants as _};
-use gpui_kit::component::select::{Select, SelectState};
-use gpui_kit::component::switch::Switch;
-use gpui_kit::component::tag::Tag;
-use gpui_kit::{
-    div, px, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _,
+use crate::ui::components::setting_rows::{
+    action_row, feedback_banner, page_header, select_row, toggle_row, SettingGroup,
 };
+use crate::ui::state::RustPodsState;
+use crate::ui::theme::{section_header, ApplePalette, SELECT_W_MD};
+use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::select::SelectState;
+use gpui_kit::component::tag::Tag;
+use gpui_kit::{div, px, Entity, IntoElement, ParentElement as _, Styled as _};
 
 pub fn render_agents_page(
     state: &RustPodsState,
@@ -19,16 +19,14 @@ pub fn render_agents_page(
     let cfg = state.config_snapshot();
     let app_toggle = app_state.clone();
 
-    let mut agents_group = grouped_card(p);
+    let mut agents_group = SettingGroup::new(p);
     for (idx, agent) in registered_agents().iter().enumerate() {
-        let with_divider = idx > 0;
         if !agent.available {
-            agents_group = agents_group.child(setting_row(
+            agents_group = agents_group.row(action_row(
                 p,
                 agent.display_name,
                 Some(agent.description),
                 Tag::secondary().child(rust_i18n::t!("agents.coming_soon")),
-                with_divider,
             ));
             continue;
         }
@@ -41,7 +39,9 @@ pub fn render_agents_page(
             note.clone()
         } else {
             match &status {
-                HookInstallStatus::Installed(cmd) => format!("{} · {}", rust_i18n::t!("agents.installed"), cmd),
+                HookInstallStatus::Installed(cmd) => {
+                    format!("{} · {}", rust_i18n::t!("agents.installed"), cmd)
+                }
                 HookInstallStatus::NotInstalled => rust_i18n::t!("agents.not_installed").to_string(),
                 HookInstallStatus::ConfigUnreadable(e) => format!("Config error: {}", e),
             }
@@ -54,6 +54,7 @@ pub fn render_agents_page(
         let controls = div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .gap(px(8.))
             .child(
@@ -107,13 +108,17 @@ pub fn render_agents_page(
             .child(
                 Button::new(("agent-install", idx))
                     .with_variant(if is_installed {
-                        gpui_kit::component::button::ButtonVariant::Secondary
+                        ButtonVariant::Secondary
                     } else {
-                        gpui_kit::component::button::ButtonVariant::Primary
+                        ButtonVariant::Primary
                     })
                     .compact()
                     .rounded(ButtonRounded::Size(px(999.)))
-                    .label(if is_installed { rust_i18n::t!("agents.uninstall") } else { rust_i18n::t!("agents.install") })
+                    .label(if is_installed {
+                        rust_i18n::t!("agents.uninstall")
+                    } else {
+                        rust_i18n::t!("agents.install")
+                    })
                     .on_click(move |_, _, cx| {
                         let installed_now =
                             matches!(agent.status(), HookInstallStatus::Installed(_));
@@ -144,70 +149,73 @@ pub fn render_agents_page(
                     }),
             );
 
-        agents_group = agents_group.child(setting_row(
+        agents_group = agents_group.row(action_row(
             p,
             agent.display_name,
             Some(&subtitle),
             controls,
-            with_divider,
         ));
     }
+
+    let feedback = state
+        .settings_feedback
+        .as_ref()
+        .map(|fb| feedback_banner(p, &fb.message, fb.is_error).into_any_element());
+
+    let sens_desc = if cfg.gesture_permission_answers_enabled {
+        rust_i18n::t!("agents.sensitivity_desc")
+    } else {
+        rust_i18n::t!("settings.disabled_requires_permission_answers")
+    };
 
     div()
         .w_full()
         .flex()
         .flex_col()
         .gap(px(16.))
+        .child(page_header(
+            p,
+            &rust_i18n::t!("agents.title"),
+            Some(&rust_i18n::t!("agents.desc")),
+            feedback,
+        ))
+        .child(section_header(
+            p,
+            &rust_i18n::t!("agents.permission_answers"),
+            None,
+        ))
         .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .px(px(4.))
-                .child(
-                    div()
-                        .text_size(px(20.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(p.text_primary)
-                        .child(rust_i18n::t!("agents.title")),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.5))
-                        .text_color(p.text_secondary)
-                        .child(rust_i18n::t!("agents.desc")),
-                ),
-        )
-        .child(section_header(p, &rust_i18n::t!("agents.permission_answers"), None))
-        .child(
-            grouped_card(p)
-                .child(setting_row(
+            SettingGroup::new(p)
+                .row(toggle_row(
                     p,
+                    "gesture-permission-answers-switch",
                     &rust_i18n::t!("agents.permission_answers"),
                     Some(&rust_i18n::t!("agents.permission_answers_desc")),
-                    Switch::new("gesture-permission-answers-switch")
-                        .checked(cfg.gesture_permission_answers_enabled)
-                        .on_change(move |checked, _, cx| {
-                            let val = *checked;
-                            app_toggle.update(cx, |s, cx| {
-                                s.controller.toggle_gesture_permission_answers(val);
-                                cx.notify();
-                            });
-                        }),
+                    cfg.gesture_permission_answers_enabled,
                     false,
+                    move |checked, _, cx| {
+                        let val = *checked;
+                        app_toggle.update(cx, |s, cx| {
+                            s.controller.toggle_gesture_permission_answers(val);
+                            s.notify_saved();
+                            cx.notify();
+                        });
+                    },
                 ))
-                .child(setting_row(
+                .row(select_row(
                     p,
                     &rust_i18n::t!("agents.sensitivity"),
-                    Some(&rust_i18n::t!("agents.sensitivity_desc")),
-                    Select::new(sensitivity_select).w(px(170.)),
-                    true,
-                )),
+                    Some(&sens_desc),
+                    sensitivity_select,
+                    SELECT_W_MD,
+                    !cfg.gesture_permission_answers_enabled,
+                ))
+                .build(),
         )
         .child(section_header(
             p,
             &rust_i18n::t!("agents.hook_title"),
             None,
         ))
-        .child(agents_group)
+        .child(agents_group.build())
 }

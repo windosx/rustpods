@@ -1,10 +1,10 @@
 use crate::system::head_mouse::{HeadMouseCommand, HeadMouseState, UinputStatus, HEAD_MOUSE};
+use crate::ui::components::setting_rows::{
+    action_row, feedback_banner, page_header, select_row, slider_row, toggle_row, SettingGroup,
+};
 use crate::ui::state::RustPodsState;
-use crate::ui::theme::{grouped_card, section_header, setting_row, ApplePalette};
+use crate::ui::theme::{section_header, ApplePalette, SELECT_W_MD};
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::select::Select;
-use gpui_kit::component::slider::Slider;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::{div, px, App, Entity, IntoElement, ParentElement as _, Styled as _, Window};
 use std::rc::Rc;
@@ -46,14 +46,38 @@ pub fn render_head_mouse_page(
     let app_pause = app_state.clone();
     let app_scroll = app_state.clone();
 
-    let status_tag = match runtime_state {
-        HeadMouseState::Active => Tag::success().outline().child(rust_i18n::t!("head_mouse.status_running")),
-        HeadMouseState::Paused => Tag::warning().outline().child(rust_i18n::t!("head_mouse.status_paused")),
-        HeadMouseState::ScrollMode => Tag::primary().outline().child(rust_i18n::t!("head_mouse.status_scrolling")),
-        HeadMouseState::PermissionDenied => Tag::danger().outline().child(rust_i18n::t!("head_mouse.status_unauthorized")),
-        HeadMouseState::Disconnected => Tag::secondary().outline().child(rust_i18n::t!("head_mouse.status_disconnected")),
-        HeadMouseState::Disabled => Tag::secondary().child(rust_i18n::t!("head_mouse.status_disabled")),
+    let status_tag = if cfg.head_mouse_enabled && runtime_state == HeadMouseState::Disabled {
+        Tag::secondary()
+            .outline()
+            .child(rust_i18n::t!("head_mouse.status_disconnected"))
+    } else {
+        match runtime_state {
+            HeadMouseState::Active => {
+                Tag::success().outline().child(rust_i18n::t!("head_mouse.status_running"))
+            }
+            HeadMouseState::Paused => {
+                Tag::warning().outline().child(rust_i18n::t!("head_mouse.status_paused"))
+            }
+            HeadMouseState::ScrollMode => {
+                Tag::primary().outline().child(rust_i18n::t!("head_mouse.status_scrolling"))
+            }
+            HeadMouseState::PermissionDenied => Tag::danger()
+                .outline()
+                .child(rust_i18n::t!("head_mouse.status_unauthorized")),
+            HeadMouseState::Disconnected => Tag::secondary()
+                .outline()
+                .child(rust_i18n::t!("head_mouse.status_disconnected")),
+            HeadMouseState::Disabled => {
+                Tag::secondary().child(rust_i18n::t!("head_mouse.status_disabled"))
+            }
+        }
     };
+
+    let header_trailing = state
+        .settings_feedback
+        .as_ref()
+        .map(|fb| feedback_banner(p, &fb.message, fb.is_error).into_any_element())
+        .or_else(|| Some(status_tag.into_any_element()));
 
     let is_paused = runtime_state == HeadMouseState::Paused;
     let is_scrolling = runtime_state == HeadMouseState::ScrollMode;
@@ -63,58 +87,47 @@ pub fn render_head_mouse_page(
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(14.))
-        .child(section_header(
+        .gap(px(16.))
+        .child(page_header(
             p,
             &rust_i18n::t!("head_mouse.title"),
             Some(&rust_i18n::t!("head_mouse.desc")),
+            header_trailing,
         ))
-        // 卡片 1: 核心开关与运行状态
         .child(
-            grouped_card(p)
-                .child(setting_row(
+            SettingGroup::new(p)
+                .row(toggle_row(
                     p,
+                    "head-mouse-enabled-switch",
                     &rust_i18n::t!("head_mouse.enable"),
                     Some(&rust_i18n::t!("head_mouse.enable_desc")),
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(10.))
-                        .child(status_tag)
-                        .child(
-                            Switch::new("head-mouse-enabled-switch")
-                                .checked(cfg.head_mouse_enabled)
-                                .on_change(move |checked, window, cx| {
-                                    let val = *checked;
-                                    if val {
-                                        if UinputStatus::probe().is_available() {
-                                            // 已就绪，静默开启
-                                            app_toggle.update(cx, |s, cx| {
-                                                s.controller.toggle_head_mouse(true);
-                                                cx.notify();
-                                            });
-                                        } else {
-                                            // 未授权 / 未安装驱动，弹出 Polkit (pkexec) 授权窗口
-                                            enable_fn(window, cx);
-                                        }
-                                    } else {
-                                        app_toggle.update(cx, |s, cx| {
-                                            s.controller.toggle_head_mouse(false);
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        ),
+                    cfg.head_mouse_enabled,
                     false,
+                    move |checked, window, cx| {
+                        let val = *checked;
+                        if val && !UinputStatus::probe().is_available() {
+                            enable_fn(window, cx);
+                        } else {
+                            app_toggle.update(cx, |s, cx| {
+                                s.controller.toggle_head_mouse(val);
+                                s.notify_saved();
+                                cx.notify();
+                            });
+                        }
+                    },
                 ))
-                .child(setting_row(
+                .row(action_row(
                     p,
                     &rust_i18n::t!("head_mouse.realtime_ctrl"),
-                    Some(&rust_i18n::t!("head_mouse.realtime_desc")),
+                    Some(&if cfg.head_mouse_enabled {
+                        rust_i18n::t!("head_mouse.realtime_desc")
+                    } else {
+                        rust_i18n::t!("settings.disabled_requires_head_mouse")
+                    }),
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .items_center()
                         .gap(px(8.))
                         .child(
@@ -138,7 +151,11 @@ pub fn render_head_mouse_page(
                                 })
                                 .compact()
                                 .rounded(ButtonRounded::Size(px(999.)))
-                                .label(if is_scrolling { rust_i18n::t!("head_mouse.exit_scroll") } else { rust_i18n::t!("head_mouse.scroll_mode") })
+                                .label(if is_scrolling {
+                                    rust_i18n::t!("head_mouse.exit_scroll")
+                                } else {
+                                    rust_i18n::t!("head_mouse.scroll_mode")
+                                })
                                 .on_click(move |_, _, cx| {
                                     app_scroll.update(cx, |_, _| {
                                         HEAD_MOUSE.send_command(HeadMouseCommand::ToggleScroll);
@@ -154,151 +171,153 @@ pub fn render_head_mouse_page(
                                 })
                                 .compact()
                                 .rounded(ButtonRounded::Size(px(999.)))
-                                .label(if is_paused { rust_i18n::t!("head_mouse.resume") } else { rust_i18n::t!("head_mouse.pause") })
+                                .label(if is_paused {
+                                    rust_i18n::t!("head_mouse.resume")
+                                } else {
+                                    rust_i18n::t!("head_mouse.pause")
+                                })
                                 .on_click(move |_, _, cx| {
                                     app_pause.update(cx, |s, _| {
                                         s.controller.head_mouse_toggle_pause();
                                     });
                                 }),
                         ),
-                    true,
-                )),
+                ))
+                .build(),
         )
-        // 卡片 2: 模式与滚动交互
         .child(section_header(
             p,
             &rust_i18n::t!("head_mouse.mode_section"),
             Some(&rust_i18n::t!("head_mouse.mode_section_desc")),
         ))
         .child(
-            grouped_card(p)
-                .child(setting_row(
+            SettingGroup::new(p)
+                .row(select_row(
                     p,
                     &rust_i18n::t!("head_mouse.tracking_mode"),
                     Some(&rust_i18n::t!("head_mouse.tracking_mode_desc")),
-                    Select::new(widgets.mode_select).w(px(220.)),
+                    widgets.mode_select,
+                    SELECT_W_MD,
                     false,
                 ))
-                .child(setting_row(
+                .row(toggle_row(
                     p,
+                    "mouse-invert-x-switch",
                     &rust_i18n::t!("head_mouse.invert_x"),
                     Some(&rust_i18n::t!("head_mouse.invert_x_desc")),
-                    Switch::new("mouse-invert-x-switch")
-                        .checked(cfg.head_mouse_invert_x)
-                        .on_change(move |checked, _, cx| {
-                            let val = *checked;
-                            app_invert_x.update(cx, |s, cx| {
-                                s.controller.toggle_head_mouse_invert_x(val);
-                                cx.notify();
-                            });
-                        }),
-                    true,
+                    cfg.head_mouse_invert_x,
+                    false,
+                    move |checked, _, cx| {
+                        let val = *checked;
+                        app_invert_x.update(cx, |s, cx| {
+                            s.controller.toggle_head_mouse_invert_x(val);
+                            s.notify_saved();
+                            cx.notify();
+                        });
+                    },
                 ))
-                .child(setting_row(
+                .row(toggle_row(
                     p,
+                    "mouse-invert-y-switch",
                     &rust_i18n::t!("head_mouse.invert_y"),
                     Some(&rust_i18n::t!("head_mouse.invert_y_desc")),
-                    Switch::new("mouse-invert-y-switch")
-                        .checked(cfg.head_mouse_invert_y)
-                        .on_change(move |checked, _, cx| {
-                            let val = *checked;
-                            app_invert_y.update(cx, |s, cx| {
-                                s.controller.toggle_head_mouse_invert_y(val);
-                                cx.notify();
-                            });
-                        }),
-                    true,
-                )),
+                    cfg.head_mouse_invert_y,
+                    false,
+                    move |checked, _, cx| {
+                        let val = *checked;
+                        app_invert_y.update(cx, |s, cx| {
+                            s.controller.toggle_head_mouse_invert_y(val);
+                            s.notify_saved();
+                            cx.notify();
+                        });
+                    },
+                ))
+                .build(),
         )
-        // 卡片 3: 速度与动力学调节
         .child(section_header(
             p,
             &rust_i18n::t!("head_mouse.tuning_section"),
             Some(&rust_i18n::t!("head_mouse.tuning_desc")),
         ))
         .child(
-            grouped_card(p)
-                .child(setting_row(
+            SettingGroup::new(p)
+                .row(slider_row(
                     p,
                     &rust_i18n::t!("head_mouse.speed"),
-                    Some(&format!("{}: {:.0} px/°", rust_i18n::t!("head_mouse.speed"), cfg.head_mouse_speed)),
-                    div()
-                        .w(px(200.))
-                        .child(Slider::new(widgets.speed).horizontal()),
-                    false,
+                    Some(&rust_i18n::t!("head_mouse.speed_desc")),
+                    format!("{:.0} px/°", cfg.head_mouse_speed),
+                    widgets.speed,
                 ))
-                .child(setting_row(
+                .row(slider_row(
                     p,
                     &rust_i18n::t!("head_mouse.accel"),
-                    Some(&format!("{}: {:.1}x", rust_i18n::t!("head_mouse.accel"), cfg.head_mouse_accel)),
-                    div()
-                        .w(px(200.))
-                        .child(Slider::new(widgets.accel).horizontal()),
-                    true,
+                    Some(&rust_i18n::t!("head_mouse.accel_desc")),
+                    format!("{:.1}x", cfg.head_mouse_accel),
+                    widgets.accel,
                 ))
-                .child(setting_row(
+                .row(slider_row(
                     p,
                     &rust_i18n::t!("head_mouse.smooth"),
-                    Some(&format!("{}: {:.2}", rust_i18n::t!("head_mouse.smooth"), cfg.head_mouse_smoothing)),
-                    div()
-                        .w(px(200.))
-                        .child(Slider::new(widgets.smoothing).horizontal()),
-                    true,
+                    Some(&rust_i18n::t!("head_mouse.smooth_desc")),
+                    format!("{:.2}", cfg.head_mouse_smoothing),
+                    widgets.smoothing,
                 ))
-                .child(setting_row(
+                .row(slider_row(
                     p,
                     &rust_i18n::t!("head_mouse.deadzone"),
-                    Some(&format!("{}: {:.1}°/s", rust_i18n::t!("head_mouse.deadzone"), cfg.head_mouse_deadzone)),
-                    div()
-                        .w(px(200.))
-                        .child(Slider::new(widgets.deadzone).horizontal()),
-                    true,
-                )),
+                    Some(&rust_i18n::t!("head_mouse.deadzone_desc")),
+                    format!("{:.1}°/s", cfg.head_mouse_deadzone),
+                    widgets.deadzone,
+                ))
+                .build(),
         )
-        // 卡片 4: 辅助手势与点击交互
         .child(section_header(
             p,
             &rust_i18n::t!("head_mouse.gestures_section"),
             Some(&rust_i18n::t!("head_mouse.gestures_desc")),
         ))
         .child(
-            grouped_card(p)
-                .child(setting_row(
+            SettingGroup::new(p)
+                .row(action_row(
                     p,
                     &rust_i18n::t!("head_mouse.stem_shortcuts"),
                     Some(&rust_i18n::t!("head_mouse.stem_desc")),
-                    Tag::primary().outline().child(rust_i18n::t!("head_mouse.ready")),
-                    false,
+                    Tag::primary()
+                        .outline()
+                        .child(rust_i18n::t!("head_mouse.ready")),
                 ))
-                .child(setting_row(
+                .row(toggle_row(
                     p,
+                    "mouse-roll-click-switch",
                     &rust_i18n::t!("head_mouse.roll_click"),
                     Some(&rust_i18n::t!("head_mouse.roll_click_desc")),
-                    Switch::new("mouse-roll-click-switch")
-                        .checked(cfg.head_mouse_roll_click)
-                        .on_change(move |checked, _, cx| {
-                            let val = *checked;
-                            app_roll.update(cx, |s, cx| {
-                                s.controller.toggle_head_mouse_roll_click(val);
-                                cx.notify();
-                            });
-                        }),
-                    true,
+                    cfg.head_mouse_roll_click,
+                    false,
+                    move |checked, _, cx| {
+                        let val = *checked;
+                        app_roll.update(cx, |s, cx| {
+                            s.controller.toggle_head_mouse_roll_click(val);
+                            s.notify_saved();
+                            cx.notify();
+                        });
+                    },
                 ))
-                .child(setting_row(
+                .row(toggle_row(
                     p,
+                    "mouse-dwell-click-switch",
                     &rust_i18n::t!("head_mouse.dwell_click"),
                     Some(&rust_i18n::t!("head_mouse.dwell_click_desc")),
-                    Switch::new("mouse-dwell-click-switch")
-                        .checked(cfg.head_mouse_dwell_click)
-                        .on_change(move |checked, _, cx| {
-                            let val = *checked;
-                            app_dwell.update(cx, |s, cx| {
-                                s.controller.toggle_head_mouse_dwell_click(val);
-                                cx.notify();
-                            });
-                        }),
-                    true,
-                )),
+                    cfg.head_mouse_dwell_click,
+                    false,
+                    move |checked, _, cx| {
+                        let val = *checked;
+                        app_dwell.update(cx, |s, cx| {
+                            s.controller.toggle_head_mouse_dwell_click(val);
+                            s.notify_saved();
+                            cx.notify();
+                        });
+                    },
+                ))
+                .build(),
         )
 }

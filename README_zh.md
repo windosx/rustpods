@@ -5,7 +5,7 @@
 <h1 align="center">RustPods</h1>
 
 <p align="center">
-  <strong>面向 Linux 与 Windows 的 AirPods 控制中心与系统服务。</strong><br>
+  <strong>面向 Linux 的 AirPods 控制中心与系统服务。</strong><br>
   原生 Rust、GPU 加速界面、头部追踪空间音频，以及用头部操控的光标。
 </p>
 
@@ -15,14 +15,14 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="许可证：AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg"></a>
-  <img alt="平台：Linux | Windows 10/11" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-1d1d1f?logo=linux&logoColor=white">
+  <img alt="平台：Linux" src="https://img.shields.io/badge/platform-Linux-1d1d1f?logo=linux&logoColor=white">
   <img alt="Rust：1.85+" src="https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust">
   <a href="https://github.com/windosx/rustpods/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/windosx/rustpods"></a>
 </p>
 
 ---
 
-RustPods 把 macOS 上习以为常的 AirPods 体验带到 Linux 与 Windows 桌面：电量与入耳状态、降噪控制、真正像控制中心的界面；开启头部追踪后，还能获得固定在空间中的声场，以及用转头驱动光标的空鼠。
+RustPods 把 macOS 上习以为常的 AirPods 体验带到 Linux 桌面：电量与入耳状态、降噪控制、真正像控制中心的界面；开启头部追踪后，还能获得固定在空间中的声场，以及用转头驱动光标的空鼠。
 
 它直接通过 L2CAP 与 Apple AACP 协议通信，不需要桥接守护进程、不需要给 BlueZ 打补丁，也不需要一台 Android 手机中转。
 
@@ -79,31 +79,10 @@ RustPods 把 macOS 上习以为常的 AirPods 体验带到 Linux 与 Windows 桌
 
 ### 纯 Rust AACP 协议栈
 
-- 通过经典蓝牙 PSM `0x1001` 建立纯 Rust L2CAP 信道（Linux 下通过 `bluer`，Windows 下通过 MagicAAP 驱动/命名管道桥接）。
+- 通过经典蓝牙 PSM `0x1001` 在 Linux 上基于 `bluer` 建立纯 Rust L2CAP 信道。
 - 自动宣告全部传感器描述符（`request_all_descriptors`），并以约 100 Hz 启动 Apple RemoteHID（`0x800`）。
 - 从解码后的 AACP 通知驱动入耳检测（摘下暂停、戴上恢复）和对话感知。
 - AES-128 载荷解密与 RPA 哈希校验位于 `src/core/crypto.rs`。
-
-### Windows 双模架构与无缝降级
-
-RustPods 原生适配 **Windows 10 / 11 (x86_64)**，采用“原生免驱 + 驱动增强”双模架构：
-
-- **免驱原生模式 (Native Driverless Mode)**：
-  - 无需安装任何第三方驱动，开箱即用。
-  - 基于 WinRT 原生 BLE 硬件过滤监听 Apple Company ID `0x004C` 广播。
-  - 支持充电盒开盖弹窗、360° 动态渲染图与左右耳/盒独立环形电量。
-  - Windows 任务栏系统托盘图标，具备实时动态环形电量与充电闪电徽标（基于 32-bit DIB/GDI 动态绘制）。
-  - 基于 Windows 全局系统媒体传输控件（GSMTC）实现入耳检测自动暂停/恢复播放。
-  - 完整的 GPU 加速控制中心界面。
-- **驱动增强模式 (Driver Enhanced Mode)**：
-  - 当系统中安装有 MagicAAP 内核驱动或运行命名管道桥接（`\\.\MagicAAP` / `\\.\pipe\magicaap-l2cap`）时，自动解锁经典蓝牙 L2CAP PSM `0x1001` 双向握手。
-  - 解锁降噪、通透、自适应音频等 ANC 模式切换。
-  - 解锁 100 Hz 传感器遥测（Apple RemoteHID IMU 数据流）。
-  - 解锁基于 Win32 `SendInput` 的姿态空鼠与激光指针模式。
-  - 解锁智能体操作点头/摇头手势审批。
-- **OpenTrack 头部追踪 UDP 输出（空间音频与游戏模拟）**：
-  - Windows 端将实时解算出的头部姿态（Yaw/Pitch/Roll）以 IEEE 754 48 字节 6DOF 数据报广播至本地 UDP `127.0.0.1:4242`。
-  - 完美接入 OpenTrack、FreeTrack 及 TrackIR 模拟飞行（微软模拟飞行 MSFS、DCS World、X-Plane）与赛车游戏生态。
 
 ## 设备兼容性
 
@@ -118,7 +97,6 @@ RustPods 可识别 AirPods 1–4、AirPods 4（ANC）、AirPods Pro 1/2（Lightn
 
 ## 系统要求
 
-### Linux
 - Linux，运行中的 **BlueZ**（>= 5.60），以及支持经典蓝牙的适配器。
 - **Rust 1.85+**（项目使用 edition 2024）。
 - 头部追踪空间音频需要 **PipeWire** 和 SOFA filter-chain 模块：
@@ -129,26 +107,17 @@ RustPods 可识别 AirPods 1–4、AirPods 4（ANC）、AirPods Pro 1/2（Lightn
   - Fedora：`sudo dnf install clang pipewire-devel pkg-config`
   - Debian/Ubuntu：`sudo apt install clang libclang-dev libpipewire-0.3-dev pkg-config`
 
-### Windows
-- **Windows 10（1809 及以上版本）或 Windows 11（x86_64）**。
-- 支持低功耗蓝牙（BLE）的蓝牙适配器。
-- （可选，用于驱动增强模式）：MagicAAP 内核驱动或兼容的 L2CAP 命名管道中继，用于开启 ANC、遥测与空鼠功能。
-
-`audio-follow` 是默认 Cargo 特性，因为 `pipewire-sys` 需要上述 Linux 头文件。在 Windows 下或不需要 PipeWire 时构建：
+`audio-follow` 是默认 Cargo 特性，因为 `pipewire-sys` 需要上述头文件。不需要 PipeWire 时构建：
 
 ```bash
 cargo build --release --no-default-features
 ```
 
-界面、托盘、AACP 协议栈和姿态鼠标均跨平台可用；Linux 下空间音频通过 PipeWire SOFA 输出，Windows 下则通过本地 OpenTrack UDP（端口 4242）输出。
+界面、托盘、AACP 协议栈和姿态鼠标均正常可用，仅略过空间音频 filter-chain 跟踪模块。
 
 ## 安装
 
 ### 方式一：包管理器与预编译安装（推荐）
-
-#### Windows (x86_64)
-- **安装包（推荐，开箱即用）**：从 [Releases 页面](https://github.com/windosx/rustpods/releases) 下载 `RustPods-Setup-v*-x86_64.exe` 安装向导，支持桌面快捷方式与开机托盘常驻自启。
-- **便携绿色包 (Portable)**：下载 `rustpods-v*-windows-x86_64.zip`，解压后双击 `rustpods.exe` 即可直接运行。
 
 #### Arch Linux (AUR)
 ```bash

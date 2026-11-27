@@ -118,23 +118,15 @@ pub fn restart_binary_path() -> PathBuf {
 /// either: the update would appear to succeed but the restart would run the
 /// old binary.
 pub fn can_self_update() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        false
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        can_self_update_with(
-            path_rustpods(),
-            std::env::var_os("HOME").map(PathBuf::from),
-            is_package_managed(),
-        )
-    }
+    can_self_update_with(
+        path_rustpods(),
+        std::env::var_os("HOME").map(PathBuf::from),
+        is_package_managed(),
+    )
 }
 
 /// Pure decision behind [`can_self_update`], split out so the prefix rules can
 /// be tested without touching PATH or the real installation.
-#[cfg(any(not(target_os = "windows"), test))]
 fn can_self_update_with(
     path_rustpods: Option<PathBuf>,
     home: Option<PathBuf>,
@@ -203,23 +195,17 @@ pub async fn install_update() -> Result<(), String> {
 pub async fn check_for_update() -> Result<Option<(String, String, String)>, String> {
     info!("Checking for RustPods updates via GitHub API...");
 
-    let mut cmd = tokio::process::Command::new("curl");
-    cmd.args([
-        "-fsSL",
-        "-m",
-        "10",
-        "-H",
-        "Accept: application/vnd.github.v3+json",
-        "-H",
-        "User-Agent: rustpods-updater",
-        GITHUB_API_LATEST_RELEASE,
-    ]);
-    #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let output = cmd
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "-m",
+            "10",
+            "-H",
+            "Accept: application/vnd.github.v3+json",
+            "-H",
+            "User-Agent: rustpods-updater",
+            GITHUB_API_LATEST_RELEASE,
+        ])
         .output()
         .await
         .map_err(|e| format!("无法执行 curl 检查更新: {e}"))?;

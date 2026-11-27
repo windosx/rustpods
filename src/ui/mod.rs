@@ -38,6 +38,10 @@ pub enum UiEvent {
     InEarResumeRequested,
     HeadGesture(crate::core::head_tracking::HeadGesture),
     UpdateStateChanged(crate::system::updater::UpdateState),
+    SettingsFeedback {
+        message: String,
+        is_error: bool,
+    },
     /// Requests a graceful application shutdown, so every Drop (notably the
     /// HRTF client restoring the default audio sink) runs before exit.
     Quit,
@@ -117,12 +121,10 @@ impl AssetSource for CompositeAssets {
     }
 }
 
-#[cfg(target_os = "linux")]
 struct SingleInstanceService {
     ui_tx: mpsc::UnboundedSender<UiEvent>,
 }
 
-#[cfg(target_os = "linux")]
 #[zbus::interface(name = "io.github.rustpods.RustPods")]
 impl SingleInstanceService {
     fn activate(&self) {
@@ -130,7 +132,6 @@ impl SingleInstanceService {
     }
 }
 
-#[cfg(target_os = "linux")]
 async fn serve_single_instance_dbus(ui_tx: mpsc::UnboundedSender<UiEvent>) {
     match zbus::connection::Builder::session() {
         Ok(builder) => {
@@ -163,19 +164,24 @@ pub fn run_app(rt_handle: tokio::runtime::Handle, start_minimized: bool) {
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);
-            let initial_mode = ThemeMode::Dark;
-            theme::apply_apple_theme(initial_mode, cx);
-            bootstrap_gui(rt_handle, initial_mode, start_minimized, cx);
+            bootstrap_gui(rt_handle, start_minimized, cx);
         });
 }
 
 fn bootstrap_gui(
     rt_handle: tokio::runtime::Handle,
-    initial_mode: ThemeMode,
     start_minimized: bool,
     cx: &mut App,
 ) {
-    let config = Arc::new(std::sync::RwLock::new(load_config()));
+    let loaded_config = load_config();
+    let initial_mode = if loaded_config.theme_mode.is_dark() {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    };
+    theme::apply_apple_theme(initial_mode, cx);
+
+    let config = Arc::new(std::sync::RwLock::new(loaded_config));
     crate::core::nod_counter::set_sensitivity(config.read().unwrap().gesture_sensitivity);
 
     let device_state = Arc::new(RwLock::new(None::<AirPodsDeviceState>));
@@ -210,15 +216,12 @@ fn bootstrap_gui(
         open_or_activate_window(&app_state, &active_window, cx);
     }
 
-    // Register D-Bus single-instance Activate handler (Linux only).
-    #[cfg(target_os = "linux")]
+    // Register D-Bus single-instance Activate handler.
     rt_handle.spawn(serve_single_instance_dbus(ui_event_tx.clone()));
 
-    // Spawn System Tray (StatusNotifierItem via ksni on Linux).
-    #[cfg(target_os = "linux")]
+    // Spawn System Tray (StatusNotifierItem via ksni).
     let tray_handle_holder: Arc<tokio::sync::Mutex<Option<ksni::Handle<RustPodsTray>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
-    #[cfg(target_os = "linux")]
     {
         let tray_dev_state = device_state.clone();
         let tx_tray_open = ui_event_tx.clone();
@@ -280,59 +283,6 @@ fn bootstrap_gui(
         });
     }
 
-    // Spawn System Tray (Win32 Shell_NotifyIconW on Windows).
-    #[cfg(target_os = "windows")]
-    {
-        let tray_dev_state = device_state.clone();
-        let tx_tray_open = ui_event_tx.clone();
-        let on_open_win = Arc::new(move || {
-            let _ = tx_tray_open.send(UiEvent::OpenWindow);
-        });
-        let aacp_tray_noise = aacp_manager.clone();
-        let dev_tray_noise = device_state.clone();
-        let tx_tray_noise = ui_event_tx.clone();
-        let rt_noise = rt_handle.clone();
-        let on_tray_noise = Arc::new(move |mode: NoiseControlMode| {
-            let aacp = aacp_tray_noise.clone();
-            let dev = dev_tray_noise.clone();
-            let tx = tx_tray_noise.clone();
-            rt_noise.spawn(async move {
-                crate::system::tray::apply_noise_mode(&aacp, &dev, &tx, mode).await;
-            });
-        });
-
-        let aacp_tray_ear = aacp_manager.clone();
-        let cfg_tray_ear = config.clone();
-        let dev_tray_ear = device_state.clone();
-        let tx_tray_ear = ui_event_tx.clone();
-        let rt_ear = rt_handle.clone();
-        let on_tray_ear = Arc::new(move |enabled: bool| {
-            let aacp = aacp_tray_ear.clone();
-            let cfg = cfg_tray_ear.clone();
-            let dev = dev_tray_ear.clone();
-            let tx = tx_tray_ear.clone();
-            rt_ear.spawn(async move {
-                crate::system::tray::apply_ear_detection_toggle(&aacp, &cfg, &dev, &tx, enabled)
-                    .await;
-            });
-        });
-
-        let tx_tray_quit = ui_event_tx.clone();
-        let on_tray_quit = Arc::new(move || {
-            let _ = tx_tray_quit.send(UiEvent::Quit);
-        });
-
-        let tray = Arc::new(RustPodsTray {
-            device_state: tray_dev_state,
-            on_open_window: on_open_win,
-            on_set_noise_mode: on_tray_noise,
-            on_toggle_ear_detection: on_tray_ear,
-            on_quit: on_tray_quit,
-        });
-
-        crate::system::tray::spawn_windows_tray(tray, true);
-    }
-
     // Spawn Tokio background engines.
     rt_handle.spawn(crate::system::zcode_ask::run_socket_server());
     rt_handle.spawn(run_audio_follow(aacp_manager.head_pose()));
@@ -358,7 +308,6 @@ fn bootstrap_gui(
         let popup_ev = popup_window.clone();
         let mpris_ev = mpris_controller.clone();
         let rt_ev = rt_handle.clone();
-        #[cfg(target_os = "linux")]
         let tray_ev = tray_handle_holder.clone();
         cx.spawn(async move |cx| {
             let gesture_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -372,7 +321,6 @@ fn bootstrap_gui(
                             s.device = new_dev;
                             cx.notify();
                         });
-                        #[cfg(target_os = "linux")]
                         {
                             let holder = tray_ev.clone();
                             rt_ev.spawn(async move {
@@ -431,7 +379,6 @@ fn bootstrap_gui(
                             }
                             cx.notify();
                         });
-                        #[cfg(target_os = "linux")]
                         {
                             let holder = tray_ev.clone();
                             rt_ev.spawn(async move {
@@ -475,9 +422,26 @@ fn bootstrap_gui(
                             cx.notify();
                         });
                     }
+                    UiEvent::SettingsFeedback { message, is_error } => {
+                        let seq = state_ev.update(cx, |s, cx| {
+                            let seq = s.set_settings_feedback(message, is_error);
+                            cx.notify();
+                            seq
+                        });
+                        let state_clear = state_ev.clone();
+                        cx.spawn(async move |cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(2200))
+                                .await;
+                            state_clear.update(cx, |s, cx| {
+                                if s.clear_settings_feedback(Some(seq)) {
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                    }
                     UiEvent::Quit => {
-                        #[cfg(target_os = "windows")]
-                        crate::system::tray::close_windows_tray();
                         cx.update(|cx| cx.quit());
                     }
                 }
@@ -544,7 +508,11 @@ fn bootstrap_gui(
                             rust_i18n::t!("spatial.calibrating").to_string()
                         };
                     } else if rate.is_none() {
-                        s.head_tracking.status = rust_i18n::t!("spatial.waiting_stream").to_string();
+                        s.head_tracking.status = if !s.device.is_connected {
+                            rust_i18n::t!("spatial.waiting_connected").to_string()
+                        } else {
+                            rust_i18n::t!("spatial.waiting_stream").to_string()
+                        };
                     }
                     cx.notify();
                 });
@@ -635,7 +603,7 @@ fn open_or_activate_window(
 }
 
 /// Drives the head-tracked audio stage for as long as poses arrive.
-#[cfg(all(target_os = "linux", feature = "audio-follow"))]
+#[cfg(feature = "audio-follow")]
 pub async fn run_audio_follow(
     pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
 ) {
@@ -684,48 +652,8 @@ pub async fn run_audio_follow(
     client.shutdown();
 }
 
-/// Broadcasts head tracking via OpenTrack UDP protocol (127.0.0.1:4242) on Windows.
-#[cfg(target_os = "windows")]
-pub async fn run_audio_follow(
-    mut pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
-) {
-    use tokio::net::UdpSocket;
-    let socket = match UdpSocket::bind("127.0.0.1:0").await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to bind UDP socket for OpenTrack: {}", e);
-            return;
-        }
-    };
-    let target = "127.0.0.1:4242";
-    info!("OpenTrack UDP head pose broadcaster ready (target: {})", target);
-
-    let mut had_pose = false;
-    while pose_rx.changed().await.is_ok() {
-        let pose = *pose_rx.borrow_and_update();
-        if let Some(pose) = pose {
-            let mut buf = [0u8; 48];
-            let yaw: f64 = pose.yaw as f64;
-            let pitch: f64 = pose.pitch as f64;
-            let roll: f64 = pose.roll as f64;
-
-            buf[24..32].copy_from_slice(&yaw.to_le_bytes());
-            buf[32..40].copy_from_slice(&pitch.to_le_bytes());
-            buf[40..48].copy_from_slice(&roll.to_le_bytes());
-
-            let _ = socket.send_to(&buf, target).await;
-            had_pose = true;
-        } else if had_pose {
-            // Reset OpenTrack consumer to neutral pose when stream stops or buds are removed.
-            let zero_buf = [0u8; 48];
-            let _ = socket.send_to(&zero_buf, target).await;
-            had_pose = false;
-        }
-    }
-}
-
-/// Stub for builds without the feature on non-Windows platforms.
-#[cfg(all(not(target_os = "windows"), not(all(target_os = "linux", feature = "audio-follow"))))]
+/// Stub for builds without `audio-follow`, so the call site stays uniform.
+#[cfg(not(feature = "audio-follow"))]
 pub async fn run_audio_follow(
     _pose_rx: tokio::sync::watch::Receiver<Option<crate::core::head_tracking::HeadPose>>,
 ) {
@@ -772,7 +700,6 @@ pub async fn start_bluetooth_daemon(
         }
     };
 
-    #[cfg(target_os = "linux")]
     if let Ok(ad) = bt_manager.get_default_adapter().await
         && let Ok(addr) = ad.address().await {
             info!("Local Bluetooth Adapter MAC: {}", addr);
@@ -852,23 +779,7 @@ pub async fn start_bluetooth_daemon(
                 let mut event_rx = aacp.subscribe();
 
                 if let Err(e) = aacp.connect(pod.address).await {
-                    info!(
-                        "AACP connection failed ({}), running in native driverless mode",
-                        e
-                    );
-                    // Bluetooth audio is connected: keep device state connected.
-                    // In driverless mode, le_monitor updates battery and in-ear status.
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                        let still_connected = match bt_manager.find_connected_airpods().await {
-                            Ok(list) => list.iter().any(|p| p.address == pod.address),
-                            Err(_) => false,
-                        };
-                        if !still_connected {
-                            info!("AirPods disconnected in driverless mode");
-                            break;
-                        }
-                    }
+                    warn!("Failed to connect AACP L2CAP channel ({}): {}", pod.address, e);
                 } else {
                     info!("AACP event stream active and connected");
 

@@ -2,7 +2,7 @@
 name = "rustpods"
 version = "0.2.2"
 edition = "2024"
-description = "AirPods Control Center and System Services for Linux & Windows"
+description = "AirPods Control Center and System Services for Linux"
 authors = ["windosx <windosx@github.com>"]
 license = "AGPL-3.0-only"
 repository = "https://github.com/windosx/rustpods"
@@ -30,7 +30,7 @@ dirs = "6.0"
 # GUI dependencies
 gpui-kit = "0.9.1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# Linux system dependencies
 bluer = { version = "0.17", features = ["full"] }
 zbus = { version = "5", features = ["tokio"] }
 ksni = "0.3"
@@ -41,33 +41,6 @@ evdev = "0.12"
 # dependency on the PipeWire headers and libclang (pipewire-sys runs bindgen).
 pipewire = { version = "0.10", optional = true }
 libspa = { version = "0.10", optional = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = [
-    "Foundation",
-    "Foundation_Collections",
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Threading",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-    "Win32_System_Pipes",
-    "Devices_Bluetooth",
-    "Devices_Bluetooth_Advertisement",
-    "Devices_Enumeration",
-    "Win32_Devices_Bluetooth",
-    "Storage_Streams",
-    "Media_Control",
-    "Win32_UI_Shell",
-    "Win32_Graphics_Gdi",
-    "Win32_Graphics_Dwm",
-    "Win32_System_Console",
-] }
-
-[build-dependencies]
-embed-resource = "3.0"
 
 [features]
 default = ["audio-follow"]

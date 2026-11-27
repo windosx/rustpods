@@ -1,6 +1,18 @@
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
 use gpui_kit::{div, hsla, px, App, Div, Hsla, IntoElement, ParentElement as _, Styled as _};
 
+/// Typography scale tokens shared across settings pages.
+pub const PAGE_TITLE_SIZE: f32 = 19.0;
+pub const SECTION_TITLE_SIZE: f32 = 13.5;
+pub const ROW_TITLE_SIZE: f32 = 13.5;
+pub const ROW_DESC_SIZE: f32 = 12.0;
+pub const CAPTION_SIZE: f32 = 11.0;
+
+/// Control width tokens calibrated for the 680px minimum window width.
+pub const SELECT_W_SM: f32 = 164.0;
+pub const SELECT_W_MD: f32 = 196.0;
+pub const SLIDER_W: f32 = 176.0;
+
 /// Semantic Apple Control Center tokens derived from the active Light/Dark theme.
 #[derive(Clone, Copy)]
 pub struct ApplePalette {
@@ -15,6 +27,10 @@ pub struct ApplePalette {
     pub card_elevated_bg: Hsla,
     pub card_border: Hsla,
     pub separator: Hsla,
+    pub row_hover: Hsla,
+    pub danger_bg: Hsla,
+    pub danger_border: Hsla,
+    pub badge_bg: Hsla,
     pub text_primary: Hsla,
     pub text_secondary: Hsla,
     pub text_muted: Hsla,
@@ -41,6 +57,10 @@ pub fn palette(cx: &App) -> ApplePalette {
             card_elevated_bg: hsla(226. / 360., 0.16, 0.19, 0.92),
             card_border: hsla(0., 0., 1.0, 0.09),
             separator: hsla(0., 0., 1.0, 0.08),
+            row_hover: hsla(0., 0., 1.0, 0.04),
+            danger_bg: hsla(3. / 360., 0.85, 0.50, 0.12),
+            danger_border: hsla(3. / 360., 0.85, 0.58, 0.35),
+            badge_bg: hsla(0., 0., 1.0, 0.09),
             text_primary: hsla(0., 0., 0.96, 1.0),
             text_secondary: hsla(220. / 360., 0.10, 0.72, 1.0),
             text_muted: hsla(220. / 360., 0.08, 0.55, 1.0),
@@ -65,6 +85,10 @@ pub fn palette(cx: &App) -> ApplePalette {
             card_elevated_bg: hsla(220. / 360., 0.16, 0.97, 1.0),
             card_border: hsla(220. / 360., 0.16, 0.80, 0.65),
             separator: hsla(220. / 360., 0.15, 0.86, 0.7),
+            row_hover: hsla(220. / 360., 0.18, 0.0, 0.03),
+            danger_bg: hsla(3. / 360., 0.85, 0.54, 0.08),
+            danger_border: hsla(3. / 360., 0.80, 0.52, 0.30),
+            badge_bg: hsla(220. / 360., 0.16, 0.50, 0.10),
             text_primary: hsla(222. / 360., 0.20, 0.12, 1.0),
             text_secondary: hsla(220. / 360., 0.10, 0.40, 1.0),
             text_muted: hsla(220. / 360., 0.08, 0.54, 1.0),

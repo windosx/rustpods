@@ -308,14 +308,12 @@ impl From<[u8; 6]> for MacAddress {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl From<bluer::Address> for MacAddress {
     fn from(addr: bluer::Address) -> Self {
         Self(addr.0)
     }
 }
 
-#[cfg(target_os = "linux")]
 impl From<MacAddress> for bluer::Address {
     fn from(addr: MacAddress) -> Self {
         bluer::Address(addr.0)

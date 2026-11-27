@@ -5,9 +5,7 @@ pub mod remotehid;
 pub mod rtbuddy;
 pub mod session;
 
-#[cfg(target_os = "linux")]
 use bluer::l2cap::{SeqPacket, Socket, SocketAddr};
-#[cfg(target_os = "linux")]
 use bluer::AddressType;
 use commands::{ControlCommandId, MicrophoneMode, NoiseControlMode};
 use events::AacpEvent;
@@ -23,7 +21,6 @@ use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-#[cfg(target_os = "linux")]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// A dead L2CAP link does not necessarily close the socket, so the receive
 /// loop's read carries this watchdog: past it, the link is treated as gone
@@ -31,7 +28,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// longest quiet stretch of a live link (head tracking streams at ~50 Hz and
 /// battery/ear notifications arrive every few seconds or via 8s status polling).
 const RECV_WATCHDOG: Duration = Duration::from_secs(20);
-#[cfg(target_os = "linux")]
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone)]
@@ -100,64 +96,36 @@ pub struct AacpManager {
 }
 
 enum AacpTransport {
-    #[cfg(target_os = "linux")]
     Linux(SeqPacket),
-    #[cfg(target_os = "windows")]
-    Windows(crate::system::magicaap::MagicAapStream),
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    Unsupported,
 }
 
 impl AacpTransport {
     async fn send(&self, packet: &[u8]) -> Result<(), std::io::Error> {
         match self {
-            #[cfg(target_os = "linux")]
             Self::Linux(sock) => sock.send(packet).await.map(|_| ()),
-            #[cfg(target_os = "windows")]
-            Self::Windows(stream) => stream.send(packet).await,
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-            Self::Unsupported => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "AACP transport unsupported",
-            )),
         }
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
         match self {
-            #[cfg(target_os = "linux")]
             Self::Linux(sock) => sock.recv(buf).await,
-            #[cfg(target_os = "windows")]
-            Self::Windows(stream) => stream.recv(buf).await,
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-            Self::Unsupported => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "AACP transport unsupported",
-            )),
         }
     }
 }
 
-
 /// `SOL_BLUETOOTH` / `BT_SECURITY` socket options, from the kernel headers.
-#[cfg(target_os = "linux")]
 const SOL_BLUETOOTH: libc::c_int = 274;
-#[cfg(target_os = "linux")]
 const BT_SECURITY: libc::c_int = 4;
 /// `BT_SECURITY_MEDIUM`: request an encrypted (or higher) link.
-#[cfg(target_os = "linux")]
 const BT_SECURITY_MEDIUM: libc::c_int = 2;
 
 /// `BT_POWER` / `force_active` socket option, from the kernel's `bluetooth.h`.
-#[cfg(target_os = "linux")]
 const BT_POWER: libc::c_int = 9;
-#[cfg(target_os = "linux")]
 const BT_POWER_FORCE_ACTIVE_ON: u8 = 1;
 
 /// Requests the kernel to keep the Bluetooth ACL link in Active Mode, preventing
 /// the controller from placing it into power-saving Sniff Mode which throttles
 /// the L2CAP polling rate down to ~30 Hz.
-#[cfg(target_os = "linux")]
 fn request_force_active(fd_owner: &impl std::os::unix::io::AsRawFd) {
     let active: u8 = BT_POWER_FORCE_ACTIVE_ON;
     let rc = unsafe {
@@ -187,9 +155,7 @@ fn request_force_active(fd_owner: &impl std::os::unix::io::AsRawFd) {
 /// These are **not** `SOL_BLUETOOTH`: the MTU lives in the L2CAP-level option
 /// block, and setting it through the wrong level silently fails with
 /// `ENOPROTOOPT`, which is why an earlier attempt at this appeared not to work.
-#[cfg(target_os = "linux")]
 const SOL_L2CAP: libc::c_int = 6;
-#[cfg(target_os = "linux")]
 const L2CAP_OPTIONS: libc::c_int = 1;
 
 /// Receive MTU the accessory needs before it will announce the motion sensor.
@@ -203,7 +169,6 @@ const AACP_RECEIVE_MTU: u16 = 2582;
 
 /// `struct l2cap_options` as the kernel lays it out: omtu, imtu, flush_to, mode,
 /// then a few single-byte fields. Only omtu/imtu are read here.
-#[cfg(target_os = "linux")]
 const L2CAP_OPTIONS_LEN: usize = 12;
 
 /// Raises the L2CAP receive MTU so the accessory will announce every sensor.
@@ -212,7 +177,6 @@ const L2CAP_OPTIONS_LEN: usize = 12;
 /// configuration, so setting it afterwards has no effect on the negotiation.
 /// The existing option block is read first and only the imtu field rewritten,
 /// because the other fields carry the kernel's current settings.
-#[cfg(target_os = "linux")]
 fn raise_receive_mtu<Type>(socket: &Socket<Type>) {
     use std::os::unix::io::AsRawFd;
 
@@ -261,7 +225,6 @@ fn raise_receive_mtu<Type>(socket: &Socket<Type>) {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn raise_link_security<Type>(socket: &Socket<Type>) {
     use std::os::unix::io::AsRawFd;
 
@@ -411,7 +374,6 @@ impl AacpManager {
             .await
     }
 
-    #[cfg(target_os = "linux")]
     async fn connect_transport(addr: MacAddress) -> Result<AacpTransport, String> {
         let bluer_addr: bluer::Address = addr.into();
         info!("Connecting AACP L2CAP socket to {} on PSM 0x{:04X}...", bluer_addr, PSM_AACP);
@@ -454,19 +416,6 @@ impl AacpManager {
         request_force_active(&seq_packet);
         info!("L2CAP AACP connected to {}", addr);
         Ok(AacpTransport::Linux(seq_packet))
-    }
-
-    #[cfg(target_os = "windows")]
-    async fn connect_transport(addr: MacAddress) -> Result<AacpTransport, String> {
-        info!("Connecting AACP via MagicAAP driver bridge to {}...", addr);
-        let stream = crate::system::magicaap::MagicAapStream::connect(addr).await?;
-        info!("AACP stream connected to {}", addr);
-        Ok(AacpTransport::Windows(stream))
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    async fn connect_transport(_addr: MacAddress) -> Result<AacpTransport, String> {
-        Err("AACP L2CAP transport not supported on this platform".to_string())
     }
 
     async fn start_transport_session(

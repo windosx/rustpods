@@ -1,5 +1,3 @@
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-
 #[macro_use]
 extern crate rust_i18n;
 
@@ -18,7 +16,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(
     name = "rustpods",
     version,
-    about = "AirPods Control Center and System Services for Linux & Windows"
+    about = "AirPods Control Center and System Services for Linux"
 )]
 struct Cli {
     #[arg(short, long, help = "Enable debug logging")]
@@ -144,12 +142,10 @@ struct Cli {
 /// accessory stop answering for both. The GUI-vs-GUI case is exempted by
 /// checking the GApplication bus name first: a second GUI launch must keep
 /// activating the running window, not fail.
-#[cfg(target_os = "linux")]
 struct InstanceLock {
     _file: std::fs::File,
 }
 
-#[cfg(target_os = "linux")]
 impl InstanceLock {
     fn acquire() -> Result<Self, String> {
         use std::os::unix::io::AsRawFd;
@@ -192,49 +188,8 @@ impl InstanceLock {
     }
 }
 
-#[cfg(target_os = "windows")]
-struct InstanceLock {
-    handle: windows::Win32::Foundation::HANDLE,
-}
-
-#[cfg(target_os = "windows")]
-impl InstanceLock {
-    fn acquire() -> Result<Self, String> {
-        use windows::core::w;
-        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-        use windows::Win32::System::Threading::CreateMutexW;
-
-        let handle = unsafe { CreateMutexW(None, true, w!("Local\\RustPodsSessionLock")) }
-            .map_err(|e| format!("Failed to create session mutex: {}", e))?;
-
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(handle);
-            }
-            return Err(
-                "Another RustPods engine (GUI or --no-gui daemon) is already running; only one can use the AACP session at a time".to_string()
-            );
-        }
-
-        Ok(Self { handle })
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for InstanceLock {
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::ReleaseMutex;
-        unsafe {
-            let _ = ReleaseMutex(self.handle);
-            let _ = CloseHandle(self.handle);
-        }
-    }
-}
-
 /// Whether a RustPods GUI already owns its application bus name on the
 /// session bus.
-#[cfg(target_os = "linux")]
 fn gui_already_running() -> bool {
     use zbus::blocking::Proxy;
 
@@ -257,27 +212,7 @@ fn gui_already_running() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(target_os = "windows")]
-fn gui_already_running() -> bool {
-    use windows::core::w;
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    unsafe {
-        let main_exists = match FindWindowW(None, w!("RustPods")) {
-            Ok(h) => !h.is_invalid() && !h.0.is_null(),
-            Err(_) => false,
-        };
-        if main_exists {
-            return true;
-        }
-        match FindWindowW(w!("RustPodsTrayClass"), w!("RustPodsTrayWindow")) {
-            Ok(h) => !h.is_invalid() && !h.0.is_null(),
-            Err(_) => false,
-        }
-    }
-}
-
 /// Asks an already-running RustPods GUI instance to bring its window forward.
-#[cfg(target_os = "linux")]
 fn activate_running_gui() -> bool {
     use zbus::blocking::Proxy;
 
@@ -295,48 +230,7 @@ fn activate_running_gui() -> bool {
     proxy.call::<_, _, ()>("Activate", &()).is_ok()
 }
 
-#[cfg(target_os = "windows")]
-fn activate_running_gui() -> bool {
-    use windows::core::w;
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE,
-    };
-    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("RustPods")) }
-        && !hwnd.is_invalid()
-        && !hwnd.0.is_null()
-    {
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-            let _ = SetForegroundWindow(hwnd);
-        }
-        true
-    } else if let Ok(tray_hwnd) =
-        unsafe { FindWindowW(w!("RustPodsTrayClass"), w!("RustPodsTrayWindow")) }
-        && !tray_hwnd.is_invalid()
-        && !tray_hwnd.0.is_null()
-    {
-        unsafe {
-            PostMessageW(
-                tray_hwnd,
-                crate::system::tray::WM_TRAY_SHOW_MAIN,
-                WPARAM(0),
-                LPARAM(0),
-            )
-            .is_ok()
-        }
-    } else {
-        false
-    }
-}
-
 fn main() {
-    #[cfg(target_os = "windows")]
-    unsafe {
-        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-    }
-
     let cli = Cli::parse();
 
     let log_level = if cli.debug {
@@ -437,38 +331,29 @@ fn main() {
     }
 
     if cli.update {
-        #[cfg(target_os = "windows")]
-        {
-            println!("Opening the latest RustPods releases in your default browser...");
-            let _ = open::that("https://github.com/windosx/rustpods/releases/latest");
-            return;
+        let is_pkg = system::updater::is_package_managed();
+        if is_pkg {
+            eprintln!("Error: This binary is located in a system package directory (/usr/bin).");
+            eprintln!("To prevent package database corruption, please update using your package manager (e.g. yay, apt, dnf).");
+            std::process::exit(1);
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let is_pkg = system::updater::is_package_managed();
-            if is_pkg {
-                eprintln!("Error: This binary is located in a system package directory (/usr/bin).");
-                eprintln!("To prevent package database corruption, please update using your package manager (e.g. yay, apt, dnf).");
-                std::process::exit(1);
+        println!("Triggering RustPods in-place update...");
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("curl -fsSL https://raw.githubusercontent.com/windosx/rustpods/master/contrib/scripts/update.sh | bash")
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("Update complete.");
+                return;
             }
-            println!("Triggering RustPods in-place update...");
-            let status = std::process::Command::new("bash")
-                .arg("-c")
-                .arg("curl -fsSL https://raw.githubusercontent.com/windosx/rustpods/master/contrib/scripts/update.sh | bash")
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    println!("Update complete.");
-                    return;
-                }
-                Ok(s) => {
-                    eprintln!("Update exited with status: {:?}", s.code());
-                    std::process::exit(s.code().unwrap_or(1));
-                }
-                Err(e) => {
-                    eprintln!("Failed to run update script: {}", e);
-                    std::process::exit(1);
-                }
+            Ok(s) => {
+                eprintln!("Update exited with status: {:?}", s.code());
+                std::process::exit(s.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!("Failed to run update script: {}", e);
+                std::process::exit(1);
             }
         }
     }
@@ -639,13 +524,10 @@ fn main() {
                         }
                     }),
                 };
-                #[cfg(target_os = "linux")]
                 tokio::spawn(async move {
                     use ksni::TrayMethods;
                     let _ = tray.spawn().await;
                 });
-                #[cfg(target_os = "windows")]
-                system::tray::spawn_windows_tray(Arc::new(tray), false);
             }
 
             // Consume UI events in background
@@ -683,8 +565,6 @@ fn main() {
                     info!("Shutdown requested from the tray");
                 }
             }
-            #[cfg(target_os = "windows")]
-            system::tray::close_windows_tray();
             info!("Daemon shutting down");
         });
     } else {

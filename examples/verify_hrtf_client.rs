@@ -10,12 +10,12 @@
 
 // The crate is binary-only, so the module is included by path rather than
 // linked as a library. It compiles the same source the daemon runs.
-#[cfg(all(target_os = "linux", feature = "audio-follow"))]
+#[cfg(feature = "audio-follow")]
 #[path = "../src/system/audio_follow.rs"]
 #[allow(dead_code, unused_imports)] // only the client half is exercised here
 mod audio_follow;
 
-#[cfg(all(target_os = "linux", feature = "audio-follow"))]
+#[cfg(feature = "audio-follow")]
 mod imp {
     use pipewire as pw;
     use pw::spa::param::ParamType;
@@ -328,12 +328,12 @@ mod imp {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "audio-follow"))]
+#[cfg(feature = "audio-follow")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     imp::run()
 }
 
-#[cfg(not(all(target_os = "linux", feature = "audio-follow")))]
+#[cfg(not(feature = "audio-follow"))]
 fn main() {
-    eprintln!("verify_hrtf_client is only supported on Linux with audio-follow");
+    eprintln!("verify_hrtf_client requires the audio-follow feature");
 }

@@ -1,10 +1,10 @@
+use crate::ui::components::setting_rows::{
+    feedback_banner, page_header, select_row, toggle_row, SettingGroup,
+};
 use crate::ui::state::RustPodsState;
-use crate::ui::theme::{grouped_card, section_header, setting_row, ApplePalette};
-use gpui_kit::component::select::{Select, SelectState};
-use gpui_kit::component::switch::Switch;
+use crate::ui::theme::{section_header, ApplePalette, SELECT_W_MD};
+use gpui_kit::component::select::SelectState;
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::Icon;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{div, px, Entity, IntoElement, ParentElement as _, Styled as _};
 
 pub fn render_settings_page(
@@ -21,104 +21,129 @@ pub fn render_settings_page(
     let app_conv = app_state.clone();
     let app_chime = app_state.clone();
 
+    let header_trailing = if let Some(fb) = &state.settings_feedback {
+        Some(feedback_banner(p, &fb.message, fb.is_error).into_any_element())
+    } else if !dev.is_connected {
+        Some(
+            Tag::warning()
+                .outline()
+                .child(rust_i18n::t!("controls.disconnected_badge"))
+                .into_any_element(),
+        )
+    } else {
+        None
+    };
+
+    let pause_desc = if cfg.ear_detection_enabled {
+        rust_i18n::t!("controls.pause_desc")
+    } else {
+        rust_i18n::t!("controls.requires_ear_detect")
+    };
+
+    let show_conv_awareness = !dev.is_connected || dev.capabilities.has_conversational_awareness;
+
     div()
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(14.))
-        .child(section_header(
+        .gap(px(16.))
+        .child(page_header(
             p,
             &rust_i18n::t!("controls.title"),
-            Some(&rust_i18n::t!("controls.desc")),
+            Some(&if dev.is_connected {
+                rust_i18n::t!("controls.desc")
+            } else {
+                rust_i18n::t!("controls.disconnected_hint")
+            }),
+            header_trailing,
+        ))
+        .child(section_header(
+            p,
+            &rust_i18n::t!("controls.wear_section"),
+            Some(&rust_i18n::t!("controls.wear_section_desc")),
         ))
         .child(
-            grouped_card(p)
-                .child(setting_row(
+            SettingGroup::new(p)
+                .row(toggle_row(
                     p,
+                    "ear-detection-switch",
                     &rust_i18n::t!("controls.ear_detect"),
                     Some(&rust_i18n::t!("controls.ear_detect_desc")),
-                    Switch::new("ear-detection-switch")
-                        .checked(cfg.ear_detection_enabled)
-                        .on_change(move |checked, _, cx| {
-                            let val = *checked;
-                            app_ear.update(cx, |s, cx| {
-                                s.device.ear_detection_enabled = val;
-                                s.controller.toggle_ear_detection(val);
-                                cx.notify();
-                            });
-                        }),
+                    cfg.ear_detection_enabled,
                     false,
+                    move |checked, _, cx| {
+                        let val = *checked;
+                        app_ear.update(cx, |s, cx| {
+                            s.device.ear_detection_enabled = val;
+                            s.controller.toggle_ear_detection(val);
+                            s.notify_saved();
+                            cx.notify();
+                        });
+                    },
                 ))
-                .child(setting_row(
+                .row(select_row(
                     p,
                     &rust_i18n::t!("controls.pause_behavior"),
-                    Some(&rust_i18n::t!("controls.pause_desc")),
-                    Select::new(pause_select).w(px(210.)),
-                    true,
+                    Some(&pause_desc),
+                    pause_select,
+                    SELECT_W_MD,
+                    !cfg.ear_detection_enabled,
                 ))
-                .child(setting_row(
+                .build(),
+        )
+        .child(section_header(
+            p,
+            &rust_i18n::t!("controls.audio_section"),
+            Some(&rust_i18n::t!("controls.audio_section_desc")),
+        ))
+        .child(
+            SettingGroup::new(p)
+                .row(select_row(
                     p,
-                    &rust_i18n::t!("controls.conv_awareness"),
-                    Some(&rust_i18n::t!("controls.conv_desc")),
-                    Switch::new("conv-awareness-switch")
-                        .checked(cfg.conversational_awareness_enabled)
-                        .on_change(move |checked, _, cx| {
+                    &rust_i18n::t!("controls.mic"),
+                    Some(&rust_i18n::t!("controls.mic_desc")),
+                    mic_select,
+                    SELECT_W_MD,
+                    false,
+                ))
+                .row_if(show_conv_awareness, || {
+                    toggle_row(
+                        p,
+                        "conv-awareness-switch",
+                        &rust_i18n::t!("controls.conv_awareness"),
+                        Some(&rust_i18n::t!("controls.conv_desc")),
+                        cfg.conversational_awareness_enabled,
+                        false,
+                        move |checked, _, cx| {
                             let val = *checked;
                             app_conv.update(cx, |s, cx| {
                                 s.device.conversational_awareness = val;
                                 s.controller.toggle_conversational_awareness(val);
+                                s.notify_saved();
                                 cx.notify();
                             });
-                        }),
-                    true,
-                ))
-                .child(setting_row(
-                    p,
-                    &rust_i18n::t!("controls.mic"),
-                    Some(&rust_i18n::t!("controls.mic_desc")),
-                    Select::new(mic_select).w(px(170.)),
-                    true,
-                ))
-                .when(dev.capabilities.has_case_speaker, |this| {
-                    this.child(setting_row(
+                        },
+                    )
+                })
+                .row_if(dev.capabilities.has_case_speaker, || {
+                    toggle_row(
                         p,
+                        "case-chime-switch",
                         &rust_i18n::t!("controls.chime"),
                         Some(&rust_i18n::t!("controls.chime_desc")),
-                        Switch::new("case-chime-switch")
-                            .checked(dev.case_chime_enabled)
-                            .on_change(move |checked, _, cx| {
-                                let val = *checked;
-                                app_chime.update(cx, |s, cx| {
-                                    s.device.case_chime_enabled = val;
-                                    s.controller.toggle_case_chime(val);
-                                    cx.notify();
-                                });
-                            }),
-                        true,
-                    ))
+                        dev.case_chime_enabled,
+                        false,
+                        move |checked, _, cx| {
+                            let val = *checked;
+                            app_chime.update(cx, |s, cx| {
+                                s.device.case_chime_enabled = val;
+                                s.controller.toggle_case_chime(val);
+                                s.notify_saved();
+                                cx.notify();
+                            });
+                        },
+                    )
                 })
-                .child(setting_row(
-                    p,
-                    &if cfg!(target_os = "windows") {
-                        rust_i18n::t!("preferences.gsmtc_row_title")
-                    } else {
-                        rust_i18n::t!("controls.mpris_integration")
-                    },
-                    Some(&if cfg!(target_os = "windows") {
-                        rust_i18n::t!("preferences.windows_media_desc")
-                    } else {
-                        rust_i18n::t!("controls.mpris_desc")
-                    }),
-                    Tag::success().outline().child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(4.))
-                            .child(Icon::new(gpui_kit::component::IconName::Check).size(px(12.)))
-                            .child(rust_i18n::t!("controls.enabled")),
-                    ),
-                    true,
-                )),
+                .build(),
         )
 }

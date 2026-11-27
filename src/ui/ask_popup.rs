@@ -2,7 +2,6 @@ use crate::system::zcode_ask::ASK_HUB;
 use crate::ui::state::RustPodsState;
 use crate::ui::theme::palette;
 use gpui_kit::component::Icon;
-#[cfg(target_os = "linux")]
 use gpui_kit::layer_shell::{
     Anchor as LayerAnchor, KeyboardInteractivity, Layer, LayerShellOptions,
 };
@@ -139,15 +138,12 @@ impl Render for AskPopupWindow {
             .flex_col()
             .justify_end()
             .items_center()
-            .when(!cfg!(target_os = "windows"), |el| el.p(px(12.)))
+            .p(px(12.))
             .child(
                 div()
-                    .when(!cfg!(target_os = "windows"), |el| {
-                        el.w(px(436.)).rounded(px(24.)).shadow_lg()
-                    })
-                    .when(cfg!(target_os = "windows"), |el| {
-                        el.size_full().rounded(px(20.))
-                    })
+                    .w(px(436.))
+                    .rounded(px(24.))
+                    .shadow_lg()
                     .bg(card_bg)
                     .border_1()
                     .border_color(if is_resolved_only {
@@ -514,11 +510,7 @@ pub fn open_or_refresh_ask_popup(
             *guard = None;
         }
 
-    let popup_size = if cfg!(target_os = "windows") {
-        size(px(436.), px(296.))
-    } else {
-        size(px(460.), px(320.))
-    };
+    let popup_size = size(px(460.), px(320.));
     let popup_bounds = WindowBounds::Windowed(Bounds::centered(None, popup_size, cx));
     let make_opts = |kind: WindowKind| WindowOptions {
         window_bounds: Some(popup_bounds),
@@ -539,7 +531,6 @@ pub fn open_or_refresh_ask_popup(
         ..Default::default()
     };
 
-    #[cfg(target_os = "linux")]
     let layer_opts = make_opts(WindowKind::LayerShell(LayerShellOptions {
         namespace: "rustpods-zcode-ask-popup".to_string(),
         layer: Layer::Overlay,
@@ -550,16 +541,12 @@ pub fn open_or_refresh_ask_popup(
         keyboard_interactivity: KeyboardInteractivity::None,
     }));
 
-    #[cfg(target_os = "linux")]
     let state_for_popup = app_state.clone();
-    #[cfg(target_os = "linux")]
     let slot_for_popup = slot.clone();
-    #[cfg(target_os = "linux")]
     let result = cx.open_window(layer_opts, move |window, cx| {
         cx.new(|cx| AskPopupWindow::new(state_for_popup, window, slot_for_popup, cx))
     });
 
-    #[cfg(target_os = "linux")]
     let handle: Option<WindowHandle<AskPopupWindow>> = match result {
         Ok(h) => {
             info!("Opened ZCode Ask popup via Wayland LayerShell");
@@ -577,32 +564,6 @@ pub fn open_or_refresh_ask_popup(
                     warn!("Failed to open fallback PopUp window for ZCode Ask: {}", e2);
                     None
                 }
-            }
-        }
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let handle: Option<WindowHandle<AskPopupWindow>> = {
-        let state_fallback = app_state.clone();
-        let slot_fallback = slot.clone();
-        match cx.open_window(make_opts(WindowKind::PopUp), move |window, cx| {
-            cx.new(|cx| AskPopupWindow::new(state_fallback, window, slot_fallback, cx))
-        }) {
-            Ok(h) => {
-                info!("Opened ZCode Ask popup via PopUp window");
-                #[cfg(target_os = "windows")]
-                {
-                    crate::ui::popup::configure_windows_popup_dwm("RustPodsAskPopup");
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        crate::ui::popup::configure_windows_popup_dwm("RustPodsAskPopup");
-                    });
-                }
-                Some(h)
-            }
-            Err(e) => {
-                warn!("Failed to open PopUp window for ZCode Ask: {}", e);
-                None
             }
         }
     };

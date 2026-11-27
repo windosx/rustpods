@@ -4,7 +4,8 @@ use crate::core::device::AirPodsDeviceState;
 use crate::core::head_tracking::{HeadGesture, HeadPose};
 use crate::core::models::AirPodsModel;
 use crate::system::config::{
-    save_config, AppConfig, AppLanguage, HeadMouseMode, PauseBehavior, StemAction,
+    save_config, AppConfig, AppLanguage, AppThemePreference, HeadMouseMode, PauseBehavior,
+    StemAction,
 };
 use crate::system::head_mouse::{HeadMouseCommand, HEAD_MOUSE};
 use crate::system::zcode_ask::{self, AskProgress, AskReply, ResolvedNote};
@@ -48,6 +49,45 @@ impl NavPage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreferencesTab {
+    #[default]
+    General,
+    System,
+    About,
+}
+
+impl PreferencesTab {
+    pub const ALL: [PreferencesTab; 3] = [
+        PreferencesTab::General,
+        PreferencesTab::System,
+        PreferencesTab::About,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            PreferencesTab::General => "general",
+            PreferencesTab::System => "system",
+            PreferencesTab::About => "about",
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            PreferencesTab::General => rust_i18n::t!("preferences.tab_general").to_string(),
+            PreferencesTab::System => rust_i18n::t!("preferences.tab_system").to_string(),
+            PreferencesTab::About => rust_i18n::t!("preferences.tab_about").to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsFeedback {
+    pub message: String,
+    pub is_error: bool,
+    pub seq: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct HeadTrackingViewState {
     pub pose: Option<HeadPose>,
@@ -61,7 +101,7 @@ impl Default for HeadTrackingViewState {
     fn default() -> Self {
         Self {
             pose: None,
-            status: "等待数据流…".to_string(),
+            status: rust_i18n::t!("spatial.waiting_stream").to_string(),
             gesture: None,
             rate_hz: None,
             calibrated: false,
@@ -115,8 +155,6 @@ impl RustPodsController {
                 }
             };
             let Some(mac_addr) = mac_addr else {
-                #[cfg(target_os = "windows")]
-                let _ = open::that("ms-settings:bluetooth");
                 let _ = tx.send(UiEvent::ConnectAttemptFinished);
                 return;
             };
@@ -127,8 +165,6 @@ impl RustPodsController {
                         Ok(()) => true,
                         Err(e) => {
                             tracing::warn!("Bluetooth connect failed ({}): {}", mac_addr, e);
-                            #[cfg(target_os = "windows")]
-                            let _ = open::that("ms-settings:bluetooth");
                             false
                         }
                     },
@@ -259,6 +295,34 @@ impl RustPodsController {
         }
     }
 
+    pub fn toggle_start_minimized(&self, enabled: bool) {
+        if let Ok(mut c) = self.config.write() {
+            c.start_minimized = enabled;
+            save_config(&c);
+        }
+    }
+
+    pub fn set_theme_mode(&self, mode: AppThemePreference) {
+        if let Ok(mut c) = self.config.write() {
+            c.theme_mode = mode;
+            save_config(&c);
+        }
+    }
+
+    pub fn reset_config_to_defaults(&self) -> AppConfig {
+        let defaults = AppConfig::default();
+        if let Ok(mut c) = self.config.write() {
+            *c = defaults.clone();
+            save_config(&c);
+        }
+        crate::core::nod_counter::set_sensitivity(defaults.gesture_sensitivity);
+        let loc = defaults.language.resolved_locale();
+        rust_i18n::set_locale(loc);
+        gpui_kit::component::set_locale(loc);
+        HEAD_MOUSE.send_command(HeadMouseCommand::SyncConfig);
+        defaults
+    }
+
     pub fn toggle_case_popup(&self, enabled: bool) {
         if let Ok(mut c) = self.config.write() {
             c.case_popup_enabled = enabled;
@@ -317,6 +381,7 @@ impl RustPodsController {
             c.head_mouse_enabled = enabled;
             save_config(&c);
         }
+        HEAD_MOUSE.send_command(HeadMouseCommand::SyncConfig);
     }
 
     pub fn set_head_mouse_mode(&self, mode: HeadMouseMode) {
@@ -483,41 +548,20 @@ impl RustPodsController {
     pub fn restart_app(&self) {
         let exe = crate::system::updater::restart_binary_path();
         let exe = exe.to_string_lossy().into_owned();
-        #[cfg(not(target_os = "windows"))]
-        let spawned = {
-            let pid = std::process::id().to_string();
-            std::process::Command::new("sh")
-                .args([
-                    "-c",
-                    "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec \"$2\"",
-                    "rustpods-restart",
-                    &pid,
-                    &exe,
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .is_ok()
-        };
-        #[cfg(target_os = "windows")]
-        let spawned = {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            // Avoid `timeout.exe`, which exits immediately with an error when stdin is redirected to NUL.
-            std::process::Command::new("cmd")
-                .args(["/C", "ping", "-n", "3", "127.0.0.1"])
-                .arg("&&")
-                .arg("start")
-                .arg("")
-                .arg(&exe)
-                .creation_flags(CREATE_NO_WINDOW)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .is_ok()
-        };
+        let pid = std::process::id().to_string();
+        let spawned = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec \"$2\"",
+                "rustpods-restart",
+                &pid,
+                &exe,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok();
         if spawned {
             let _ = self.ui_tx.send(UiEvent::Quit);
         } else {
@@ -534,6 +578,13 @@ pub struct RustPodsState {
     pub zcode_progress: Option<AskProgress>,
     pub zcode_resolved: Option<ResolvedNote>,
     pub active_page: NavPage,
+    pub preferences_tab: PreferencesTab,
+    pub diagnostics_expanded: bool,
+    pub confirm_reset: bool,
+    pub reset_confirm_seq: u64,
+    pub settings_feedback: Option<SettingsFeedback>,
+    pub feedback_seq: u64,
+    pub config_revision: u64,
     pub theme_mode: ThemeMode,
     pub update_state: crate::system::updater::UpdateState,
     pub agent_notes: HashMap<&'static str, String>,
@@ -558,6 +609,13 @@ impl RustPodsState {
             zcode_progress: None,
             zcode_resolved: None,
             active_page: NavPage::Overview,
+            preferences_tab: PreferencesTab::General,
+            diagnostics_expanded: false,
+            confirm_reset: false,
+            reset_confirm_seq: 0,
+            settings_feedback: None,
+            feedback_seq: 0,
+            config_revision: 0,
             theme_mode,
             update_state: crate::system::updater::UpdateState::default(),
             agent_notes: HashMap::new(),
@@ -568,5 +626,168 @@ impl RustPodsState {
 
     pub fn config_snapshot(&self) -> AppConfig {
         self.controller.config.read().unwrap().clone()
+    }
+
+    pub fn set_preferences_tab(&mut self, tab: PreferencesTab) {
+        self.preferences_tab = tab;
+        if tab != PreferencesTab::About {
+            self.confirm_reset = false;
+        }
+    }
+
+    pub fn toggle_diagnostics_expanded(&mut self) {
+        self.diagnostics_expanded = !self.diagnostics_expanded;
+    }
+
+    pub fn request_reset_confirm(&mut self) -> u64 {
+        self.confirm_reset = true;
+        self.reset_confirm_seq = self.reset_confirm_seq.wrapping_add(1);
+        self.reset_confirm_seq
+    }
+
+    pub fn cancel_reset_confirm(&mut self) {
+        self.confirm_reset = false;
+    }
+
+    pub fn expire_reset_confirm(&mut self, seq: u64) {
+        if self.reset_confirm_seq == seq {
+            self.confirm_reset = false;
+        }
+    }
+
+    pub fn set_settings_feedback(&mut self, message: impl Into<String>, is_error: bool) -> u64 {
+        self.feedback_seq = self.feedback_seq.wrapping_add(1);
+        let seq = self.feedback_seq;
+        self.settings_feedback = Some(SettingsFeedback {
+            message: message.into(),
+            is_error,
+            seq,
+        });
+        seq
+    }
+
+    pub fn notify_saved(&mut self) -> u64 {
+        let msg = rust_i18n::t!("settings.saved").to_string();
+        self.set_settings_feedback(msg, false)
+    }
+
+    pub fn clear_settings_feedback(&mut self, expected_seq: Option<u64>) -> bool {
+        match expected_seq {
+            Some(seq) => {
+                if self
+                    .settings_feedback
+                    .as_ref()
+                    .is_some_and(|f| f.seq == seq)
+                {
+                    self.settings_feedback = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                let had = self.settings_feedback.is_some();
+                self.settings_feedback = None;
+                had
+            }
+        }
+    }
+
+    pub fn apply_theme_mode(&mut self, mode: ThemeMode) {
+        self.theme_mode = mode;
+        let pref = if mode.is_dark() {
+            AppThemePreference::Dark
+        } else {
+            AppThemePreference::Light
+        };
+        self.controller.set_theme_mode(pref);
+    }
+
+    pub fn reset_config_to_defaults(&mut self) -> AppConfig {
+        let defaults = self.controller.reset_config_to_defaults();
+        self.theme_mode = if defaults.theme_mode.is_dark() {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        };
+        self.confirm_reset = false;
+        self.config_revision = self.config_revision.wrapping_add(1);
+        let msg = rust_i18n::t!("settings.reset_done").to_string();
+        self.set_settings_feedback(msg, false);
+        defaults
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> RustPodsState {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let controller = RustPodsController {
+            rt: rt.handle().clone(),
+            aacp: Arc::new(AacpManager::new()),
+            device_state: Arc::new(RwLock::new(None)),
+            config: Arc::new(std::sync::RwLock::new(AppConfig::default())),
+            ui_tx,
+        };
+        // Leak runtime handle only in test helper? Better: keep runtime alive via Box::leak is unnecessary if we don't spawn.
+        std::mem::forget(rt);
+        RustPodsState::new(controller, ThemeMode::Dark)
+    }
+
+    #[test]
+    fn preferences_tab_switch_resets_confirm_flag() {
+        let mut state = test_state();
+        assert_eq!(state.preferences_tab, PreferencesTab::General);
+        assert!(!state.confirm_reset);
+
+        state.set_preferences_tab(PreferencesTab::About);
+        let seq = state.request_reset_confirm();
+        assert!(state.confirm_reset);
+        assert_eq!(seq, 1);
+
+        // Switching away from About clears pending reset confirmation.
+        state.set_preferences_tab(PreferencesTab::System);
+        assert!(!state.confirm_reset);
+    }
+
+    #[test]
+    fn reset_confirm_expiry_respects_sequence() {
+        let mut state = test_state();
+        let seq1 = state.request_reset_confirm();
+        let seq2 = state.request_reset_confirm();
+        assert!(state.confirm_reset);
+
+        // Stale timer must not clear a newer confirmation request.
+        state.expire_reset_confirm(seq1);
+        assert!(state.confirm_reset);
+
+        state.expire_reset_confirm(seq2);
+        assert!(!state.confirm_reset);
+    }
+
+    #[test]
+    fn settings_feedback_clear_respects_sequence() {
+        let mut state = test_state();
+        let seq1 = state.set_settings_feedback("Saved", false);
+        let seq2 = state.set_settings_feedback("Reset", false);
+
+        state.clear_settings_feedback(Some(seq1));
+        assert!(state.settings_feedback.is_some());
+
+        state.clear_settings_feedback(Some(seq2));
+        assert!(state.settings_feedback.is_none());
+    }
+
+    #[test]
+    fn diagnostics_toggle_flips_state() {
+        let mut state = test_state();
+        assert!(!state.diagnostics_expanded);
+        state.toggle_diagnostics_expanded();
+        assert!(state.diagnostics_expanded);
+        state.toggle_diagnostics_expanded();
+        assert!(!state.diagnostics_expanded);
     }
 }

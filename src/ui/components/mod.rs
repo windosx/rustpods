@@ -5,5 +5,6 @@ pub mod headtracking;
 pub mod hero;
 pub mod noise;
 pub mod preferences;
+pub mod setting_rows;
 pub mod settings;
 pub mod zcode_ask;

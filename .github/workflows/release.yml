@@ -97,64 +97,8 @@ jobs:
           name: linux-artifacts
           path: artifacts/*
 
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Determine version
-        id: get_version
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          VERSION="${TAG#v}"
-          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Inno Setup
-        run: choco install innosetup --no-progress
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary (Windows)
-        run: cargo build --release --no-default-features
-
-      - name: Build Windows Installer (Inno Setup)
-        run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="${{ steps.get_version.outputs.VERSION }}" contrib\windows\rustpods-installer.iss
-
-      - name: Package Windows Zip
-        shell: pwsh
-        run: |
-          $ver = "${{ steps.get_version.outputs.VERSION }}"
-          $distName = "rustpods-v$ver-windows-x86_64"
-          New-Item -ItemType Directory -Force -Path "dist/$distName"
-          Copy-Item "target/release/rustpods.exe" "dist/$distName/"
-          Copy-Item "README.md" "dist/$distName/"
-          Copy-Item "README_zh.md" "dist/$distName/"
-          Copy-Item "LICENSE" "dist/$distName/"
-          Copy-Item "NOTICE" "dist/$distName/"
-          New-Item -ItemType Directory -Force -Path "artifacts"
-          Compress-Archive -Path "dist/$distName" -DestinationPath "artifacts/$distName.zip"
-          Copy-Item "dist/RustPods-Setup-*.exe" "artifacts/"
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-artifacts
-          path: artifacts/*
-
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

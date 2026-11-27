@@ -69,6 +69,20 @@ impl AppConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppThemePreference {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl AppThemePreference {
+    pub fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AppLanguage {
     #[default]
     Auto,
@@ -189,6 +203,9 @@ pub struct AppConfig {
     /// Interface display language (Auto follows system, ZhCn, or EnUs).
     #[serde(default)]
     pub language: AppLanguage,
+    /// Interface theme preference (Dark or Light).
+    #[serde(default)]
+    pub theme_mode: AppThemePreference,
 }
 
 fn default_true() -> bool {
@@ -244,17 +261,12 @@ impl Default for AppConfig {
             head_mouse_roll_click: false,
             head_mouse_dwell_click: false,
             language: AppLanguage::Auto,
+            theme_mode: AppThemePreference::Dark,
         }
     }
 }
 
 pub fn get_config_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    let dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("rustpods");
-
-    #[cfg(not(target_os = "windows"))]
     let dir = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -455,6 +467,7 @@ mod tests {
             head_mouse_roll_click: true,
             head_mouse_dwell_click: true,
             language: AppLanguage::EnUs,
+            theme_mode: AppThemePreference::Light,
         };
         save_config_to(&path, &cfg);
 
@@ -486,6 +499,10 @@ mod tests {
         assert_eq!(rust_i18n::t!("preferences.mpris_row_title", locale = "zh-CN"), "D-Bus MPRIS 媒体联动");
         assert_eq!(rust_i18n::t!("preferences.mpris_row_title", locale = "en"), "D-Bus MPRIS Media Control");
         assert_eq!(rust_i18n::t!("preferences.linux_audio_title", locale = "en"), "PipeWire / PulseAudio Native Audio");
+        assert_eq!(rust_i18n::t!("controls.requires_ear_detect", locale = "zh-CN"), "需先开启「自动入耳检测」后生效");
+        assert_eq!(rust_i18n::t!("controls.requires_ear_detect", locale = "en"), "Requires Automatic In-Ear Detection to be enabled");
+        assert_eq!(rust_i18n::t!("preferences.open_folder", locale = "zh-CN"), "打开目录");
+        assert_eq!(rust_i18n::t!("preferences.open_folder", locale = "en"), "Open Folder");
         assert_eq!(rust_i18n::t!("preferences.update_now", locale = "en"), "Update Now");
         assert_eq!(
             rust_i18n::t!("preferences.update_complete", version = "0.2.0", locale = "zh-CN"),
@@ -495,6 +512,47 @@ mod tests {
             rust_i18n::t!("preferences.update_complete", version = "0.2.0", locale = "en"),
             "Updated to v0.2.0; restart to apply"
         );
+        // Stage 1 settings refactor keys
+        assert_eq!(rust_i18n::t!("settings.saved", locale = "zh-CN"), "已保存");
+        assert_eq!(rust_i18n::t!("settings.saved", locale = "en"), "Saved");
+        assert_eq!(rust_i18n::t!("settings.reset_done", locale = "zh-CN"), "已恢复默认设置");
+        assert_eq!(rust_i18n::t!("settings.reset_done", locale = "en"), "Settings reset to defaults");
+        assert_eq!(rust_i18n::t!("settings.not_connected_hint", locale = "zh-CN"), "未连接 AirPods，设备级选项将在连接后生效");
+        assert_eq!(rust_i18n::t!("settings.not_connected_hint", locale = "en"), "AirPods not connected; device options will apply once connected");
+        assert_eq!(rust_i18n::t!("settings.disabled_requires_ear_detect", locale = "zh-CN"), "需先开启「自动入耳检测」");
+        assert_eq!(rust_i18n::t!("settings.disabled_requires_ear_detect", locale = "en"), "Requires Automatic In-Ear Detection");
+        assert_eq!(rust_i18n::t!("settings.disabled_requires_head_mouse", locale = "zh-CN"), "需先启用「姿态鼠标」");
+        assert_eq!(rust_i18n::t!("settings.disabled_requires_head_mouse", locale = "en"), "Requires Head Mouse to be enabled");
+        assert_eq!(rust_i18n::t!("settings.disabled_requires_permission_answers", locale = "zh-CN"), "需先启用「手势权限审批」");
+        assert_eq!(rust_i18n::t!("settings.disabled_requires_permission_answers", locale = "en"), "Requires Gesture Permission Approval");
+        assert_eq!(rust_i18n::t!("preferences.tab_general", locale = "zh-CN"), "常规");
+        assert_eq!(rust_i18n::t!("preferences.tab_general", locale = "en"), "General");
+        assert_eq!(rust_i18n::t!("preferences.tab_system", locale = "zh-CN"), "设备与系统");
+        assert_eq!(rust_i18n::t!("preferences.tab_system", locale = "en"), "Device & System");
+        assert_eq!(rust_i18n::t!("preferences.tab_about", locale = "zh-CN"), "关于与维护");
+        assert_eq!(rust_i18n::t!("preferences.tab_about", locale = "en"), "About");
+        assert_eq!(rust_i18n::t!("preferences.start_minimized", locale = "zh-CN"), "启动时最小化到托盘");
+        assert_eq!(rust_i18n::t!("preferences.start_minimized", locale = "en"), "Start Minimized to Tray");
+        assert_eq!(rust_i18n::t!("preferences.diagnostics_title", locale = "zh-CN"), "设备与系统诊断");
+        assert_eq!(rust_i18n::t!("preferences.diagnostics_title", locale = "en"), "Device & System Diagnostics");
+        assert_eq!(
+            rust_i18n::t!("preferences.diagnostics_summary_connected", model = "AirPods Pro 2", locale = "zh-CN"),
+            "AACP 已连接 · AirPods Pro 2"
+        );
+        assert_eq!(
+            rust_i18n::t!("preferences.diagnostics_summary_connected", model = "AirPods Pro 2", locale = "en"),
+            "AACP Connected · AirPods Pro 2"
+        );
+        assert_eq!(rust_i18n::t!("preferences.device_disconnected_placeholder", locale = "zh-CN"), "未连接（连接后读取）");
+        assert_eq!(rust_i18n::t!("preferences.device_disconnected_placeholder", locale = "en"), "Not connected (reads when connected)");
+        assert_eq!(rust_i18n::t!("preferences.open_config_dir", locale = "zh-CN"), "打开配置目录");
+        assert_eq!(rust_i18n::t!("preferences.open_config_dir", locale = "en"), "Open Config Folder");
+        assert_eq!(rust_i18n::t!("preferences.reset_defaults", locale = "zh-CN"), "恢复默认设置");
+        assert_eq!(rust_i18n::t!("preferences.reset_defaults", locale = "en"), "Reset to Defaults");
+        assert_eq!(rust_i18n::t!("preferences.reset_confirm_btn", locale = "zh-CN"), "确认恢复");
+        assert_eq!(rust_i18n::t!("preferences.reset_confirm_btn", locale = "en"), "Confirm Reset");
+        assert_eq!(rust_i18n::t!("preferences.reset_cancel_btn", locale = "zh-CN"), "取消");
+        assert_eq!(rust_i18n::t!("preferences.reset_cancel_btn", locale = "en"), "Cancel");
     }
 
     #[test]
@@ -521,6 +579,7 @@ mod tests {
         assert_eq!(loaded.head_mouse_smoothing, 0.35);
         assert_eq!(loaded.head_mouse_deadzone, 2.0);
         assert_eq!(loaded.head_mouse_mode, HeadMouseMode::Relative);
+        assert_eq!(loaded.theme_mode, AppThemePreference::Dark);
         remove_scratch(&path);
     }
 }
