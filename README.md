@@ -27,7 +27,7 @@ RustPods brings the parts of the AirPods experience that macOS takes for granted
 It speaks Apple's AACP protocol over L2CAP directly from Rust. No bridge daemon, no patched BlueZ, no Android phone in the middle.
 
 > [!NOTE]
-> RustPods is early-stage software (v0.2.2). Head tracking has been verified end-to-end on AirPods 3 through Apple RemoteHID; newer models use the documented payload layouts in `src/core/head_tracking.rs`. Expect rough edges, and please [open an issue](https://github.com/windosx/rustpods/issues) when you find one.
+> RustPods is early-stage software (v0.2.3). Head tracking has been verified end-to-end on AirPods 3 through Apple RemoteHID; newer models use the documented payload layouts in `src/core/head_tracking.rs`. Expect rough edges, and please [open an issue](https://github.com/windosx/rustpods/issues) when you find one.
 
 ## Features
 
